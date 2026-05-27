@@ -34,6 +34,7 @@ class ChatMessage(Static):
         self.md.update(prefix + self.content)
 
 class App(TextualApp):
+    TITLE = 'Kairos'
     CSS = """
     #chat-container {
         height: 1fr;
@@ -55,8 +56,12 @@ class App(TextualApp):
         super().__init__()
         self.agent = Agent()
 
+
     def compose(self) -> ComposeResult:
+        from textual.widgets import Header, Footer
+        yield Header(show_clock=True)
         with VerticalScroll(id="chat-container"):
+
             pass
         yield Input(placeholder="Type a message and press Enter...", id="input-box")
 
@@ -83,7 +88,7 @@ class App(TextualApp):
         # Call agent in background worker
         self.run_agent_task(user_message, agent_msg_widget)
 
-    @work
+    @work(thread=True)
     async def run_agent_task(self, user_message: str, agent_msg_widget: ChatMessage) -> None:
 
         # We can pass an async callback so that it safely updates the UI on the event loop
