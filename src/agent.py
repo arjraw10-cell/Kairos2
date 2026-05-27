@@ -119,3 +119,7 @@ async def process_user_message(user_message: str, yield_callback: Optional[Calla
 
     if not yield_callback:
         return responses
+
+class Agent:
+    async def process_user_message(self, user_message, yield_callback=None):
+        return await process_user_message(user_message, yield_callback)
