@@ -1,3 +1,6 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import asyncio
 from textual.app import App as TextualApp, ComposeResult
 from textual.containers import VerticalScroll
