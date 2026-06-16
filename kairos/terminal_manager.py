@@ -1,8 +1,9 @@
 import subprocess
+import sys
 import threading
 import time
 from typing import Dict, Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import queue
 
 @dataclass
@@ -10,7 +11,6 @@ class Terminal:
     id: int
     background: bool
     process: Optional[subprocess.Popen] = None
-    output_queue: queue.Queue = field(default_factory=queue.Queue)
     closed: bool = False
     output_buffer: str = ""  # Accumulated output for background terminals
 
@@ -29,12 +29,18 @@ class TerminalManager:
         
         if background:
             # Start a shell process for interactive commands
+            if sys.platform == "win32":
+                shell_cmd = ["cmd", "/k"]
+            else:
+                shell_cmd = ["/bin/bash", "--login"]
             term.process = subprocess.Popen(
-                ["cmd", "/k"],  # Windows: keep shell open
+                shell_cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1
             )
             # Start reader thread
@@ -46,12 +52,13 @@ class TerminalManager:
         return terminal_id
 
     def _read_output(self, term: Terminal):
-        """Background thread to read output from background terminal"""
+        """Background thread to read output from background terminal."""
         if term.process and term.process.stdout:
             for line in iter(term.process.stdout.readline, ''):
                 if line:
-                    term.output_queue.put(line)
-                    term.output_buffer += line
+                    # Must acquire lock before modifying output_buffer
+                    with self._lock:
+                        term.output_buffer += line
 
     def execute_command(self, terminal_id: int, command: str, timeout: Optional[int] = None, is_background: Optional[bool] = None) -> Tuple[bool, str]:
         """
@@ -89,6 +96,8 @@ class TerminalManager:
                     shell=True,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=timeout
                 )
                 output = result.stdout + result.stderr
@@ -142,18 +151,29 @@ class TerminalManager:
         if term.closed:
             return False, f"Terminal {terminal_id} is already closed"
         
+        success = True
+        error_msg = ""
+        
         if term.background and term.process:
             try:
                 term.process.terminate()
-                term.process.wait(timeout=5)
+                try:
+                    term.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    term.process.kill()
+                    term.process.wait(timeout=2)
             except Exception as e:
-                term.process.kill()
+                success = False
+                error_msg = f" (warning: {str(e)})"
         
         term.closed = True
         with self._lock:
             del self.terminals[terminal_id]
         
-        return True, f"Terminal {terminal_id} closed"
+        if success:
+            return True, f"Terminal {terminal_id} closed"
+        else:
+            return False, f"Terminal {terminal_id} closed with errors{error_msg}"
 
     def get_terminal_info(self, terminal_id: int) -> Optional[dict]:
         with self._lock:

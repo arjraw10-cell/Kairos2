@@ -15,6 +15,14 @@ dependencies = [
     "prompt_toolkit>=3.0.0",
 ]
 
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.40.0",
+]
+stealth = [
+    "cloakbrowser>=0.3.0",
+]
+
 [project.scripts]
 kairos = "kairos.main:main"
 
