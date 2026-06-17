@@ -7,7 +7,7 @@ import traceback
 
 from kairos.config import Config
 from kairos.agent import Agent
-from kairos.cli import CLI, _paste_registry, _resolve_paste_tokens
+from kairos.cli import CLI, _paste_registry
 from kairos.tools.session import SessionManager
 
 
@@ -190,8 +190,6 @@ def main():
                 break
 
             if user_input.lower() in ("exit", "quit", "q", "/exit", "/quit"):
-                session_mgr.save_chat(agent.get_history())
-                session_mgr.new_session()
                 break
 
             if user_input.lower() == "clear":
@@ -232,7 +230,6 @@ def main():
                     history = session_mgr.load_session(selected_id)
                     if history:
                         session_mgr.save_chat(agent.get_history())
-                        session_mgr.new_session()
                         agent.reset()
                         agent.conversation_history = history
                         session_mgr.set_current_session(selected_id)

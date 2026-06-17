@@ -50,10 +50,7 @@ class SessionManager:
 
         Strategy:
         1. If _current_session_id is set and still on disk → update it.
-        2. Otherwise find the most recent entry with the same preview
-           (first user message) and update it — this handles process
-           restarts and module reloads gracefully.
-        3. If nothing matches → create a brand-new entry.
+        2. Otherwise → create a brand-new entry.
         """
         if len(conversation_history) <= 1:
             return  # Don't save empty sessions (only system prompt)
@@ -66,18 +63,7 @@ class SessionManager:
         if self._current_session_id and self._current_session_id in data:
             session_id = self._current_session_id
 
-        # 2. Fallback: find the most recent entry with the same preview
-        if not session_id and preview:
-            candidates = [
-                (sid, s) for sid, s in data.items()
-                if s.get("preview") == preview
-            ]
-            if candidates:
-                # Pick the one with the latest timestamp
-                candidates.sort(key=lambda c: c[1].get("timestamp", ""), reverse=True)
-                session_id = candidates[0][0]
-
-        # 3. Create brand-new entry if nothing matched
+        # 2. Create brand-new entry if no tracked session
         if not session_id:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             session_id = f"chat_{timestamp}"

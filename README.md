@@ -4,17 +4,22 @@ A minimal personal coding agent in Python.
 
 ## Features
 
-- **9 Core Tools**: `read`, `write`, `edit` (strict find-and-replace), `change_workspace`, plus 5 terminal tools
+- **24 Tools**: File operations, terminal management, search, git, sub-agents, and a full browser automation suite
 - **Absolute Paths**: All file operations use absolute paths — no workspace restrictions
-- **Terminal Management**: Background and blocking terminals with full lifecycle control
-- **Chat Persistence**: All sessions saved to `chats/chats.json` with timestamps
-- **`/resume`**: Load previous chats via arrow-key picker
+- **Streaming First**: Tokens print as they arrive; no waiting for full responses
+- **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange
+- **Auto-Compaction**: Conversation history is automatically summarized when context usage exceeds 80%
+- **Sub-Agents**: Spawn autonomous child agents to work on tasks in parallel
+- **Browser Automation**: Full Playwright/CloakBrowser integration with stealth mode, persistent profiles, multi-tab, and CDP support
+- **Paste System**: Ctrl+V creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. On Windows, uses `GetClipboardSequenceNumber()` for fast detection that doesn't slow down typing.
+- **Chat Persistence**: All sessions saved to `chats/chats.json` with auto-save every 60 seconds and on window close. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions.
+- **`/resume`**: Load previous chats via numbered picker
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
-- **Thinking Trace**: Model's reasoning displayed in italics with grey shading
+- **Streaming Display**: Real-time tokens in a live-updating panel (grey for thinking, green for final response)
 - **Tool Summaries**: One-line display when tools are called (e.g., `read file: /path`)
-- **Interrupt**: Press Ctrl+C during a response to stop and give feedback
-- **OpenAI Compatible**: Uses OpenAI chat completions API
-- **Clean CLI**: Beautiful terminal UI with `rich` and `prompt_toolkit`
+- **Dual Interrupt**: Ctrl+C hard-interrupts mid-step; Escape gracefully stops after the current step finishes
+- **OpenAI Compatible**: Works with any OpenAI-compatible API (OpenRouter, local models, etc.)
+- **Clean CLI**: Terminal UI with `rich` and `prompt_toolkit`
 
 ## Installation
 
@@ -26,15 +31,24 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+For browser automation, also install Playwright browsers:
+
+```bash
+playwright install chromium
+```
+
 ## Configuration
 
 1. Copy `.env.example` to `.env`
 2. Edit `.env` with your credentials:
+
 ```
 OPENAI_API_KEY=your_api_key_here
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o
 ```
+
+Any OpenAI-compatible endpoint works — just change `OPENAI_BASE_URL`.
 
 ## Usage
 
@@ -49,12 +63,13 @@ python main.py /path/to/project  # specific workspace
 |---------|-------------|
 | `Escape` | Stop after current step (finish tool calls, then wait for input) |
 | `Ctrl+C` | Hard-interrupt (abort mid-step) |
-| `Ctrl+V` | Paste text from clipboard |
-| `/resume` | Load a saved chat (arrow keys + enter) |
+| `Ctrl+V` | Paste text or images from clipboard |
+| `/resume` | Load a saved chat |
+| `/compact` | Manually compact conversation history |
+| `/paste` | Info about paste functionality |
 | `clear` | Clear the screen |
 | `reset` | Save and reset conversation history |
 | `exit` / `quit` / `q` | Save and exit |
-| `Ctrl+C` | Interrupt a running response |
 
 ## Tools
 
@@ -62,47 +77,114 @@ python main.py /path/to/project  # specific workspace
 
 | Tool | Description |
 |------|-------------|
-| `read(path)` | Read file contents (absolute path) |
-| `write(path, content)` | Write/create a file (absolute path) |
-| `edit(path, oldText, newText)` | Strict find-and-replace (must match exactly once) |
-| `change_workspace(path)` | Change working directory |
+| `read(path)` | Read file contents — supports images (png, jpg, gif, webp, bmp, tiff, svg) returned as vision data |
+| `write(path, content)` | Write or create a file (parent directories created automatically) |
+| `edit(path, oldText, newText)` | Strict find-and-replace — must match exactly once |
+
+### Search & Git
+
+| Tool | Description |
+|------|-------------|
+| `search(pattern, path?, include?, max_results?)` | Regex file content search (like ripgrep) — skips binary files and non-source directories |
+| `git(command, **kwargs)` | Git operations: `status`, `diff`, `log`, `commit`, `branch` |
 
 ### Terminal Tools
 
 | Tool | Description |
 |------|-------------|
-| `new_terminal(background)` | Create a terminal (persistent or one-shot) |
-| `execute_command(terminal_id, command, timeout?, is_background?)` | Run command |
-| `read_logs(terminal_id, start_line, end_line?)` | Read terminal output |
-| `close_terminal(terminal_id)` | Close a terminal |
-| `get_terminal_info(terminal_id)` | Get terminal status |
+| `new_terminal(background)` | Create a terminal — `true` for persistent shell, `false` for one-shot |
+| `execute_command(terminal_id, command, timeout?, is_background?)` | Run a command in a terminal |
+| `read_logs(terminal_id, start_line, end_line?)` | Read output from a background terminal by line numbers |
+| `close_terminal(terminal_id)` | Close a terminal and release resources |
+| `get_terminal_info(terminal_id)` | Get terminal status (ID, type, closed status, line count) |
+
+### Sub-Agent Tools
+
+| Tool | Description |
+|------|-------------|
+| `spawn_subagent(prompt, mode?)` | Spawn an autonomous child agent — `blocking` (waits) or `non-blocking` (returns ID) |
+| `get_subagent_result(subagent_id)` | Poll a non-blocking sub-agent for its result |
+
+Sub-agents have access to file, search, git, and terminal tools but cannot spawn further sub-agents or use browser tools.
+
+### Browser Tools
+
+| Tool | Description |
+|------|-------------|
+| `browser_launch(profile?, proxy?, humanize?, chrome_profile?, connect_cdp?)` | Launch a browser (Playwright or CloakBrowser stealth) |
+| `browser_navigate(url)` | Navigate to a URL |
+| `browser_click(selector)` | Click an element (CSS selector or text) |
+| `browser_type(selector, text, press_enter?)` | Type into an input field |
+| `browser_select(selector, value)` | Select a dropdown option |
+| `browser_snapshot()` | Get a compact text representation of the page (interactive elements, headings, form state) |
+| `browser_screenshot(full_page?)` | Capture a screenshot (saved to `~/.kairos/screenshots/`) |
+| `browser_tab_list()` | List all open tabs |
+| `browser_tab_switch(index?, url_pattern?)` | Switch tabs by index or URL pattern |
+| `browser_tab_open(url?)` | Open a new tab |
+| `browser_evaluate(expression)` | Execute JavaScript in the page |
+| `browser_close()` | Close the browser and clean up |
+
+Browser features:
+- **Persistent profiles**: Cookies, localStorage, and cache survive across sessions (`~/.kairos/profiles/`)
+- **CloakBrowser**: Stealth Chromium with fingerprint patches when installed (`pip install cloakbrowser`)
+- **CDP mode**: Connect to an already-running Chrome instance (`chrome --remote-debugging-port=9222`)
+- **Chrome profile copy**: Import your real Chrome profile (cookies, logins, history)
+- **Human-like mode**: Realistic mouse/keyboard/scroll behavior for bot detection
 
 ## Architecture
 
 ```
+main.py                     # Entry point
 kairos/
-├── main.py             # Entry point, REPL loop
-├── config.py           # Lazy config loading
-├── agent.py            # Core agent loop with OpenAI
-├── cli.py              # Terminal UI (animated thinking, trace, picker)
-├── terminal_manager.py # Terminal lifecycle
+├── main.py                 # CLI REPL loop, signal handlers, auto-save
+├── config.py               # Lazy .env loading (OPENAI_API_KEY, BASE_URL, MODEL)
+├── agent.py                # Core agent loop, streaming, compaction, tool dispatch
+├── cli.py                  # Terminal UI (streaming panels, thinking dots, paste handling)
+├── tokens.py               # Token counting with tiktoken (session/context/turn)
+├── terminal_manager.py     # Terminal lifecycle (background shells, blocking subprocesses)
+├── browser_manager.py      # Playwright/CloakBrowser lifecycle in a dedicated worker thread
 └── tools/
-    ├── base.py         # ToolResult
-    ├── read.py         # Read file
-    ├── write.py        # Write file
-    ├── edit.py         # Strict edit
-    ├── workspace.py    # Change workspace
-    ├── terminal.py     # Terminal tools
-    └── session.py      # Chat persistence
+    ├── base.py             # ToolResult class
+    ├── read.py             # Read file (text + images)
+    ├── write.py            # Write/create file
+    ├── edit.py             # Strict find-and-replace
+    ├── search.py           # Regex file search (ripgrep-like)
+    ├── git.py              # Git subcommand dispatcher
+    ├── terminal.py         # Terminal tool wrappers
+    ├── subagent.py         # Sub-agent spawn and tracking
+    ├── browser.py          # Browser tool wrappers
+    └── session.py          # Chat save/load manager
 ```
+
+## Key Concepts
+
+### Streaming
+
+Tokens are streamed in real-time. During the agent's reasoning phase, a grey panel updates live. When a final response is reached, it transitions to a green panel rendered as Markdown. Tool call thinking stays as a grey trace.
+
+### Compaction
+
+When the conversation context exceeds 80% of the context window, old messages are automatically summarized into a structured checkpoint (Goal, Progress, Key Decisions, Next Steps) and replaced. Recent context (~20k tokens) is preserved. You can also trigger this manually with `/compact`.
+
+### AGENTS.md
+
+Kairos auto-loads an `AGENTS.md` file from the workspace root into the system prompt. Use this to give the agent project-specific conventions, instructions, or context.
+
+### Auto-Save
+
+Chat history is saved:
+- After every exchange
+- Every 60 seconds in the background
+- On SIGTERM / SIGINT / SIGHUP (window close, task kill)
 
 ## Design Principles
 
-1. **One Tool Per File** — easy to add new tools
-2. **Absolute Paths** — no workspace containment, just use full paths
-3. **Interruptible** — Ctrl+C stops the agent cleanly
-4. **Persistent Chats** — sessions saved automatically, even on window close
-5. **Minimal Dependencies** — only `openai`, `python-dotenv`, `rich`, `prompt_toolkit`
+1. **Streaming First** — Tokens print as they arrive; no waiting for full response
+2. **Absolute Paths** — No workspace containment, just use full paths
+3. **One Tool Per File** — Easy to add new tools
+4. **Interruptible** — Ctrl+C hard-interrupts; Escape gracefully stops between steps
+5. **Token Aware** — Session, context, and turn token counts displayed
+6. **Minimal Dependencies** — `openai`, `python-dotenv`, `rich`, `prompt_toolkit`, `tiktoken`, `playwright`
 
 ## License
 

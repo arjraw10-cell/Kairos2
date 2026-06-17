@@ -113,6 +113,8 @@ class Agent:
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
             "You have 24 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
+            "## Documentation Rule\n"
+            "When you make ANY code change (edit, add, or remove code in any source file), you MUST also update the AGENTS.md and README.md files in the workspace root to reflect the change. This is not optional. Every code change must be accompanied by documentation updates so that the documentation stays accurate.\n\n"
             "## Browser Tools\n"
             "You can browse the web using browser tools. The workflow is:\n"
             "1. `browser_launch` \u2014 start the browser (optionally with a named profile for persistent sessions)\n"
@@ -138,7 +140,17 @@ class Agent:
             pass  # best-effort; don't break the prompt if the file can't be read
 
         if agents_md:
-            base += f"\n\n## AGENTS.md\nThe following is an AGENTS.md file found in the workspace. Follow any instructions or conventions described in it.\n\n{agents_md}"
+            base += (
+                "\n\n## AGENTS.md (Architecture Documentation)\n"
+                "Below is the AGENTS.md file from your workspace root. This is your complete reference for "
+                "the codebase you are working on. It contains the full project structure, file-by-file "
+                "descriptions, class signatures, method details, and design patterns. "
+                "Use this as your primary knowledge source \u2014 it is injected into your system prompt so you "
+                "always have full context of the codebase without needing to read every file.\n\n"
+                "Follow any instructions or conventions described in it. "
+                "If you make code changes, remember to also update this AGENTS.md and README.md.\n\n"
+                f"{agents_md}"
+            )
 
         self.system_prompt = base
         self.conversation_history = [{"role": "system", "content": self.system_prompt}]

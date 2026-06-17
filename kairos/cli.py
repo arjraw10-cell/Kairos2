@@ -28,9 +28,16 @@ PROMPT_STYLE = Style.from_dict({
     "": "ansidefault",
 })
 
-# ---- Paste counters (incrementing numbers for display) ----
+# ---- Paste counters (incrementing numbers for display, reset per prompt) ----
 _image_counter = 0
 _text_counter = 0
+
+
+def _reset_paste_counters():
+    """Reset paste token counters at the start of each prompt."""
+    global _image_counter, _text_counter
+    _image_counter = 0
+    _text_counter = 0
 
 
 def _make_image_token() -> str:
@@ -53,6 +60,28 @@ def _make_text_token() -> str:
 _paste_registry: Dict[str, dict] = {}
 
 _kb = KeyBindings()
+
+
+# ------------------------------------------------------------------ #
+#  Clipboard sequence number (cheap change detection on Windows)      #
+# ------------------------------------------------------------------ #
+
+def _get_clipboard_sequence_number() -> int:
+    """Return the current clipboard sequence number (Windows only).
+
+    This is a single ctypes call — virtually free. The number increments
+    whenever clipboard content changes, letting us detect pastes without
+    spawning subprocesses on every keystroke.
+
+    Returns 0 on non-Windows or on failure.
+    """
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        return ctypes.windll.user32.GetClipboardSequenceNumber()
+    except Exception:
+        return 0
 
 
 # ------------------------------------------------------------------ #
@@ -284,13 +313,6 @@ def _find_token_at_or_before_cursor(text: str, cursor_pos: int) -> Optional[str]
     return None
 
 
-def _resolve_paste_tokens(text: str) -> str:
-    """Replace text paste tokens with actual content.
-    Image tokens are left in place for main.py to extract."""
-    for token, data in list(_paste_registry.items()):
-        if token in text and data["type"] == "text":
-            text = text.replace(token, data["text_stripped"])
-    return text
 
 
 # ------------------------------------------------------------------ #
@@ -602,70 +624,138 @@ class CLI:
 
     def get_user_input(self, prefix: str = "kairos> ") -> Optional[str]:
         try:
+            # Reset paste token counters for this prompt
+            _reset_paste_counters()
+            _paste_registry.clear()
+
             buf = self._prompt_session.default_buffer
 
-            # ---- 1. Snapshot clipboard BEFORE the prompt ----
+            # ---- 1. Snapshot clipboard state BEFORE the prompt ----
             pre_image_data = _check_clipboard_has_image()
             pre_image_hash = _get_image_hash(pre_image_data)
+            _pre_clip_seq = [_get_clipboard_sequence_number()]
 
-            pre_clip_text = _get_clipboard_text_clean()
-            # We also keep the raw (non-stripped) version for the registry
-            pre_clip_raw: Optional[str] = None
-            if pre_clip_text:
-                try:
-                    pre_clip_raw = _read_system_clipboard()
-                except Exception:
-                    pre_clip_raw = pre_clip_text
-
-            # ---- 2. Set up text-paste detection via on_text_changed ----
+            # ---- 2. Set up paste detection via on_text_changed ----
             # Windows Terminal intercepts Ctrl+V and pastes raw characters
-            # before prompt_toolkit sees a key event.  We detect this by
-            # watching for the clipboard text to suddenly appear in the buffer.
+            # before prompt_toolkit sees a key event.  We detect this by:
+            #   a) Watching for clipboard sequence number changes (cheap!)
+            #   b) Then reading clipboard only when a change is detected
             _handling = [False]           # prevent recursion flag
             _prev_text = [buf.text]       # last known buffer state
-            _text_pasted = [False]        # have we already replaced?
 
             def _on_text_changed(b):
                 """Replace terminal-intercepted text paste with a token."""
-                if _handling[0] or _text_pasted[0]:
-                    return
-                if not pre_clip_text or len(pre_clip_text) < 3:
+                if _handling[0]:
                     return
 
                 current = b.text
                 if current == _prev_text[0]:
                     return
-                _prev_text[0] = current
 
-                # Did the clipboard text appear in the buffer?
-                if pre_clip_text not in current:
+                # Buffer shrank (user deleted) — not a paste
+                if len(current) <= len(_prev_text[0]):
+                    _prev_text[0] = current
                     return
 
-                # Was it already there before the prompt started?
-                # (We check against an empty buffer since prev_text tracks changes)
-                # Simple heuristic: if buffer grew and the new content contains
-                # the clipboard text, it was likely a paste.
+                # Check if the clipboard changed since the prompt started.
+                # On Windows this is a single ctypes call (< 1 microsecond).
+                # On other platforms, fall back to buffer-growth heuristic.
+                clip_changed = False
+                if _pre_clip_seq[0] > 0:
+                    clip_changed = _get_clipboard_sequence_number() != _pre_clip_seq[0]
+                else:
+                    # Non-Windows: assume paste if buffer grew by 3+ chars
+                    clip_changed = (len(current) - len(_prev_text[0])) >= 3
+
+                if not clip_changed:
+                    _prev_text[0] = current
+                    return
+
+                # Clipboard changed — read the text content (expensive, but
+                # only happens once per paste, not per keystroke)
+                clip_text = _get_clipboard_text_clean()
+                if not clip_text or len(clip_text) < 3:
+                    _prev_text[0] = current
+                    return
+
+                # Check that the clipboard text appears in the NEW content
+                # but NOT in the previous content — it was just added.
+                if clip_text not in current or clip_text in _prev_text[0]:
+                    _prev_text[0] = current
+                    return
+
+                # Read raw (non-stripped) version for the registry
+                clip_raw = _read_system_clipboard() or clip_text
 
                 _handling[0] = True
                 try:
                     token = _make_text_token()
                     _paste_registry[token] = {
                         "type": "text",
-                        "text": pre_clip_raw or pre_clip_text,
-                        "text_stripped": pre_clip_text,
+                        "text": clip_raw,
+                        "text_stripped": clip_text,
                     }
-                    idx = current.find(pre_clip_text)
+                    idx = current.find(clip_text)
                     if idx == -1:
                         return
                     b.text = (current[:idx] + token
-                              + current[idx + len(pre_clip_text):])
+                              + current[idx + len(clip_text):])
                     b.cursor_position = idx + len(token)
                     _prev_text[0] = b.text
-                    _text_pasted[0] = True
+                    # Update sequence number so we don't re-detect
+                    _pre_clip_seq[0] = _get_clipboard_sequence_number()
                 finally:
                     _handling[0] = False
 
             buf.on_text_changed += _on_text_changed
+
+            # ---- 2. Image paste poller (for Windows Terminal) ----
+            # When Ctrl+V pastes an image, Windows Terminal ignores it
+            # (no buffer change), so on_text_changed never fires.
+            # We poll the cheap clipboard sequence number every 200ms
+            # and insert the image token when an image paste is detected.
+            _prompt_active = [True]
+            _image_paste_thread = [None]
+
+            def _image_paste_poller():
+                """Background thread: poll clipboard for image pastes."""
+                last_seq = _pre_clip_seq[0]
+                while _prompt_active[0]:
+                    time.sleep(0.2)
+                    if not _prompt_active[0]:
+                        break
+                    cur_seq = _get_clipboard_sequence_number()
+                    if cur_seq == last_seq or cur_seq == 0:
+                        continue
+                    # Clipboard changed — check if it's an image
+                    try:
+                        img_data = _check_clipboard_has_image()
+                        if img_data and len(img_data) > 0:
+                            # Don't double-detect: check if this image
+                            # was already the pre-prompt image
+                            img_hash = _get_image_hash(img_data)
+                            if img_hash != pre_image_hash:
+                                data_url = _image_data_to_url(img_data)
+                                token = _make_image_token()
+                                _paste_registry[token] = {
+                                    "type": "image", "data_url": data_url
+                                }
+                                if not _handling[0]:
+                                    _handling[0] = True
+                                    try:
+                                        buf.insert_text(" " + token)
+                                        _prev_text[0] = buf.text
+                                    finally:
+                                        _handling[0] = False
+                    except Exception:
+                        pass
+                    last_seq = cur_seq
+
+            _img_thread = threading.Thread(
+                target=_image_paste_poller, daemon=True
+            )
+            _img_thread.start()
+            _image_paste_thread[0] = _img_thread
 
             # ---- 3. Run the prompt ----
             try:
@@ -674,16 +764,19 @@ class CLI:
                     style=PROMPT_STYLE,
                 ).strip()
             finally:
+                _prompt_active[0] = False
                 buf.on_text_changed -= _on_text_changed
+                # Wait for poller thread to notice and exit
+                if _image_paste_thread[0]:
+                    _image_paste_thread[0].join(timeout=0.5)
 
-            # ---- 4. Post-prompt: detect IMAGE paste ----
-            # (The terminal can't paste images as text, so on_text_changed
-            # won't catch them.  We detect the clipboard change here.)
+            # ---- 4. Post-prompt: detect IMAGE paste (fallback) ----
+            # Images can't be pasted as text, so on_text_changed won't
+            # catch them.  We detect the clipboard change here.
             try:
                 post_image_data = _check_clipboard_has_image()
                 post_image_hash = _get_image_hash(post_image_data)
                 if post_image_hash and post_image_hash != pre_image_hash:
-                    # New image on clipboard — user pressed Ctrl+V for an image
                     data_url = _image_data_to_url(post_image_data)
                     token = _make_image_token()
                     _paste_registry[token] = {"type": "image", "data_url": data_url}
@@ -694,8 +787,9 @@ class CLI:
             except Exception:
                 pass
 
-            # ---- 5. Resolve paste token placeholders -> real content ----
-            result = _resolve_paste_tokens(result)
+            # Note: paste token resolution happens in main.py, not here.
+            # main.py handles both text and image tokens in one pass.
+
             return result
 
         except (EOFError, KeyboardInterrupt):
