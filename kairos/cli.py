@@ -645,7 +645,13 @@ class CLI:
                 # On other platforms, fall back to buffer-growth heuristic.
                 clip_changed = False
                 if _pre_clip_seq[0] > 0:
-                    clip_changed = _get_clipboard_sequence_number() != _pre_clip_seq[0]
+                    current_seq = _get_clipboard_sequence_number()
+                    clip_changed = current_seq != _pre_clip_seq[0]
+                    # Always sync the sequence number immediately so we
+                    # don't re-trigger on the next keystroke when the
+                    # clipboard change wasn't an actual paste (e.g. a
+                    # clipboard manager or another app touched it once).
+                    _pre_clip_seq[0] = current_seq
                 else:
                     # Non-Windows: assume paste if buffer grew by 3+ chars
                     clip_changed = (len(current) - len(_prev_text[0])) >= 3
@@ -685,8 +691,6 @@ class CLI:
                               + current[idx + len(clip_text):])
                     b.cursor_position = idx + len(token)
                     _prev_text[0] = b.text
-                    # Update sequence number so we don't re-detect
-                    _pre_clip_seq[0] = _get_clipboard_sequence_number()
                 finally:
                     _handling[0] = False
 

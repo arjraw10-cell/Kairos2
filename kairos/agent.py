@@ -1566,6 +1566,9 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         current = user_message
         _first_image = image_url  # Only attach to the very first step
 
+        max_empty_retries = 2  # Retry up to 2 times if agent returns no response
+        empty_retry_count = 0
+
         try:
             while True:
                 # Check for graceful stop (Escape) — only between steps,
@@ -1586,7 +1589,15 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 if response:
                     return response
                 if not tool_calls:
-                    return "Agent stopped without response."
+                    # No response and no tool calls — retry the API call
+                    if empty_retry_count < max_empty_retries:
+                        empty_retry_count += 1
+                        if self.on_compact:
+                            self.on_compact(
+                                f"No response from API — retrying ({empty_retry_count}/{max_empty_retries})..."
+                            )
+                        continue
+                    return "Agent returned without a response."
         except InterruptedError:
             return "[Interrupted]"
 

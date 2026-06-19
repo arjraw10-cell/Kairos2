@@ -568,22 +568,41 @@ class BrowserManager:
                     # Get the element's id
                     el_id = el.get_attribute("id")
                     if el_id:
+                        # Try <label for="id"> (standard HTML)
                         label_loc = page.locator(f'label[for="{el_id}"]')
                         if label_loc.count() > 0:
                             label_loc.first.click(timeout=3000)
                             return True
+                        # Try aria-labelledby target (Moodle LMS pattern).
+                        # Moodle uses <div id="..._label"> instead of <label>.
+                        aria_id = el.get_attribute("aria-labelledby")
+                        if aria_id:
+                            aria_loc = page.locator(f'[id="{aria_id}"]')
+                            if aria_loc.count() > 0:
+                                aria_loc.first.click(timeout=3000)
+                                return True
                     # Try closest wrapping label
                     wrapping = page.locator(f"label:has({selector})").first
                     if wrapping.count() > 0:
                         wrapping.click(timeout=3000)
                         return True
-                    # Last resort: force click via JS
+                    # Last resort: force click via JS using getElementById.
+                    # querySelector fails on IDs with colons (e.g. Moodle quiz
+                    # IDs like q10711386:4_answer4), but getElementById is
+                    # immune since it takes a raw string, not a CSS selector.
                     try:
-                        result = page.evaluate(f"""() => {{
-                            const el = document.querySelector('{selector}');
-                            if (el) {{ el.click(); return true; }}
+                        result = page.evaluate("""(sel) => {
+                            // For [id="..."] attribute selectors, extract the raw ID
+                            let el = null;
+                            const idMatch = sel.match(/^\\[id="(.+)"\\]$/);
+                            if (idMatch) {
+                                el = document.getElementById(idMatch[1]);
+                            } else {
+                                el = document.querySelector(sel);
+                            }
+                            if (el) { el.click(); return true; }
                             return false;
-                        }}""")
+                        }""", selector)
                         if result:
                             return True
                     except Exception:
@@ -657,16 +676,49 @@ class BrowserManager:
             method = self._worker.dispatch(_do_select, timeout=10)
             if method:
                 return f"Selected '{value}' in {selector} (matched by {method})"
-            return f"Select failed for '{selector}': '{value}' not found as value, label, or index"
         except Exception as e:
-            return f"Select failed for '{selector}': {e}"
+            pass  # Fall through to JS fallback
+
+        # Fallback: set via JS using getElementById (handles selectors like
+        # [id="menuq10711386:10_sub0"] that Playwright can't parse)
+        try:
+            def _do_js_select():
+                # Parse [id="..."] attribute selectors → raw ID string
+                if selector.startswith('[id="') and selector.endswith('"]'):
+                    raw_id = selector[5:-2]
+                    return page.evaluate(
+                        "(id, val) => {"
+                        "  const e = document.getElementById(id);"
+                        "  if (!e) return null;"
+                        "  e.value = val;"
+                        "  e.dispatchEvent(new Event('change', {bubbles: true}));"
+                        "  return e.value;"
+                        "}",
+                        raw_id, value,
+                    )
+                return None
+            result = self._worker.dispatch(_do_js_select, timeout=10)
+            if result is not None:
+                return f"Selected '{value}' in {selector} (via JS)"
+        except Exception:
+            pass
+
+        return f"Select failed for '{selector}': '{value}' not found as value, label, or index"
 
     def evaluate(self, expression: str) -> str:
         page = self.current_page
         if not page:
             return "No active page."
         try:
-            result = self._worker.dispatch(lambda: page.evaluate(expression), timeout=15)
+            # If expression is a string that contains 'return', wrap it
+            # in an arrow function so Playwright treats it as a function body
+            # rather than a top-level statement (where bare return is illegal).
+            # Simple expressions like "document.querySelector(...).innerHTML"
+            # are fine as-is since they don't use 'return'.
+            fn_expression = expression
+            if isinstance(expression, str) and 'return' in expression.split():
+                fn_expression = f'() => {{ {expression} }}'
+            result = self._worker.dispatch(lambda: page.evaluate(fn_expression), timeout=15)
             if result is None:
                 return "JavaScript executed (returned null/undefined)"
             if isinstance(result, str):
@@ -792,7 +844,13 @@ class BrowserManager:
                         label_text = el.get("label", "")
                         display = label_text or text or placeholder or value
                         checked = "✓" if el.get("checked") else "✗"
-                        parts.append(f'{input_type}: "{display}" {checked}')
+                        # Show label_selector hint so the model knows which
+                        # element to click (aria-labelledby target from snapshot)
+                        label_sel = el.get("label_selector", "")
+                        if label_sel:
+                            parts.append(f'{input_type}: "{display}" {checked} (label: {label_sel})')
+                        else:
+                            parts.append(f'{input_type}: "{display}" {checked}')
                     else:
                         display = placeholder or text or input_type
                         val_str = f' = "{value}"' if value else ""
@@ -823,6 +881,10 @@ class BrowserManager:
 
                 parts.append(f" -> {selector}")
                 lines.append(" ".join(parts))
+                # Show question context if available
+                ctx = el.get("context", "")
+                if ctx:
+                    lines.append(f"       ↳ Q: {ctx}")
             lines.append("")
 
         text_blocks = data.get("text_blocks", [])
@@ -983,8 +1045,7 @@ class BrowserManager:
 #  Snapshot JS (defined at module level so lambdas can reference it)
 # ------------------------------------------------------------------
 
-_SNAPSHOT_JS = """
-() => {
+_SNAPSHOT_JS = """() => {
     const result = {
         title: document.title || '',
         url: window.location.href,
@@ -994,10 +1055,16 @@ _SNAPSHOT_JS = """
     };
 
     function getSelector(el) {
-        if (el.id) return '#' + CSS.escape(el.id);
+        // Use [id="..."] attribute selectors instead of #id with CSS.escape.
+        // CSS.escape produces backslash-escaped selectors that double when
+        // serialized through JSON/Python, causing selector failures.
+        // Attribute selectors handle colons and special chars natively.
+        if (el.id) {
+            return '[id="' + el.id + '"]';
+        }
         if (el.name) {
             const tag = el.tagName.toLowerCase();
-            return tag + '[name="' + CSS.escape(el.name) + '"]';
+            return tag + '[name="' + el.name + '"]';
         }
         if (el.dataset && el.dataset.testid) {
             return '[data-testid="' + el.dataset.testid + '"]';
@@ -1007,7 +1074,7 @@ _SNAPSHOT_JS = """
         while (current && current !== document.body && path.length < 4) {
             let selector = current.tagName.toLowerCase();
             if (current.id) {
-                selector = '#' + CSS.escape(current.id);
+                selector = '[id="' + current.id + '"]';
                 path.unshift(selector);
                 break;
             }
@@ -1044,17 +1111,62 @@ _SNAPSHOT_JS = """
         return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
     }
 
+    // Walk up the DOM from an element to find the nearest question context.
+    // Looks for common quiz/LMS patterns: .qtext, .formulation, fieldset,
+    // legend, heading (h1-h4), or any element with question-like class names.
+    // Returns a short context string (the question text) or empty string.
+    function findQuestionContext(el) {
+        const questionSelectors = [
+            '.qtext', '.formulation', '.question-text', '.question-text-text',
+            '.quiz-problem', '.formulation.clearfix',
+            'fieldset', 'legend',
+            '[role="group"]', '[role="radiogroup"]'
+        ];
+        let current = el;
+        // Walk up max 10 levels to avoid performance issues
+        for (let i = 0; i < 10 && current && current !== document.body; i++) {
+            current = current.parentElement;
+            if (!current) break;
+
+            // Check for question text containers
+            for (const sel of questionSelectors) {
+                if (current.matches && current.matches(sel)) {
+                    const qtextEl = current.querySelector('.qtext') || current;
+                    let text = getText(qtextEl, 200);
+                    if (text && text.length > 3) return text;
+                }
+            }
+
+            // Check for headings
+            if (/^H[1-4]$/.test(current.tagName)) {
+                const text = getText(current, 150);
+                if (text && text.length > 3) return text;
+            }
+
+            // Check for "Question N" text pattern
+            const directText = getText(current, 50);
+            if (directText && /^Question \\d+/.test(directText)) {
+                const parent = current.parentElement;
+                if (parent) {
+                    const qtext = parent.querySelector('.qtext, .formulation p, p');
+                    if (qtext) {
+                        const qText = getText(qtext, 200);
+                        if (qText && qText.length > 3) return qText;
+                    }
+                }
+            }
+        }
+        return '';
+    }
+
     const interactiveSelectors = 'a, button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="radio"], [role="checkbox"], [role="option"], [role="listbox"], [role="combobox"], [role="menuitemcheckbox"], [role="menuitemradio"], [onclick]';
     document.querySelectorAll(interactiveSelectors).forEach(el => {
         const tag = el.tagName.toLowerCase();
 
-        // For radio/checkbox inputs, allow hidden ones — they are often hidden
-        // by CSS but paired with a visible <label>. Skip truly hidden elements
-        // for other types (nobody needs a hidden <div>).
         if (tag === 'input') {
             const inputType = el.type || 'text';
             if (inputType === 'radio' || inputType === 'checkbox') {
-                // Always include — even if hidden, we need them for form completeness
+                // Always include
             } else if (!isVisible(el)) {
                 return;
             }
@@ -1068,28 +1180,52 @@ _SNAPSHOT_JS = """
             text: getText(el, 60)
         };
 
+        // Add question context for answer-type elements (radio, checkbox, select in quiz context)
+        if (tag === 'input' || tag === 'select') {
+            const inputType = el.type || (tag === 'select' ? 'select' : 'text');
+            if (inputType === 'radio' || inputType === 'checkbox' || tag === 'select') {
+                const ctx = findQuestionContext(el);
+                if (ctx) entry.context = ctx;
+            }
+        }
+
         if (tag === 'input') {
             entry.input_type = el.type || 'text';
             entry.placeholder = el.placeholder || '';
             entry.value = el.value || '';
             entry.checked = el.checked || false;
-            // For radio/checkbox, find the associated label text
             if (entry.input_type === 'radio' || entry.input_type === 'checkbox') {
                 const inputId = el.id;
                 if (inputId) {
-                    const label = document.querySelector('label[for="' + CSS.escape(inputId) + '"]');
+                    // Check 1: <label for="id"> (standard HTML)
+                    const label = document.querySelector('label[for="' + inputId + '"]');
                     if (label) entry.label = getText(label, 80);
                 }
-                // Also check parent <label> wrapping the input
+                // Check 2: parent <label> wrapping the input
                 if (!entry.label) {
                     const parentLabel = el.closest('label');
                     if (parentLabel) {
-                        // Get text excluding the input itself
                         const clone = parentLabel.cloneNode(true);
                         const inputs = clone.querySelectorAll('input');
                         inputs.forEach(inp => inp.remove());
                         const labelText = getText(clone, 80);
                         if (labelText) entry.label = labelText;
+                    }
+                }
+                // Check 3: aria-labelledby (Moodle LMS pattern)
+                const ariaLabelledBy = el.getAttribute('aria-labelledby');
+                if (ariaLabelledBy && !entry.label) {
+                    const ariaLabelEl = document.getElementById(ariaLabelledBy);
+                    if (ariaLabelEl) {
+                        const ariaText = getText(ariaLabelEl, 80);
+                        if (ariaText) entry.label = ariaText;
+                    }
+                }
+                // Store label_selector for clickable label element
+                if (ariaLabelledBy) {
+                    const ariaLabelEl = document.getElementById(ariaLabelledBy);
+                    if (ariaLabelEl) {
+                        entry.label_selector = getSelector(ariaLabelEl);
                     }
                 }
             }
@@ -1115,21 +1251,17 @@ _SNAPSHOT_JS = """
         result.elements.push(entry);
     });
 
-    // Also capture <label> elements associated with form controls so the model
-    // can see the text near radio buttons even when the input is hidden.
     const labels = document.querySelectorAll('label');
     let labelCount = 0;
     labels.forEach(el => {
         if (labelCount >= 30) return;
         const text = getText(el, 100);
         if (!text || text.length < 2) return;
-        // Check if this label is associated with an input
         const forAttr = el.getAttribute('for');
         const input = forAttr ? document.getElementById(forAttr) : el.querySelector('input');
         if (input) {
             const inputType = input.type || 'text';
             if (inputType === 'radio' || inputType === 'checkbox') {
-                // Already captured as input — skip to avoid duplication
                 return;
             }
         }
@@ -1151,7 +1283,7 @@ _SNAPSHOT_JS = """
     const textEls = document.querySelectorAll('p, label, li, dt, dd, [role="text"], [role="heading"]');
     let textCount = 0;
     textEls.forEach(el => {
-        if (!isVisible(el) || textCount >= 20) return;
+        if (!isVisible(el) || textCount >= 40) return;
         const text = getText(el, 120);
         if (text && text.length > 5) {
             result.text_blocks.push(text);
@@ -1161,4 +1293,5 @@ _SNAPSHOT_JS = """
 
     return result;
 }
+
 """

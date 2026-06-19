@@ -114,10 +114,10 @@ Sub-agents have access to file, search, git, and terminal tools but cannot spawn
 |------|-------------|
 | `browser_launch(profile?, proxy?, humanize?, chrome_profile?, connect_cdp?)` | Launch a browser (Playwright or CloakBrowser stealth) |
 | `browser_navigate(url)` | Navigate to a URL |
-| `browser_click(selector)` | Click an element (CSS selector, text, or label — auto-fallback for hidden inputs like radio buttons) |
+| `browser_click(selector)` | Click an element (CSS selector, text, or label — auto-fallback for hidden inputs like radio buttons; uses `getElementById` for IDs with special chars) |
 | `browser_type(selector, text, press_enter?)` | Type into an input field |
-| `browser_select(selector, value)` | Select a dropdown option (tries by value, then visible label text, then index) |
-| `browser_snapshot()` | Get a compact text representation of the page (interactive elements, select options, radio labels, form state) |
+| `browser_select(selector, value)` | Select a dropdown option (tries by value, then visible label text, then index, then JS fallback via `getElementById`) |
+| `browser_snapshot()` | Get a compact text representation of the page (interactive elements, select options, radio labels, form state, question context for quiz pages) |
 | `browser_screenshot(full_page?)` | Capture a screenshot (saved to `~/.kairos/screenshots/`) |
 | `browser_tab_list()` | List all open tabs |
 | `browser_tab_switch(index?, url_pattern?)` | Switch tabs by index or URL pattern |

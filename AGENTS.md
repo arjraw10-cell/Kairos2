@@ -215,7 +215,8 @@ The main agent loop:
    - Checks `_should_stop()` (Escape) between steps
    - Auto-compacts if context > 80%
    - Calls `step()`
-   - Returns when: final response received, no tool calls, interrupt, or graceful stop (Escape)
+   - **Empty response retry**: If `step()` returns no content and no tool calls (API returned nothing), retries the same call up to 2 times with a status message before giving up. This handles transient API issues where the model returns an empty response.
+   - Returns when: final response received, no tool calls (after retries exhausted), interrupt, or graceful stop (Escape)
 3. Returns `"[Interrupted]"` on `InterruptedError`
 
 #### Compaction
@@ -279,7 +280,7 @@ Rebuilds system prompt, resets token counter, closes browser if open.
 - `_paste_handler(event)` — Ctrl+V key binding: text paste only (reads clipboard, inserts text token)
 - `_alt_v_handler(event)` — Alt+V key binding: image paste only (reads clipboard image, inserts image token; shows `[no image on clipboard]` if none)
 - `_backspace_handler(event)` — deletes entire paste token if cursor is inside one
-- `_on_text_changed(b)` — detects Windows Terminal paste using `GetClipboardSequenceNumber()` (a single ctypes call) to detect clipboard changes cheaply, then reads clipboard content only when a paste is actually detected
+- `_on_text_changed(b)` — detects Windows Terminal paste using `GetClipboardSequenceNumber()` (a single ctypes call) to detect clipboard changes cheaply, then reads clipboard content only when a paste is actually detected. The sequence number is synced immediately after each check so a one-time clipboard change (e.g. from a clipboard manager or another app) doesn't cause repeated expensive subprocess calls on every subsequent keystroke.
 - Image pasting is explicit via Alt+V — no background polling or auto-detection
 
 **Clipboard helpers** (cross-platform):
@@ -354,10 +355,10 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 
 **Key operations** (all dispatched to worker thread):
 - `navigate(url)` — `page.goto(url, wait_until="domcontentloaded")`
-- `click(selector)` — tries CSS selector first, falls back to `page.get_by_text()`, then label/JS click for hidden elements (radio/checkbox)
+- `click(selector)` — tries CSS selector first, falls back to `page.get_by_text()`, then label/JS click for hidden elements (radio/checkbox), then `getElementById` via JS for IDs with special chars (colons, etc.)
 - `type_text(selector, text, press_enter?)` — `loc.fill("")` then `loc.type(text, delay=30)`
-- `select_option(selector, value)` — tries by HTML `value` attribute, then by visible `label` text, then by numeric index (auto-fallback chain)
-- `snapshot()` — executes `_SNAPSHOT_JS` (inline JS that extracts accessibility tree), formats into compact text
+- `select_option(selector, value)` — tries by HTML `value` attribute, then by visible `label` text, then by numeric index, then JS fallback via `getElementById` + `dispatchEvent('change')` for selectors that Playwright can't parse
+- `snapshot()` — executes `_SNAPSHOT_JS` (inline JS that extracts accessibility tree), formats into compact text. Question context lines (`↳ Q:`) are shown below radio/checkbox/select elements when available.
 - `screenshot(full_page?)` — saves PNG to `~/.kairos/screenshots/screenshot_<timestamp>.png`, returns file path
 - Tab management: `open_new_tab()`, `switch_tab()`, `list_tabs()`, `close_tab()`
 - `evaluate(expression)` — `page.evaluate(expression)`, returns JSON-stringified result
@@ -366,8 +367,9 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 - Interactive elements with computed CSS selectors (id > name > data-testid > class path)
 - Hidden radio/checkbox inputs (always included, even when CSS-hidden — commonly used in quiz forms)
 - Associated `<label>` text for radio/checkbox inputs (via `label[for]` and wrapping `<label>`)
+- **Question context** for radio/checkbox/select elements: walks up the DOM via `findQuestionContext()` to find the nearest question text (Moodle `.qtext`, `.formulation`, headings, "Question N" patterns). Included as `context` field on element entries.
 - Headings (h1-h4)
-- Text blocks (p, label, li, dt, dd)
+- Text blocks (p, label, li, dt, dd) — up to 40 blocks (increased from 20)
 - Form state (input values, textarea content, select options with visible text and value attributes)
 - Additional ARIA roles: `radio`, `checkbox`, `option`, `listbox`, `combobox`, `menuitemcheckbox`, `menuitemradio`
 
@@ -375,7 +377,7 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 1. CSS selector click via Playwright `locator(selector).click()`
 2. `page.get_by_text()` — matches visible text
 3. Label click — finds `<label for="id">` wrapping the element and clicks it (for hidden radio/checkbox)
-4. JavaScript `el.click()` — last resort force-click via `document.querySelector().click()`
+4. JavaScript `el.click()` — last resort force-click: parses `[id="..."]` attribute selectors to extract raw ID, then uses `document.getElementById(id).click()` (immune to colons and special chars that break `querySelector`). Falls back to `querySelector` for non-ID selectors.
 
 ### `kairos/tools/base.py` — ToolResult
 
