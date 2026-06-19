@@ -11,7 +11,7 @@ A minimal personal coding agent in Python.
 - **Auto-Compaction**: Conversation history is automatically summarized when context usage exceeds 80%
 - **Sub-Agents**: Spawn autonomous child agents to work on tasks in parallel
 - **Browser Automation**: Full Playwright/CloakBrowser integration with stealth mode, persistent profiles, multi-tab, and CDP support
-- **Paste System**: Ctrl+V creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. On Windows, uses `GetClipboardSequenceNumber()` for fast detection that doesn't slow down typing.
+- **Paste System**: Ctrl+V pastes text, Alt+V pastes images. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. No background polling or auto-detection — images are pasted explicitly via Alt+V.
 - **Chat Persistence**: All sessions saved to `chats/chats.json` with auto-save every 60 seconds and on window close. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions.
 - **`/resume`**: Load previous chats via numbered picker
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
@@ -63,7 +63,8 @@ python main.py /path/to/project  # specific workspace
 |---------|-------------|
 | `Escape` | Stop after current step (finish tool calls, then wait for input) |
 | `Ctrl+C` | Hard-interrupt (abort mid-step) |
-| `Ctrl+V` | Paste text or images from clipboard |
+| `Ctrl+V` | Paste text from clipboard |
+| `Alt+V` | Paste image from clipboard |
 | `/resume` | Load a saved chat |
 | `/compact` | Manually compact conversation history |
 | `/paste` | Info about paste functionality |

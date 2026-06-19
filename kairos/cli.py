@@ -3,9 +3,8 @@ import time
 import sys
 import os
 import base64
-from typing import Optional, Callable, Dict, List, Tuple
+from typing import Optional, Callable, Dict
 
-import hashlib
 import subprocess
 import tempfile
 from pathlib import Path
@@ -226,13 +225,6 @@ def _image_data_to_url(data: bytes) -> str:
 #  Clipboard monitoring helpers                                       #
 # ------------------------------------------------------------------ #
 
-def _get_image_hash(data: Optional[bytes]) -> Optional[str]:
-    """Return MD5 hex digest of image bytes, or None."""
-    if data and len(data) > 0:
-        return hashlib.md5(data).hexdigest()
-    return None
-
-
 def _get_clipboard_text_clean() -> str:
     """Read clipboard text, stripped. Returns empty string on failure."""
     try:
@@ -250,24 +242,14 @@ def _get_clipboard_text_clean() -> str:
 def _paste_handler(event):
     """Handle Ctrl+V on terminals that pass the key event through.
 
+    Text paste only. Images are pasted via Alt+V (see _alt_v_handler).
+
     On Windows Terminal, Ctrl+V is intercepted by the terminal itself
     and this handler is NEVER called.  For that case, ``get_user_input()``
-    uses ``Buffer.on_text_changed`` to detect text pastes and clipboard
-    polling to detect image pastes.
+    uses ``Buffer.on_text_changed`` to detect text pastes.
     """
     try:
         buf = event.app.current_buffer
-
-        # 1. Try image first
-        image_data = _check_clipboard_has_image()
-        if image_data and len(image_data) > 0:
-            data_url = _image_data_to_url(image_data)
-            token = _make_image_token()
-            _paste_registry[token] = {"type": "image", "data_url": data_url}
-            buf.insert_text(token)
-            return
-
-        # 2. Otherwise, try text
         text = _read_system_clipboard()
         if text:
             token = _make_text_token()
@@ -277,6 +259,28 @@ def _paste_handler(event):
                 "text_stripped": text.strip(),
             }
             buf.insert_text(token)
+    except Exception:
+        pass
+
+
+@_kb.add("escape", "v")
+def _alt_v_handler(event):
+    """Handle Alt+V: paste an image from the clipboard.
+
+    Reads the clipboard for image data and inserts a ``(Pasted Image #N)``
+    token if found.  If the clipboard has no image, shows a brief message.
+    """
+    try:
+        buf = event.app.current_buffer
+        image_data = _check_clipboard_has_image()
+        if image_data and len(image_data) > 0:
+            data_url = _image_data_to_url(image_data)
+            token = _make_image_token()
+            _paste_registry[token] = {"type": "image", "data_url": data_url}
+            buf.insert_text(token)
+        else:
+            # Brief inline hint — doesn't survive long but user sees it
+            buf.insert_text("[no image on clipboard]")
     except Exception:
         pass
 
@@ -327,9 +331,8 @@ class CLI:
         self._live: Optional[Live] = None
         self._stream_text = ""
         self._skip_print_response = False
-        self._last_clipboard_hash: Optional[str] = None
 
-        # PromptSession with paste support (Ctrl+V)
+        # PromptSession with paste support (Ctrl+V / Alt+V)
         self._prompt_session = PromptSession(
             key_bindings=_kb,
             enable_open_in_editor=False,
@@ -345,12 +348,15 @@ class CLI:
     # ------------------------------------------------------------------ #
 
     def print_banner(self):
+        # Build banner using chr(92) to avoid all backslash escaping issues
+        BS = chr(92)  # backslash character
+        line1 = " __  __     ______   __  __        ____  ____  ___"
+        line2 = "/  " + BS + "/  | __|__  / | /  " + BS + "/  | __ _|  _ " + BS + "/ ___|/ __|"
+        line3 = BS + "      / |_ / / /| ||      |/ _" + chr(96) + " | |_) " + BS + "___ " + BS + " (__ "
+        line4 = " " + BS + "__" + BS + "__/ /__/____|_|" + BS + "____/" + BS + "__,_|____/|____/" + BS + "___|"
+        banner_art = line1 + chr(10) + line2 + chr(10) + line3 + chr(10) + line4 + chr(10)
         banner = Text()
-        banner.append(
-            "\u2588\u2584\u2588\u2584\u2588 \u2588\u2580\u2588 \u2588\u2584\u2588 \u2588\u2580\u2580 \u2588\u2580\u2588 \u2588\u2584\u2588\u2584\u2588\n\u2588\u2581\u2580\u2588\u2581\u2588 \u2588\u2588 \u2588\u2581\u2580 \u2588\u2588\u2584 \u2588\u2588\u2588 \u2588\u2581\u2580\u2588\u2581\u2588",
-            style="bold cyan",
-        )
-        banner.append("\n", style="dim")
+        banner.append(banner_art, style="bold cyan")
         banner.append("Minimal Coding Agent", style="italic white")
         self.console.print(Panel(banner, border_style="cyan", padding=(1, 2)))
         self.console.print()
@@ -539,25 +545,6 @@ class CLI:
         return None
 
     # ------------------------------------------------------------------ #
-    #  Clipboard image detection (for auto-detect / post-prompt)          #
-    # ------------------------------------------------------------------ #
-
-    def check_clipboard_image(self) -> Optional[str]:
-        """Check clipboard for image data. Returns a base64 data URL, or None.
-
-        Deduplicates by content hash so the same image isn't returned twice
-        in a row.
-        """
-        image_data = _check_clipboard_has_image()
-        if image_data is None or len(image_data) == 0:
-            return None
-        h = hashlib.md5(image_data).hexdigest()
-        if h == self._last_clipboard_hash:
-            return None
-        self._last_clipboard_hash = h
-        return _image_data_to_url(image_data)
-
-    # ------------------------------------------------------------------ #
     #  Escape key listener                                                 #
     # ------------------------------------------------------------------ #
 
@@ -630,18 +617,14 @@ class CLI:
 
             buf = self._prompt_session.default_buffer
 
-            # ---- 1. Snapshot clipboard state BEFORE the prompt ----
-            pre_image_data = _check_clipboard_has_image()
-            pre_image_hash = _get_image_hash(pre_image_data)
-            _pre_clip_seq = [_get_clipboard_sequence_number()]
-
-            # ---- 2. Set up paste detection via on_text_changed ----
+            # ---- Text paste detection via on_text_changed ----
             # Windows Terminal intercepts Ctrl+V and pastes raw characters
-            # before prompt_toolkit sees a key event.  We detect this by:
-            #   a) Watching for clipboard sequence number changes (cheap!)
-            #   b) Then reading clipboard only when a change is detected
+            # before prompt_toolkit sees a key event.  We detect this by
+            # watching for clipboard sequence number changes (cheap!) then
+            # reading clipboard only when a change is detected.
             _handling = [False]           # prevent recursion flag
             _prev_text = [buf.text]       # last known buffer state
+            _pre_clip_seq = [_get_clipboard_sequence_number()]
 
             def _on_text_changed(b):
                 """Replace terminal-intercepted text paste with a token."""
@@ -709,86 +692,18 @@ class CLI:
 
             buf.on_text_changed += _on_text_changed
 
-            # ---- 2. Image paste poller (for Windows Terminal) ----
-            # When Ctrl+V pastes an image, Windows Terminal ignores it
-            # (no buffer change), so on_text_changed never fires.
-            # We poll the cheap clipboard sequence number every 200ms
-            # and insert the image token when an image paste is detected.
-            _prompt_active = [True]
-            _image_paste_thread = [None]
-
-            def _image_paste_poller():
-                """Background thread: poll clipboard for image pastes."""
-                last_seq = _pre_clip_seq[0]
-                while _prompt_active[0]:
-                    time.sleep(0.2)
-                    if not _prompt_active[0]:
-                        break
-                    cur_seq = _get_clipboard_sequence_number()
-                    if cur_seq == last_seq or cur_seq == 0:
-                        continue
-                    # Clipboard changed — check if it's an image
-                    try:
-                        img_data = _check_clipboard_has_image()
-                        if img_data and len(img_data) > 0:
-                            # Don't double-detect: check if this image
-                            # was already the pre-prompt image
-                            img_hash = _get_image_hash(img_data)
-                            if img_hash != pre_image_hash:
-                                data_url = _image_data_to_url(img_data)
-                                token = _make_image_token()
-                                _paste_registry[token] = {
-                                    "type": "image", "data_url": data_url
-                                }
-                                if not _handling[0]:
-                                    _handling[0] = True
-                                    try:
-                                        buf.insert_text(" " + token)
-                                        _prev_text[0] = buf.text
-                                    finally:
-                                        _handling[0] = False
-                    except Exception:
-                        pass
-                    last_seq = cur_seq
-
-            _img_thread = threading.Thread(
-                target=_image_paste_poller, daemon=True
-            )
-            _img_thread.start()
-            _image_paste_thread[0] = _img_thread
-
-            # ---- 3. Run the prompt ----
+            # ---- Run the prompt ----
             try:
                 result = self._prompt_session.prompt(
                     HTML(f'<style class="prompt">{prefix}</style>'),
                     style=PROMPT_STYLE,
                 ).strip()
             finally:
-                _prompt_active[0] = False
                 buf.on_text_changed -= _on_text_changed
-                # Wait for poller thread to notice and exit
-                if _image_paste_thread[0]:
-                    _image_paste_thread[0].join(timeout=0.5)
-
-            # ---- 4. Post-prompt: detect IMAGE paste (fallback) ----
-            # Images can't be pasted as text, so on_text_changed won't
-            # catch them.  We detect the clipboard change here.
-            try:
-                post_image_data = _check_clipboard_has_image()
-                post_image_hash = _get_image_hash(post_image_data)
-                if post_image_hash and post_image_hash != pre_image_hash:
-                    data_url = _image_data_to_url(post_image_data)
-                    token = _make_image_token()
-                    _paste_registry[token] = {"type": "image", "data_url": data_url}
-                    if result:
-                        result = result + " " + token
-                    else:
-                        result = token
-            except Exception:
-                pass
 
             # Note: paste token resolution happens in main.py, not here.
             # main.py handles both text and image tokens in one pass.
+            # Images are pasted explicitly via Alt+V keybinding.
 
             return result
 

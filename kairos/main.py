@@ -141,7 +141,7 @@ def main():
     cli.print_banner()
     cli.print_info("Type your request, 'exit' to quit, '/resume' to load a chat")
     cli.print_info("'/compact' to compact conversation, Ctrl+C to hard-interrupt")
-    cli.print_info("Escape to stop after current step, Ctrl+V to paste text or images")
+    cli.print_info("Escape to stop after current step, Ctrl+V to paste text, Alt+V to paste images")
     cli.print_info("Commands: 'clear', 'reset', '/exit', '/quit'")
     cli.console.print()
 
@@ -211,9 +211,10 @@ def main():
                 continue
 
             if user_input.lower() == "/paste":
-                cli.print_info("Ctrl+V pastes text or images from your clipboard.")
+                cli.print_info("Ctrl+V pastes text from your clipboard.")
+                cli.print_info("Alt+V pastes images from your clipboard.")
                 cli.print_info(
-                    "Text shows as (Pasted text), images show as (Pasted image)."
+                    "Text shows as (Pasted Text #N), images show as (Pasted Image #N)."
                 )
                 cli.print_info(
                     "Backspace removes an entire paste token. The actual content is sent to the API."
@@ -247,19 +248,11 @@ def main():
                         user_input = user_input.replace(token, "")
             _paste_registry.clear()
 
-            # Also detect image from clipboard (for empty-input image send)
+            # Empty input: if no image was pasted, just skip
             if not user_input.strip():
                 if not paste_image_data_url:
-                    paste_image_data_url = cli.check_clipboard_image()
-                if paste_image_data_url:
-                    user_input = "Describe this image."
-                else:
                     continue
-            elif not paste_image_data_url:
-                # No paste image -- check clipboard for auto-detected image
-                paste_image_data_url = cli.check_clipboard_image()
-                if paste_image_data_url:
-                    cli.print_info("Image detected from clipboard")
+                user_input = "Describe this image."
 
             # Show animated "Thinking..." while agent processes
             cli.start_thinking()

@@ -207,15 +207,15 @@ Returns `(response_text | None, tool_calls_made: List[Dict])`.
 
 **Important**: Tool results have `image_url` stripped before appending to history (prevents 400 errors from OpenRouter/providers that don't support images in tool messages).
 
-#### Run (`run(user_message, image_url?, max_iterations=50`)
+#### Run (`run(user_message, image_url?)`)
 
 The main agent loop:
 1. Clears interrupt event
-2. Loops up to `max_iterations` (default 50):
+2. Loops indefinitely until one of the termination conditions is met:
    - Checks `_should_stop()` (Escape) between steps
    - Auto-compacts if context > 80%
    - Calls `step()`
-   - Returns when: final response received, no tool calls, interrupt, or max iterations
+   - Returns when: final response received, no tool calls, interrupt, or graceful stop (Escape)
 3. Returns `"[Interrupted]"` on `InterruptedError`
 
 #### Compaction
@@ -264,7 +264,6 @@ Rebuilds system prompt, resets token counter, closes browser if open.
 - `self._live` — `rich.live.Live` (streaming panel, None when not streaming)
 - `self._stream_text` — accumulated streaming text
 - `self._skip_print_response` — bool to prevent double-printing final response
-- `self._last_clipboard_hash` — MD5 hash for clipboard image deduplication
 - `self._prompt_session` — `PromptSession` with paste key bindings
 
 **Streaming display**:
@@ -277,10 +276,11 @@ Rebuilds system prompt, resets token counter, closes browser if open.
 - `_paste_registry: Dict[str, dict]` — maps token strings to `{type: "text"|"image", ...}`
 - `_make_image_token()` / `_make_text_token()` — creates numbered tokens like `(Pasted Image #1)`
 - `_reset_paste_counters()` — resets token counters at the start of each prompt
-- `_paste_handler(event)` — Ctrl+V key binding: checks clipboard for image first, then text
+- `_paste_handler(event)` — Ctrl+V key binding: text paste only (reads clipboard, inserts text token)
+- `_alt_v_handler(event)` — Alt+V key binding: image paste only (reads clipboard image, inserts image token; shows `[no image on clipboard]` if none)
 - `_backspace_handler(event)` — deletes entire paste token if cursor is inside one
 - `_on_text_changed(b)` — detects Windows Terminal paste using `GetClipboardSequenceNumber()` (a single ctypes call) to detect clipboard changes cheaply, then reads clipboard content only when a paste is actually detected
-- Image paste poller — background thread polls `GetClipboardSequenceNumber()` every 200ms while prompt is active; when clipboard changes to an image, inserts `(Pasted Image #1)` token into the buffer immediately (so user sees it and can backspace to remove it)
+- Image pasting is explicit via Alt+V — no background polling or auto-detection
 
 **Clipboard helpers** (cross-platform):
 - `_check_clipboard_has_image()` — Windows: PowerShell + `System.Windows.Forms.Clipboard`, macOS: `pngpaste`, Linux: `xclip`
