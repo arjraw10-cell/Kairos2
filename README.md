@@ -113,10 +113,10 @@ Sub-agents have access to file, search, git, and terminal tools but cannot spawn
 |------|-------------|
 | `browser_launch(profile?, proxy?, humanize?, chrome_profile?, connect_cdp?)` | Launch a browser (Playwright or CloakBrowser stealth) |
 | `browser_navigate(url)` | Navigate to a URL |
-| `browser_click(selector)` | Click an element (CSS selector or text) |
+| `browser_click(selector)` | Click an element (CSS selector, text, or label — auto-fallback for hidden inputs like radio buttons) |
 | `browser_type(selector, text, press_enter?)` | Type into an input field |
-| `browser_select(selector, value)` | Select a dropdown option |
-| `browser_snapshot()` | Get a compact text representation of the page (interactive elements, headings, form state) |
+| `browser_select(selector, value)` | Select a dropdown option (tries by value, then visible label text, then index) |
+| `browser_snapshot()` | Get a compact text representation of the page (interactive elements, select options, radio labels, form state) |
 | `browser_screenshot(full_page?)` | Capture a screenshot (saved to `~/.kairos/screenshots/`) |
 | `browser_tab_list()` | List all open tabs |
 | `browser_tab_switch(index?, url_pattern?)` | Switch tabs by index or URL pattern |
@@ -130,6 +130,7 @@ Browser features:
 - **CDP mode**: Connect to an already-running Chrome instance (`chrome --remote-debugging-port=9222`)
 - **Chrome profile copy**: Import your real Chrome profile (cookies, logins, history)
 - **Human-like mode**: Realistic mouse/keyboard/scroll behavior for bot detection
+- **Smart form interaction**: Hidden radio/checkbox inputs are captured with their label text; click auto-falls back to label/JS for hidden elements; select dropdowns show available options with both display text and value attributes
 
 ## Architecture
 

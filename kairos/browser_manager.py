@@ -555,11 +555,47 @@ class BrowserManager:
             self._worker.dispatch(lambda: page.locator(selector).click(timeout=10000), timeout=15)
             return f"Clicked: {selector}"
         except Exception as e:
+            # Fallback 1: try by visible text
             try:
                 self._worker.dispatch(lambda: page.get_by_text(selector, exact=False).first.click(timeout=5000), timeout=10)
                 return f"Clicked element with text: {selector}"
             except Exception:
-                return f"Click failed for '{selector}': {e}"
+                pass
+            # Fallback 2: for hidden inputs (radio/checkbox), click the associated label via JS
+            try:
+                def _click_label():
+                    el = page.locator(selector).first
+                    # Get the element's id
+                    el_id = el.get_attribute("id")
+                    if el_id:
+                        label_loc = page.locator(f'label[for="{el_id}"]')
+                        if label_loc.count() > 0:
+                            label_loc.first.click(timeout=3000)
+                            return True
+                    # Try closest wrapping label
+                    wrapping = page.locator(f"label:has({selector})").first
+                    if wrapping.count() > 0:
+                        wrapping.click(timeout=3000)
+                        return True
+                    # Last resort: force click via JS
+                    try:
+                        result = page.evaluate(f"""() => {{
+                            const el = document.querySelector('{selector}');
+                            if (el) {{ el.click(); return true; }}
+                            return false;
+                        }}""")
+                        if result:
+                            return True
+                    except Exception:
+                        pass
+                    return False
+
+                clicked = self._worker.dispatch(_click_label, timeout=10)
+                if clicked:
+                    return f"Clicked label for hidden element: {selector}"
+            except Exception:
+                pass
+            return f"Click failed for '{selector}': {e}"
 
     def type_text(self, selector: str, text: str, press_enter: bool = False) -> str:
         page = self.current_page
@@ -593,9 +629,35 @@ class BrowserManager:
         page = self.current_page
         if not page:
             return "No active page."
+
+        def _do_select():
+            loc = page.locator(selector)
+            # Try by value attribute first
+            try:
+                loc.select_option(value=value, timeout=3000)
+                return "value"
+            except Exception:
+                pass
+            # Try by visible label text (e.g. "to celebrate")
+            try:
+                loc.select_option(label=value, timeout=3000)
+                return "label"
+            except Exception:
+                pass
+            # Try by numeric index
+            try:
+                idx = int(value)
+                loc.select_option(index=idx, timeout=3000)
+                return "index"
+            except (ValueError, Exception):
+                pass
+            return None
+
         try:
-            self._worker.dispatch(lambda: page.locator(selector).select_option(value=value, timeout=5000), timeout=10)
-            return f"Selected '{value}' in {selector}"
+            method = self._worker.dispatch(_do_select, timeout=10)
+            if method:
+                return f"Selected '{value}' in {selector} (matched by {method})"
+            return f"Select failed for '{selector}': '{value}' not found as value, label, or index"
         except Exception as e:
             return f"Select failed for '{selector}': {e}"
 
@@ -727,8 +789,10 @@ class BrowserManager:
                     placeholder = el.get("placeholder", "")
                     value = el.get("value", "")
                     if input_type in ("checkbox", "radio"):
+                        label_text = el.get("label", "")
+                        display = label_text or text or placeholder or value
                         checked = "✓" if el.get("checked") else "✗"
-                        parts.append(f'{input_type}: "{text or placeholder}" {checked}')
+                        parts.append(f'{input_type}: "{display}" {checked}')
                     else:
                         display = placeholder or text or input_type
                         val_str = f' = "{value}"' if value else ""
@@ -737,7 +801,15 @@ class BrowserManager:
                     parts.append(f'Textarea: "{el.get("placeholder", "")}"')
                 elif tag == "select":
                     selected = el.get("selected", "")
-                    parts.append(f'Select: "{text}" selected="{selected}"')
+                    options = el.get("options", [])
+                    if options:
+                        opt_strs = []
+                        for opt in options:
+                            sel_mark = " *" if opt.get("selected") else ""
+                            opt_strs.append(f'"{opt.get("text", "")}" (val="{opt.get("value", "")}"){sel_mark}')
+                        parts.append(f'Select: "{text}" selected="{selected}" options=[{", ".join(opt_strs)}]')
+                    else:
+                        parts.append(f'Select: "{text}" selected="{selected}"')
                 else:
                     role = el.get("role", "")
                     parts.append(f'{tag}({role}): "{text}"')
@@ -972,10 +1044,24 @@ _SNAPSHOT_JS = """
         return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
     }
 
-    const interactiveSelectors = 'a, button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [onclick]';
+    const interactiveSelectors = 'a, button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="radio"], [role="checkbox"], [role="option"], [role="listbox"], [role="combobox"], [role="menuitemcheckbox"], [role="menuitemradio"], [onclick]';
     document.querySelectorAll(interactiveSelectors).forEach(el => {
-        if (!isVisible(el)) return;
         const tag = el.tagName.toLowerCase();
+
+        // For radio/checkbox inputs, allow hidden ones — they are often hidden
+        // by CSS but paired with a visible <label>. Skip truly hidden elements
+        // for other types (nobody needs a hidden <div>).
+        if (tag === 'input') {
+            const inputType = el.type || 'text';
+            if (inputType === 'radio' || inputType === 'checkbox') {
+                // Always include — even if hidden, we need them for form completeness
+            } else if (!isVisible(el)) {
+                return;
+            }
+        } else {
+            if (!isVisible(el)) return;
+        }
+
         const entry = {
             tag: tag,
             selector: getSelector(el),
@@ -987,14 +1073,34 @@ _SNAPSHOT_JS = """
             entry.placeholder = el.placeholder || '';
             entry.value = el.value || '';
             entry.checked = el.checked || false;
+            // For radio/checkbox, find the associated label text
+            if (entry.input_type === 'radio' || entry.input_type === 'checkbox') {
+                const inputId = el.id;
+                if (inputId) {
+                    const label = document.querySelector('label[for="' + CSS.escape(inputId) + '"]');
+                    if (label) entry.label = getText(label, 80);
+                }
+                // Also check parent <label> wrapping the input
+                if (!entry.label) {
+                    const parentLabel = el.closest('label');
+                    if (parentLabel) {
+                        // Get text excluding the input itself
+                        const clone = parentLabel.cloneNode(true);
+                        const inputs = clone.querySelectorAll('input');
+                        inputs.forEach(inp => inp.remove());
+                        const labelText = getText(clone, 80);
+                        if (labelText) entry.label = labelText;
+                    }
+                }
+            }
         } else if (tag === 'textarea') {
             entry.placeholder = el.placeholder || '';
             entry.value = (el.value || '').substring(0, 100);
         } else if (tag === 'select') {
             entry.selected = el.value || '';
-            entry.options = Array.from(el.options).slice(0, 10).map(o => ({
+            entry.options = Array.from(el.options).slice(0, 20).map(o => ({
                 value: o.value,
-                text: o.text.substring(0, 40),
+                text: o.text.substring(0, 50),
                 selected: o.selected
             }));
         } else if (tag === 'a') {
@@ -1007,6 +1113,28 @@ _SNAPSHOT_JS = """
         if (ariaLabel) entry.aria_label = ariaLabel;
 
         result.elements.push(entry);
+    });
+
+    // Also capture <label> elements associated with form controls so the model
+    // can see the text near radio buttons even when the input is hidden.
+    const labels = document.querySelectorAll('label');
+    let labelCount = 0;
+    labels.forEach(el => {
+        if (labelCount >= 30) return;
+        const text = getText(el, 100);
+        if (!text || text.length < 2) return;
+        // Check if this label is associated with an input
+        const forAttr = el.getAttribute('for');
+        const input = forAttr ? document.getElementById(forAttr) : el.querySelector('input');
+        if (input) {
+            const inputType = input.type || 'text';
+            if (inputType === 'radio' || inputType === 'checkbox') {
+                // Already captured as input — skip to avoid duplication
+                return;
+            }
+        }
+        result.text_blocks.push(text);
+        labelCount++;
     });
 
     document.querySelectorAll('h1, h2, h3, h4').forEach(el => {
