@@ -295,7 +295,7 @@ Called before every API request in `step()`. Handles two structural problems tha
 - `_paste_handler(event)` — Ctrl+V key binding: text paste only (reads clipboard, inserts text token)
 - `_alt_v_handler(event)` — Alt+V key binding: image paste only (reads clipboard image, inserts image token; shows `[no image on clipboard]` if none)
 - `_backspace_handler(event)` — deletes entire paste token if cursor is inside one
-- `_on_text_changed(b)` — detects Windows Terminal paste using `GetClipboardSequenceNumber()` (a single ctypes call) to detect clipboard changes cheaply, then reads clipboard content only when a paste is actually detected. The sequence number is synced immediately after each check so a one-time clipboard change (e.g. from a clipboard manager or another app) doesn't cause repeated expensive subprocess calls on every subsequent keystroke.
+- `_on_text_changed(b)` — detects Windows Terminal paste by reading the clipboard via a fast ctypes Win32 call (~0.001ms) on every text increase and checking if the clipboard text appears as a substring of the buffer. This works regardless of when the text was copied (before or after prompt start). For long text arriving character-by-character, enters a **pending state** and checks each subsequent event until the full clipboard text appears in the buffer (up to 100 events / ~5 second timeout). This approach works because on Windows Terminal, Ctrl+V is intercepted and characters are written to the buffer one at a time (growth=1 per keystroke), so buffer-growth heuristics never fire.
 - Image pasting is explicit via Alt+V — no background polling or auto-detection
 
 **Clipboard helpers** (cross-platform):
@@ -304,6 +304,7 @@ Called before every API request in `step()`. Handles two structural problems tha
 - `_detect_mime(data)` — detects PNG/JPEG/GIF/WEBP/BMP/TIFF from magic bytes
 - `_image_data_to_url(data)` — converts to base64 data URL
 - `_get_clipboard_sequence_number()` — Windows: single ctypes call to `GetClipboardSequenceNumber()` (microseconds), returns 0 on other platforms
+- `_ctypes_read_clipboard()` — Windows: reads clipboard text via direct Win32 API calls (OpenClipboard/GetClipboardData/GlobalLock), sub-millisecond. Falls back to `_read_system_clipboard()` on non-Windows
 
 **Escape key listener**:
 - `start_escape_listener(on_escape)` — spawns thread listening for raw Escape key

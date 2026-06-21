@@ -68,7 +68,7 @@ _kb = KeyBindings()
 def _get_clipboard_sequence_number() -> int:
     """Return the current clipboard sequence number (Windows only).
 
-    This is a single ctypes call — virtually free. The number increments
+    This is a single ctypes call -- virtually free. The number increments
     whenever clipboard content changes, letting us detect pastes without
     spawning subprocesses on every keystroke.
 
@@ -81,6 +81,40 @@ def _get_clipboard_sequence_number() -> int:
         return ctypes.windll.user32.GetClipboardSequenceNumber()
     except Exception:
         return 0
+
+
+def _ctypes_read_clipboard() -> str:
+    """Read clipboard text via Win32 API. Sub-millisecond on Windows.
+
+    Uses direct ctypes calls (OpenClipboard / GetClipboardData / GlobalLock)
+    instead of spawning PowerShell.  Returns empty string on failure or
+    non-Windows.
+    """
+    if sys.platform != "win32":
+        return _read_system_clipboard()
+    try:
+        import ctypes
+        CF_UNICODETEXT = 13
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        if not user32.OpenClipboard(0):
+            return ""
+        try:
+            if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                return ""
+            h = user32.GetClipboardData(CF_UNICODETEXT)
+            if not h:
+                return ""
+            p = kernel32.GlobalLock(h)
+            if not p:
+                return ""
+            text = ctypes.c_wchar_p(p).value or ""
+            kernel32.GlobalUnlock(h)
+            return text
+        finally:
+            user32.CloseClipboard()
+    except Exception:
+        return ""
 
 
 # ------------------------------------------------------------------ #
@@ -618,13 +652,21 @@ class CLI:
             buf = self._prompt_session.default_buffer
 
             # ---- Text paste detection via on_text_changed ----
-            # Windows Terminal intercepts Ctrl+V and pastes raw characters
-            # before prompt_toolkit sees a key event.  We detect this by
-            # watching for clipboard sequence number changes (cheap!) then
-            # reading clipboard only when a change is detected.
+            # Windows Terminal intercepts Ctrl+V and writes raw characters to
+            # the buffer one at a time (growth=1 per keystroke).  We detect
+            # pastes by reading the clipboard via a fast ctypes Win32 call
+            # (~0.001ms) on every text increase and checking if the clipboard
+            # text now appears in the buffer.  This works regardless of when
+            # the text was copied (before or after prompt start).
+            #
+            # For long text that arrives character-by-character, we hold a
+            # pending state and check each subsequent event until the full
+            # clipboard text appears in the buffer.
             _handling = [False]           # prevent recursion flag
             _prev_text = [buf.text]       # last known buffer state
-            _pre_clip_seq = [_get_clipboard_sequence_number()]
+            _pending_paste = [None]       # clipboard text awaiting full delivery
+            _pending_count = [0]          # events since pending started (timeout)
+            _last_clip_seq = [_get_clipboard_sequence_number()]  # baseline
 
             def _on_text_changed(b):
                 """Replace terminal-intercepted text paste with a token."""
@@ -638,61 +680,88 @@ class CLI:
                 # Buffer shrank (user deleted) — not a paste
                 if len(current) <= len(_prev_text[0]):
                     _prev_text[0] = current
+                    _pending_paste[0] = None
                     return
 
-                # Check if the clipboard changed since the prompt started.
-                # On Windows this is a single ctypes call (< 1 microsecond).
-                # On other platforms, fall back to buffer-growth heuristic.
-                clip_changed = False
-                if _pre_clip_seq[0] > 0:
-                    current_seq = _get_clipboard_sequence_number()
-                    clip_changed = current_seq != _pre_clip_seq[0]
-                    # Always sync the sequence number immediately so we
-                    # don't re-trigger on the next keystroke when the
-                    # clipboard change wasn't an actual paste (e.g. a
-                    # clipboard manager or another app touched it once).
-                    _pre_clip_seq[0] = current_seq
-                else:
-                    # Non-Windows: assume paste if buffer grew by 3+ chars
-                    clip_changed = (len(current) - len(_prev_text[0])) >= 3
-
-                if not clip_changed:
-                    _prev_text[0] = current
-                    return
-
-                # Clipboard changed — read the text content (expensive, but
-                # only happens once per paste, not per keystroke)
-                clip_text = _get_clipboard_text_clean()
-                if not clip_text or len(clip_text) < 3:
-                    _prev_text[0] = current
-                    return
-
-                # Check that the clipboard text appears in the NEW content
-                # but NOT in the previous content — it was just added.
-                if clip_text not in current or clip_text in _prev_text[0]:
-                    _prev_text[0] = current
-                    return
-
-                # Read raw (non-stripped) version for the registry
-                clip_raw = _read_system_clipboard() or clip_text
-
-                _handling[0] = True
-                try:
-                    token = _make_text_token()
-                    _paste_registry[token] = {
-                        "type": "text",
-                        "text": clip_raw,
-                        "text_stripped": clip_text,
-                    }
-                    idx = current.find(clip_text)
-                    if idx == -1:
+                # --- If we're waiting for a multi-chunk paste to finish ---
+                if _pending_paste[0] is not None:
+                    pending = _pending_paste[0]
+                    if pending in current:
+                        # Full text arrived — replace with token
+                        _handling[0] = True
+                        try:
+                            raw = _ctypes_read_clipboard() or pending
+                            token = _make_text_token()
+                            _paste_registry[token] = {
+                                "type": "text",
+                                "text": raw,
+                                "text_stripped": pending,
+                            }
+                            idx = current.find(pending)
+                            if idx != -1:
+                                b.text = (current[:idx] + token
+                                          + current[idx + len(pending):])
+                                b.cursor_position = idx + len(token)
+                                _prev_text[0] = b.text
+                            else:
+                                _prev_text[0] = current
+                        finally:
+                            _handling[0] = False
+                        _pending_paste[0] = None
+                        _pending_count[0] = 0
                         return
-                    b.text = (current[:idx] + token
-                              + current[idx + len(clip_text):])
-                    b.cursor_position = idx + len(token)
-                    _prev_text[0] = b.text
-                finally:
-                    _handling[0] = False
+                    _pending_count[0] += 1
+                    if _pending_count[0] > 100:
+                        # Timed out — not a paste after all
+                        _pending_paste[0] = None
+                        _pending_count[0] = 0
+                    else:
+                        # Still waiting — don't update _prev_text so we
+                        # can still detect the paste when it fully arrives
+                        return
+
+                # --- New paste detection: read clipboard via ctypes ---
+                # This is ~0.001ms on Windows, safe to do on every keystroke.
+                clip_raw = _ctypes_read_clipboard()
+                clip_text = clip_raw.strip() if clip_raw else ""
+                if len(clip_text) < 3:
+                    _prev_text[0] = current
+                    return
+
+                # Check if clipboard text is a substring of the buffer
+                if clip_text in current and clip_text not in _prev_text[0]:
+                    # Full paste detected in one shot — replace with token
+                    _handling[0] = True
+                    try:
+                        token = _make_text_token()
+                        _paste_registry[token] = {
+                            "type": "text",
+                            "text": clip_raw,
+                            "text_stripped": clip_text,
+                        }
+                        idx = current.find(clip_text)
+                        if idx != -1:
+                            b.text = (current[:idx] + token
+                                      + current[idx + len(clip_text):])
+                            b.cursor_position = idx + len(token)
+                            _prev_text[0] = b.text
+                        else:
+                            _prev_text[0] = current
+                    finally:
+                        _handling[0] = False
+                    return
+
+                if clip_text not in current and len(clip_text) > len(current):
+                    # Clipboard text is longer than buffer — long paste
+                    # arriving character-by-character.  Enter pending state.
+                    _pending_paste[0] = clip_text
+                    _pending_count[0] = 0
+                    # Don't update _prev_text — keep original for comparison
+                    return
+
+                # Either: clipboard text was already in buffer (not new),
+                # or buffer grew by 1 char of regular typing.
+                _prev_text[0] = current
 
             buf.on_text_changed += _on_text_changed
 
