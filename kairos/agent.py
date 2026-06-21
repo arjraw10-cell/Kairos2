@@ -951,6 +951,51 @@ class Agent:
 
             self.conversation_history = [system] + tail
 
+    def _validate_history_before_api(self) -> Optional[str]:
+        """Sanitize conversation history before sending to the API.
+
+        Handles two structural problems that cause 400 errors:
+
+        1. **No user message**: Some APIs reject requests with no user message.
+           Triggered by truncation dropping the user message during long
+           tool-call chains, or compaction landing on a bad boundary.
+           Recovery: auto-compact to restore a valid state.
+
+        2. **Invalid message ordering**: The OpenAI API requires alternating
+           user/assistant messages.  A stale tool result left over from a
+           previous step, or a truncation cut at a bad point, can leave the
+           history ending with: [..., tool, tool, user] — which is invalid.
+           Recovery: trim trailing tool messages that lack a preceding
+           assistant message in the recent window.
+
+        Returns a status message if recovery was performed, or None.
+        """
+        history = self.conversation_history
+        if len(history) <= 2:
+            return None
+
+        # --- Check 1: must have at least one user message ---
+        has_user = any(m.get("role") == "user" for m in history)
+        if not has_user:
+            return self.compact()
+
+        # --- Check 2: fix invalid tool message sequences ---
+        # Walk backward from the end.  If we hit tool messages before
+        # reaching an assistant message (or the start), those tools are
+        # orphaned (their assistant message was truncated away) and will
+        # cause a 400 error.
+        i = len(history) - 1
+        while i > 0 and history[i].get("role") == "tool":
+            i -= 1
+        # i now points to the last non-tool message from the end.
+        # If it's not an assistant, the trailing tools are orphaned.
+        if i > 0 and history[i].get("role") != "assistant":
+            orphan_count = len(history) - 1 - i
+            self.conversation_history = history[: i + 1]
+            return f"Removed {orphan_count} orphaned tool message(s) to fix history ordering."
+
+        return None
+
     # ------------------------------------------------------------------ #
     #  Compaction                                                          #
     # ------------------------------------------------------------------ #
@@ -1460,18 +1505,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
     # ------------------------------------------------------------------ #
     #  Agent loop                                                          #
     # ------------------------------------------------------------------ #
-
-    def _validate_history_before_api(self) -> Optional[str]:
-        """Check that conversation history is valid before an API call.
-
-        Some APIs reject requests that have no user message.  If we detect
-        this, attempt an auto-compact to restore a valid state.  Returns a
-        status message if recovery was performed, or None if history is fine.
-        """
-        has_user = any(m.get("role") == "user" for m in self.conversation_history)
-        if not has_user and len(self.conversation_history) > 2:
-            return self.compact()
-        return None
 
     def step(
         self, user_message: Optional[str] = None, image_url: Optional[str] = None

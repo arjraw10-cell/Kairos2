@@ -260,7 +260,9 @@ Keeps `system + last MAX_HISTORY_MESSAGES (100)`. After truncation, verifies at 
 
 #### History Validation (`_validate_history_before_api()`)
 
-Called before every API request in `step()`. If the conversation history has no user message (edge case from truncation or compaction), triggers a `compact()` to restore a valid state.
+Called before every API request in `step()`. Handles two structural problems that cause 400 errors:
+1. **No user message**: If the conversation history has no user message (from truncation or compaction), triggers a `compact()` to restore a valid state.
+2. **Orphaned tool messages**: If trailing tool messages lack a preceding assistant message (from truncation cutting at a bad point), they are trimmed to restore valid ordering.
 
 ### `kairos/cli.py` — CLI (Terminal UI)
 
