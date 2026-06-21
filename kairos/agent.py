@@ -932,9 +932,24 @@ class Agent:
     def _truncate_history_if_needed(self):
         if len(self.conversation_history) >= 1 + self.MAX_HISTORY_MESSAGES:
             system = self.conversation_history[0]
-            self.conversation_history = [system] + self.conversation_history[
-                -(self.MAX_HISTORY_MESSAGES) :
-            ]
+
+            # Standard truncation: keep system + last MAX_HISTORY_MESSAGES
+            tail = self.conversation_history[-(self.MAX_HISTORY_MESSAGES) :]
+
+            # Safety: ensure at least one user message survives truncation.
+            # Some APIs require a user message in the conversation history.
+            # During long tool-call chains (assistant + tool messages piling
+            # up), the user message can get pushed out of the window.
+            has_user = any(m.get("role") == "user" for m in tail)
+            if not has_user:
+                # Find the last user message in the full history and expand
+                # the window to include it (plus everything after it).
+                for i in range(len(self.conversation_history) - 1, 0, -1):
+                    if self.conversation_history[i].get("role") == "user":
+                        tail = self.conversation_history[i:]
+                        break
+
+            self.conversation_history = [system] + tail
 
     # ------------------------------------------------------------------ #
     #  Compaction                                                          #
@@ -1446,6 +1461,18 @@ Keep each section concise. Preserve exact file paths, function names, and error 
     #  Agent loop                                                          #
     # ------------------------------------------------------------------ #
 
+    def _validate_history_before_api(self) -> Optional[str]:
+        """Check that conversation history is valid before an API call.
+
+        Some APIs reject requests that have no user message.  If we detect
+        this, attempt an auto-compact to restore a valid state.  Returns a
+        status message if recovery was performed, or None if history is fine.
+        """
+        has_user = any(m.get("role") == "user" for m in self.conversation_history)
+        if not has_user and len(self.conversation_history) > 2:
+            return self.compact()
+        return None
+
     def step(
         self, user_message: Optional[str] = None, image_url: Optional[str] = None
     ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
@@ -1469,6 +1496,12 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             else:
                 user_msg = {"role": "user", "content": user_message}
             self.conversation_history.append(user_msg)
+
+        # Safety: ensure history has at least one user message before calling
+        # the API (some providers reject requests without one).
+        recovery = self._validate_history_before_api()
+        if recovery and self.on_compact:
+            self.on_compact(recovery)
 
         # Count input tokens for this turn
         self.tokens.start_turn(self.conversation_history)

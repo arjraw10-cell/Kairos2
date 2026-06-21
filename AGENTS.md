@@ -254,6 +254,14 @@ The main agent loop:
 
 Rebuilds system prompt, resets token counter, closes browser if open.
 
+#### History Truncation (`_truncate_history_if_needed()`)
+
+Keeps `system + last MAX_HISTORY_MESSAGES (100)`. After truncation, verifies at least one `role: "user"` message survives — if not, expands the window backward to include the most recent user message. This prevents the "No user query found in messages" 400 error that occurs during long tool-call chains.
+
+#### History Validation (`_validate_history_before_api()`)
+
+Called before every API request in `step()`. If the conversation history has no user message (edge case from truncation or compaction), triggers a `compact()` to restore a valid state.
+
 ### `kairos/cli.py` — CLI (Terminal UI)
 
 **Class**: `CLI`
