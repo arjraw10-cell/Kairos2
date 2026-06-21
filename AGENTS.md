@@ -215,7 +215,7 @@ The main agent loop:
    - Checks `_should_stop()` (Escape) between steps
    - Auto-compacts if context > 80%
    - Calls `step()`
-   - **Empty response retry**: If `step()` returns no content and no tool calls (API returned nothing), retries the same call up to 2 times with a status message before giving up. This handles transient API issues where the model returns an empty response.
+   - **Empty response retry**: If `step()` returns no content and no tool calls (API returned nothing), removes the empty assistant message from history (to prevent consecutive assistant messages), then retries the same call up to 2 times with a status message before giving up. This handles transient API issues where the model returns an empty response.
    - Returns when: final response received, no tool calls (after retries exhausted), interrupt, or graceful stop (Escape)
 3. Returns `"[Interrupted]"` on `InterruptedError`
 

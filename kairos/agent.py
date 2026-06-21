@@ -1589,7 +1589,12 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 if response:
                     return response
                 if not tool_calls:
-                    # No response and no tool calls — retry the API call
+                    # No response and no tool calls — retry the API call.
+                    # Remove the empty assistant message so the history still
+                    # ends with the user message (avoids the "Cannot have 2 or
+                    # more assistant messages at the end of the list" 400 error).
+                    if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
+                        self.conversation_history.pop()
                     if empty_retry_count < max_empty_retries:
                         empty_retry_count += 1
                         if self.on_compact:
