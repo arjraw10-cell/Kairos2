@@ -4,7 +4,7 @@
 
 ## Overview
 
-Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 24 tools. All file operations use absolute paths — no workspace containment.
+Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 27 tools. All file operations use absolute paths — no workspace containment.
 
 ## Project Structure
 
@@ -21,14 +21,14 @@ Agent2/
 ├── chats/                  # Saved chat sessions (gitignored)
 │   └── chats.json          # All chat history in one file
 └── kairos/
-    ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, TerminalManager, BrowserManager
+    ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, SkillManager, TerminalManager, BrowserManager
     ├── main.py             # CLI REPL loop, signal handlers, auto-save, paste resolution
     ├── config.py           # Lazy .env loading via lru_cache
-    ├── agent.py            # Core agent: streaming, tool dispatch, compaction, error handling (~800 lines)
-    ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling (~600 lines)
+    ├── agent.py            # Core agent: streaming, tool dispatch, compaction, error handling
+    ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling
     ├── tokens.py           # TokenCounter using tiktoken
     ├── terminal_manager.py # Terminal lifecycle (background + blocking)
-    ├── browser_manager.py  # Playwright/CloakBrowser in dedicated worker thread (~700 lines)
+    ├── browser_manager.py  # Playwright/CloakBrowser in dedicated worker thread
     └── tools/
         ├── __init__.py     # Imports and re-exports all tools
         ├── base.py         # ToolResult(success, output, error?, image_url?)
@@ -40,6 +40,7 @@ Agent2/
         ├── terminal.py     # 5 terminal tool wrappers
         ├── subagent.py     # SubAgentTool — spawn/track child agents
         ├── browser.py      # 12 browser tool wrappers
+        ├── skills.py       # SkillManager — list, load, write skills
         └── session.py      # SessionManager — save/load chats to chats/chats.json
 ```
 
@@ -58,7 +59,7 @@ if __name__ == "__main__":
 
 ### `kairos/__init__.py`
 
-Exports: `Config`, `Agent`, `ToolResult`, `SessionManager`, `TerminalManager`, `BrowserManager`.
+Exports: `Config`, `Agent`, `ToolResult`, `SessionManager`, `SkillManager`, `TerminalManager`, `BrowserManager`.
 
 ### `kairos/config.py` — Config
 
@@ -125,7 +126,7 @@ agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream
 **Constructor**: `Agent(workspace: str)`
 - Creates `OpenAI` client from config
 - Sets `self.cwd = Path(workspace).resolve()`
-- Initializes all 24 tool instances
+- Initializes all 27 tool instances
 - Calls `_setup_system_prompt()` which builds the system prompt and initializes `conversation_history`
 
 **Key attributes**:
@@ -140,6 +141,7 @@ agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream
 - `self.terminal_manager` — `TerminalManager` instance
 - `self.browser_manager` — `BrowserManager` instance
 - `self.subagent_tool` — `SubAgentTool` instance (None if sub-agent)
+- `self.skill_manager` — `SkillManager` instance
 
 **Callbacks** (set by `main.py`):
 - `on_tool_call(name: str, args: dict) -> None`
@@ -162,12 +164,15 @@ Builds a system prompt containing:
    
    {contents of AGENTS.md}
    ```
+5. **Skills** (auto-injected skill names from `skills/` directory):
+   - If skills exist: lists available skill names with instructions to use `load_skill` and `write_skill`
+   - If no skills: tells agent to use `write_skill` to create the first one
 
 This means the AGENTS.md content is injected directly into every API call's system message. The agent sees it as authoritative project context.
 
 #### Tool Schema (`_get_tool_schema()`)
 
-Returns a list of 24 OpenAI function tool definitions. If `self._is_subagent` is True, removes browser tools (12) and sub-agent tools (2), leaving 10 tools.
+Returns a list of 27 OpenAI function tool definitions. If `self._is_subagent` is True, removes browser tools (12) and sub-agent tools (2), leaving 13 tools (includes skill tools).
 
 #### Tool Execution (`_execute_tool(name, args)`)
 
@@ -205,7 +210,7 @@ Returns `(response_text | None, tool_calls_made: List[Dict])`.
 7. If no tool calls: calls `tokens.finish_turn()`, returns response
 8. If tool calls: executes each via `_execute_tool()`, appends tool results to history, truncates history if >100 messages, counts output tokens from tool results
 
-**Important**: Tool results have `image_url` stripped before appending to history (prevents 400 errors from OpenRouter/providers that don't support images in tool messages).
+**Important**: Tool results have `image_url` stripped before appending to history. Screenshot images are re-injected as a user vision message (with `[Screenshot captured]` prefix) so the model can actually see them, since tool messages can't carry images on most providers.
 
 #### Run (`run(user_message, image_url?)`)
 
@@ -352,7 +357,7 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 
 **Worker Thread** (`_WorkerThread`):
 - `start()` — spawns thread, initializes Playwright
-- `dispatch(fn, timeout)` — queues callable, blocks until result
+- `dispatch(fn, timeout)` — queues callable, blocks until result; raises `TimeoutError` if task never completes (no silent `None` returns)
 - `stop()` — sends sentinel, joins thread
 
 **Launch modes**:
@@ -364,14 +369,14 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 **CloakBrowser integration**: When `pip install cloakbrowser` is available, uses its stealth Chromium binary and `build_args()` for fingerprint patches. Falls back to standard Playwright Chromium.
 
 **Key operations** (all dispatched to worker thread):
-- `navigate(url)` — `page.goto(url, wait_until="domcontentloaded")`
-- `click(selector)` — tries CSS selector first, falls back to `page.get_by_text()`, then label/JS click for hidden elements (radio/checkbox), then `getElementById` via JS for IDs with special chars (colons, etc.)
-- `type_text(selector, text, press_enter?)` — `loc.fill("")` then `loc.type(text, delay=30)`
-- `select_option(selector, value)` — tries by HTML `value` attribute, then by visible `label` text, then by numeric index, then JS fallback via `getElementById` + `dispatchEvent('change')` for selectors that Playwright can't parse
+- `navigate(url)` — `page.goto(url, wait_until="domcontentloaded")`; reports specific error types (DNS, connection, timeout) on failure
+- `click(selector)` — tries CSS selector, visible text, label/aria-labelledby click for hidden elements, then JS `getElementById` force-click. **Verifies post-click**: snapshots URL/title before click, checks for URL/title changes, modal/dropdown appearance, and radio/checkbox state changes. Reports what changed or warns "no visible page state change detected."
+- `type_text(selector, text, press_enter?)` — tries `fill()` first (fast, fires events), falls back to `click + type()` (keystroke simulation), then placeholder fallback. **Verifies after each attempt**: reads back `input_value()` and compares to expected text. Reports exact match, stripped match with note, or `WARNING: Typed but verification failed!` with expected vs actual values. Falls back through all 3 strategies if verification fails.
+- `select_option(selector, value)` — tries by HTML `value` attribute, then visible `label` text, then numeric index, then JS fallback via `getElementById` + `dispatchEvent('change')`. **Verifies after selection**: reads back `input_value()` and compares to expected. Reports verified match, mismatch with warning, or empty readback warning.
 - `snapshot()` — executes `_SNAPSHOT_JS` (inline JS that extracts accessibility tree), formats into compact text. Question context lines (`↳ Q:`) are shown below radio/checkbox/select elements when available.
-- `screenshot(full_page?)` — saves PNG to `~/.kairos/screenshots/screenshot_<timestamp>.png`, returns file path
+- `screenshot(full_page?)` — saves PNG to `~/.kairos/screenshots/screenshot_<timestamp>.png`, returns file path + base64 data URL for vision injection
 - Tab management: `open_new_tab()`, `switch_tab()`, `list_tabs()`, `close_tab()`
-- `evaluate(expression)` — `page.evaluate(expression)`, returns JSON-stringified result
+- `evaluate(expression)` — tries expression directly first, wraps in arrow function on `SyntaxError` fallback; returns JSON-stringified result
 
 **Snapshot JS** (`_SNAPSHOT_JS`): Extracts:
 - Interactive elements with computed CSS selectors (id > name > data-testid > class path)
@@ -383,11 +388,13 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 - Form state (input values, textarea content, select options with visible text and value attributes)
 - Additional ARIA roles: `radio`, `checkbox`, `option`, `listbox`, `combobox`, `menuitemcheckbox`, `menuitemradio`
 
-**Click fallback chain**:
+**Click fallback chain** (with post-click verification):
 1. CSS selector click via Playwright `locator(selector).click()`
 2. `page.get_by_text()` — matches visible text
-3. Label click — finds `<label for="id">` wrapping the element and clicks it (for hidden radio/checkbox)
-4. JavaScript `el.click()` — last resort force-click: parses `[id="..."]` attribute selectors to extract raw ID, then uses `document.getElementById(id).click()` (immune to colons and special chars that break `querySelector`). Falls back to `querySelector` for non-ID selectors.
+3. Label click — finds `<label for="id">`, `aria-labelledby` target (Moodle pattern), or wrapping `<label>` and clicks it (for hidden radio/checkbox)
+4. JavaScript `el.click()` — last resort force-click: parses `[id="..."]` attribute selectors to extract raw ID, then uses `document.getElementById(id).click()` (immune to colons and special chars that break `querySelector`).
+
+**Post-click verification**: Before clicking, snapshots URL and title. After clicking, checks for URL change, title change, modal/dropdown appearance, and radio/checkbox state. Reports what changed or warns "no visible page state change detected" so the agent knows the click may not have had the expected effect.
 
 ### `kairos/tools/base.py` — ToolResult
 
@@ -490,7 +497,27 @@ class SubAgentTool:
 **Sub-agent restrictions** (enforced in `Agent._get_tool_schema()`):
 - No `spawn_subagent` / `get_subagent_result`
 - No browser tools (12 tools removed)
-- Has: read, write, edit, search, git, and all 5 terminal tools (10 total)
+- Has: read, write, edit, search, git, all 5 terminal tools, and 3 skill tools (13 total)
+
+### `kairos/tools/skills.py` — SkillManager
+
+```python
+class SkillManager:
+    SKILL_FILENAME = "SKILL.md"
+    
+    def __init__(self, skills_dir: str): ...
+    def list_skills(self) -> ToolResult: ...
+    def load_skill(self, skill_name: str) -> ToolResult: ...
+    def write_skill(self, skill_name: str, content: str, overwrite: bool = False) -> ToolResult: ...
+```
+
+Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill names are loaded into the system prompt; full content is fetched on demand.
+
+**`list_skills()`**: Scans skills directory for subdirectories containing `SKILL.md`, returns comma-separated names.
+
+**`load_skill(skill_name)`**: Validates name, reads `skills/<skill_name>/SKILL.md`, returns full content. Lists available skills in error if not found.
+
+**`write_skill(skill_name, content, overwrite=False)`**: Validates name (no `..`, `/`, `\`, special chars), creates folder if needed, writes `SKILL.md`. If skill exists and `overwrite=False`, returns error with instruction to set `overwrite=true`.
 
 ### `kairos/tools/browser.py` — Browser Tools
 
@@ -527,6 +554,17 @@ class SessionManager:
     def list_sessions(self) -> List[Dict[str, str]]: ...
     def load_session(self, session_id: str) -> Optional[List[Dict]]: ...
 ```
+
+**`_load_all()`** — corruption-recovering loader:
+- Tries `json.loads()` first
+- On `JSONDecodeError`: uses `JSONDecoder.raw_decode()` to parse up to the last valid JSON boundary, re-saves the recovered data
+- Last resort: iterates through JSON blocks and merges any that parse successfully
+- Returns `{}` if completely unrecoverable
+
+**`_save_all()`** — atomic writer:
+- Writes to a temp file in the same directory, then `fsync()`s, then atomically replaces the target via `shutil.move()`
+- Prevents file corruption from interrupted writes (Ctrl+C, crash, power loss) — the target file is only replaced after the full write succeeds
+- Cleans up the temp file on failure
 
 **`save_chat()`** deduplication strategy:
 1. If `_current_session_id` set and exists on disk → update it

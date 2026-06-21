@@ -126,21 +126,20 @@ class BrowserSnapshotTool:
 
 
 class BrowserScreenshotTool:
-    """Capture a screenshot of the current page. Saved to disk, not sent via API."""
+    """Capture a screenshot of the current page."""
 
     def __init__(self, browser_manager):
         self.bm = browser_manager
 
     def __call__(self, full_page: bool = False) -> ToolResult:
         try:
-            png_bytes, message = self.bm.screenshot(full_page=full_page)
+            png_bytes, message, data_url = self.bm.screenshot(full_page=full_page)
             if png_bytes is None:
                 return ToolResult(False, "", message)
 
-            # Return as text-only — do NOT send base64 image data through the
-            # API.  OpenRouter and many providers return 400 for inline base64
-            # data URLs in tool messages.  The file path is in `message`.
-            return ToolResult(True, message)
+            # Return the data URL as image_url on ToolResult so the model
+            # can see the screenshot via the vision API.
+            return ToolResult(True, message, image_url=data_url)
         except Exception as e:
             return ToolResult(False, "", f"Screenshot failed: {e}")
 

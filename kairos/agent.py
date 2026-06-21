@@ -22,6 +22,7 @@ from .tools import (
     SearchTool,
     GitTool,
     SubAgentTool,
+    SkillManager,
     BrowserLaunchTool,
     BrowserNavigateTool,
     BrowserClickTool,
@@ -92,6 +93,9 @@ class Agent:
         self.browser_evaluate_tool = BrowserEvaluateTool(self.browser_manager)
         self.browser_close_tool = BrowserCloseTool(self.browser_manager)
 
+        # Skills
+        self.skill_manager = SkillManager(str(self.cwd / "skills"))
+
         # Callbacks wired from CLI
         self.on_tool_call: Optional[Callable[[str, dict], None]] = None
         self.on_stream_start: Optional[Callable[[], None]] = None
@@ -112,7 +116,8 @@ class Agent:
             "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, inspect version control, and browse the web.\n\n"
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
-            "You have 24 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n Whenver the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, you should look for the AGENTS.md file in that directory."
+            "You have 27 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
+            "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, you should look for the AGENTS.md file in that directory.\n\n"
             "## Browser Tools\n"
             "You can browse the web using browser tools. The workflow is:\n"
             "1. `browser_launch` \u2014 start the browser (optionally with a named profile for persistent sessions)\n"
@@ -148,6 +153,22 @@ class Agent:
                 "Follow any instructions or conventions described in it. "
                 "If you make code changes, remember to also update this AGENTS.md and README.md.\n\n"
                 f"{agents_md}"
+            )
+
+        # Auto-inject available skill names
+        skill_names = self.skill_manager._discover_skills()
+        if skill_names:
+            base += (
+                "\n\n## Skills\n"
+                "Available skills: " + ", ".join(skill_names) + "\n"
+                "Use load_skill(skill_name) to read a skill's full content when needed.\n"
+                "Use write_skill(skill_name, content) to create a new skill, "
+                "or write_skill(skill_name, content, overwrite=true) to update an existing one."
+            )
+        else:
+            base += (
+                "\n\n## Skills\n"
+                "No skills available yet. Use write_skill(skill_name, content) to create one."
             )
 
         self.system_prompt = base
@@ -630,11 +651,9 @@ class Agent:
                     "name": "browser_screenshot",
                     "description": (
                         "Capture a visual screenshot of the current page. "
-                        "Saved to ~/.kairos/screenshots/ and the file path is returned. "
-                        "Use when you need to verify visual layout, "
-                        "see images, or when the text snapshot isn't enough. "
-                        "NOTE: do NOT use this tool — it saves a file but does not return "
-                        "image data to the model. Use browser_snapshot instead for page inspection."
+                        "Saved to ~/.kairos/screenshots/ and returned as image data the model can see. "
+                        "Use when you need to verify visual layout, see images, or when the text snapshot isn't enough. "
+                        "The screenshot is automatically injected as a vision image so you can analyze it."
                     ),
                     "parameters": {
                         "type": "object",
@@ -730,6 +749,73 @@ class Agent:
                     },
                 },
             },
+            # ---- Skill Tools ----
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_skills",
+                    "description": (
+                        "List all available skills by name. "
+                        "Skills are stored in the workspace's skills/ directory. "
+                        "Each skill is a folder containing a SKILL.md file. "
+                        "Use load_skill to read a skill's full content."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "load_skill",
+                    "description": (
+                        "Load a skill by name and return its full SKILL.md content. "
+                        "Use list_skills first to see available skill names."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "skill_name": {
+                                "type": "string",
+                                "description": "Name of the skill (folder name under skills/)",
+                            },
+                        },
+                        "required": ["skill_name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_skill",
+                    "description": (
+                        "Create or update a skill's SKILL.md file. "
+                        "Creates the skill folder automatically. "
+                        "If the skill already exists, you must set overwrite=true to replace it."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "skill_name": {
+                                "type": "string",
+                                "description": "Name for the skill (folder name under skills/)",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Full content for the SKILL.md file",
+                            },
+                            "overwrite": {
+                                "type": "boolean",
+                                "description": "Set to true to overwrite an existing skill (default: false)",
+                            },
+                        },
+                        "required": ["skill_name", "content"],
+                    },
+                },
+            },
         ]
 
         if self._is_subagent:
@@ -815,6 +901,14 @@ class Agent:
                 a["expression"]
             ).to_dict(),
             "browser_close": lambda a: self.browser_close_tool().to_dict(),
+            # Skill tools
+            "list_skills": lambda a: self.skill_manager.list_skills().to_dict(),
+            "load_skill": lambda a: self.skill_manager.load_skill(
+                a["skill_name"]
+            ).to_dict(),
+            "write_skill": lambda a: self.skill_manager.write_skill(
+                a["skill_name"], a["content"], overwrite=a.get("overwrite", False)
+            ).to_dict(),
         }
 
         if name not in dispatch:
@@ -906,6 +1000,15 @@ class Agent:
             return f"evaluate JS: {expr_preview}"
         if name == "browser_close":
             return "close browser"
+        # Skill tool summaries
+        if name == "list_skills":
+            return "list skills"
+        if name == "load_skill":
+            return f"load skill: {args.get('skill_name', '?')}"
+        if name == "write_skill":
+            skill = args.get("skill_name", "?")
+            ow = " (overwrite)" if args.get("overwrite") else ""
+            return f"write skill: {skill}{ow}"
         return name
 
     # ------------------------------------------------------------------ #
@@ -1579,6 +1682,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
         # Execute tool calls
         tool_results = []
+        tool_image_data_urls = []  # Collect screenshots to inject as vision messages
         for tc in assembled_tool_calls:
             self._check_interrupt()
 
@@ -1590,10 +1694,12 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
             result_json = self._execute_tool(func_name, func_args)
 
-            # Parse result — discard image data since tool messages with
-            # images cause 400 errors on OpenRouter and most providers.
+            # Parse result — extract image data before sending tool message
+            # (tool messages can't carry images on most providers).
             result_dict = json.loads(result_json)
-            result_dict.pop("image_url", None)  # Discard — never safe in tool messages
+            image_data_url = result_dict.pop("image_url", None)  # Extract before tool msg
+            if image_data_url:
+                tool_image_data_urls.append(image_data_url)
             text_content = json.dumps(result_dict)
 
             tool_msg = {
@@ -1606,6 +1712,15 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             tool_results.append(tool_msg)
 
         self.conversation_history.extend(tool_results)
+
+        # Inject any image results as a user vision message so the model
+        # can actually see them (tool messages can't carry images).
+        if tool_image_data_urls:
+            image_parts = [{"type": "text", "text": "[Screenshot captured — the image below shows the current browser page]"}]
+            for img_url in tool_image_data_urls:
+                image_parts.append({"type": "image_url", "image_url": {"url": img_url}})
+            self.conversation_history.append({"role": "user", "content": image_parts})
+
         self._truncate_history_if_needed()
 
         # Count output tokens from tool results (text only, not image data)
