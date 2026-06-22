@@ -34,6 +34,8 @@ from .tools import (
     BrowserTabOpenTool,
     BrowserEvaluateTool,
     BrowserCloseTool,
+    BrowserClickXYTool,
+    BrowserSwitchFrameTool,
 )
 
 
@@ -91,6 +93,8 @@ class Agent:
         self.browser_tab_open_tool = BrowserTabOpenTool(self.browser_manager)
         self.browser_evaluate_tool = BrowserEvaluateTool(self.browser_manager)
         self.browser_close_tool = BrowserCloseTool(self.browser_manager)
+        self.browser_click_xy_tool = BrowserClickXYTool(self.browser_manager)
+        self.browser_switch_frame_tool = BrowserSwitchFrameTool(self.browser_manager)
 
         # Callbacks wired from CLI
         self.on_tool_call: Optional[Callable[[str, dict], None]] = None
@@ -112,7 +116,7 @@ class Agent:
             "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, inspect version control, and browse the web.\n\n"
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
-            "You have 24 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n Whenver the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, you should look for the AGENTS.md file in that directory."
+            "You have 26 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n Whenver the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, you should look for the AGENTS.md file in that directory."
             "## Browser Tools\n"
             "You can browse the web using browser tools. The workflow is:\n"
             "1. `browser_launch` \u2014 start the browser (optionally with a named profile for persistent sessions)\n"
@@ -730,6 +734,55 @@ class Agent:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_click_xy",
+                    "description": (
+                        "Click at absolute viewport coordinates (x, y). "
+                        "Useful for vision-based interaction: take a screenshot, visually locate "
+                        "the target element, then click its coordinates. "
+                        "The x coordinate is horizontal (left=0), y is vertical (top=0)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "x": {
+                                "type": "number",
+                                "description": "Horizontal pixel coordinate (left=0)",
+                            },
+                            "y": {
+                                "type": "number",
+                                "description": "Vertical pixel coordinate (top=0)",
+                            },
+                        },
+                        "required": ["x", "y"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_switch_frame",
+                    "description": (
+                        "Switch the active context into an iframe, or back to the top-level page. "
+                        "Pass a CSS selector, frame name, or URL fragment to target an iframe. "
+                        "Pass None or empty string to return to the top-level page. "
+                        "After switching, all browser_click, browser_type, browser_select, "
+                        "browser_snapshot, and browser_evaluate operations route through that frame."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "frame_selector": {
+                                "type": "string",
+                                "description": "CSS selector, frame name, or URL fragment to match the iframe. Empty/null to return to top-level.",
+                            }
+                        },
+                        "required": [],
+                    },
+                },
+            },
         ]
 
         if self._is_subagent:
@@ -739,6 +792,7 @@ class Agent:
                 "browser_type", "browser_select", "browser_snapshot",
                 "browser_screenshot", "browser_tab_list", "browser_tab_switch",
                 "browser_tab_open", "browser_evaluate", "browser_close",
+                "browser_click_xy", "browser_switch_frame",
             )]
         return tools
 
@@ -815,6 +869,12 @@ class Agent:
                 a["expression"]
             ).to_dict(),
             "browser_close": lambda a: self.browser_close_tool().to_dict(),
+            "browser_click_xy": lambda a: self.browser_click_xy_tool(
+                a["x"], a["y"]
+            ).to_dict(),
+            "browser_switch_frame": lambda a: self.browser_switch_frame_tool(
+                a.get("frame_selector")
+            ).to_dict(),
         }
 
         if name not in dispatch:
@@ -906,6 +966,11 @@ class Agent:
             return f"evaluate JS: {expr_preview}"
         if name == "browser_close":
             return "close browser"
+        if name == "browser_click_xy":
+            return f"click at ({args.get('x', '?')}, {args.get('y', '?')})"
+        if name == "browser_switch_frame":
+            sel = args.get("frame_selector", "")
+            return f"switch to frame: {sel}" if sel else "switch to top-level page"
         return name
 
     # ------------------------------------------------------------------ #
@@ -1355,12 +1420,14 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
     def _stream_response(
         self,
-    ) -> Tuple[str, List[Dict[str, Any]]]:
+    ) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, int]]]:
         """
         Stream a response from OpenAI. Yields content tokens via on_stream
-        callback as they arrive. Returns (full_content, assembled_tool_calls).
+        callback as they arrive. Returns (full_content, assembled_tool_calls, api_usage).
 
         Each tool call is: {"id": str, "name": str, "arguments": dict}
+        api_usage is {"prompt_tokens": int, "completion_tokens": int} or None
+        if the API didn't report usage.
         """
         max_retries = 3
         base_delay = 1.0
@@ -1375,6 +1442,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                     tools=self._get_tool_schema(),
                     tool_choice="auto",
                     stream=True,
+                    stream_options={"include_usage": True},
                 )
                 break
             except Exception as e:
@@ -1393,11 +1461,18 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
         content = ""
         tool_calls: Dict[int, Dict[str, str]] = {}  # index -> {id, name, arguments}
+        api_usage = None  # Ground-truth token counts from the API (final chunk)
 
         for chunk in stream:
             self._check_interrupt()
 
             if not chunk.choices:
+                # Final chunk with usage info (stream_options={"include_usage": True})
+                if chunk.usage:
+                    api_usage = {
+                        "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                        "completion_tokens": chunk.usage.completion_tokens or 0,
+                    }
                 continue
 
             delta = chunk.choices[0].delta
@@ -1440,7 +1515,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 }
             )
 
-        return content, assembled
+        return content, assembled, api_usage
 
     # ------------------------------------------------------------------ #
     #  Agent loop                                                          #
@@ -1474,10 +1549,17 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         self.tokens.start_turn(self.conversation_history)
 
         # Stream the response
-        content, assembled_tool_calls = self._stream_response()
+        content, assembled_tool_calls, api_usage = self._stream_response()
 
-        # Accumulate output tokens from content
-        self.tokens.add_output_tokens(content)
+        # Use ground-truth token counts from the API when available,
+        # falling back to tiktoken estimates
+        if api_usage:
+            self.tokens.set_turn_from_api(
+                api_usage["prompt_tokens"], api_usage["completion_tokens"]
+            )
+        else:
+            # Fallback: count output tokens from content
+            self.tokens.add_output_tokens(content)
 
         # Build the assistant message for history
         assistant_msg: Dict[str, Any] = {
@@ -1502,6 +1584,12 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 }
                 for tc in assembled_tool_calls
             ]
+
+            # When using API counts, tool call arguments are already included
+            # in the completion_tokens. Only add them when using tiktoken estimates.
+            if not api_usage:
+                for tc in assembled_tool_calls:
+                    self.tokens.add_output_tokens(tc["name"] + json.dumps(tc["arguments"]))
 
         self.conversation_history.append(assistant_msg)
 
@@ -1541,10 +1629,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
         self.conversation_history.extend(tool_results)
         self._truncate_history_if_needed()
-
-        # Count output tokens from tool results (text only, not image data)
-        for tr in tool_results:
-            self.tokens.add_output_tokens(tr["content"])
 
         self.tokens.finish_turn()
         if self.on_token_update:

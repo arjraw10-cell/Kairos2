@@ -4,14 +4,14 @@ A minimal personal coding agent in Python.
 
 ## Features
 
-- **24 Tools**: File operations, terminal management, search, git, sub-agents, and a full browser automation suite
+- **26 Tools**: File operations, terminal management, search, git, sub-agents, and a full browser automation suite (with shadow DOM, iframe, and vision-click support)
 - **Absolute Paths**: All file operations use absolute paths — no workspace restrictions
 - **Streaming First**: Tokens print as they arrive; no waiting for full responses
-- **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange
+- **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange. Uses ground-truth counts from the API when available (`stream_options={"include_usage": True}`), with tiktoken estimates as fallback
 - **Auto-Compaction**: Conversation history is automatically summarized when context usage exceeds 80%
 - **Sub-Agents**: Spawn autonomous child agents to work on tasks in parallel
 - **Browser Automation**: Full Playwright/CloakBrowser integration with stealth mode, persistent profiles, multi-tab, and CDP support
-- **Paste System**: Ctrl+V pastes text, Alt+V pastes images. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. No background polling or auto-detection — images are pasted explicitly via Alt+V.
+- **Paste System**: Ctrl+V pastes text, Alt+V pastes images. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. Smart clipboard detection with pending state: if the clipboard changes while typing, the new content is remembered and matched once it actually appears in the buffer, preventing missed pastes.
 - **Chat Persistence**: All sessions saved to `chats/chats.json` with auto-save every 60 seconds and on window close. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions.
 - **`/resume`**: Load previous chats via numbered picker
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
@@ -124,6 +124,8 @@ Sub-agents have access to file, search, git, and terminal tools but cannot spawn
 | `browser_tab_open(url?)` | Open a new tab |
 | `browser_evaluate(expression)` | Execute JavaScript in the page |
 | `browser_close()` | Close the browser and clean up |
+| `browser_click_xy(x, y)` | Click at absolute viewport coordinates (vision-based fallback) |
+| `browser_switch_frame(frame_selector?)` | Switch into an iframe, or back to top-level |
 
 Browser features:
 - **Persistent profiles**: Cookies, localStorage, and cache survive across sessions (`~/.kairos/profiles/`)
@@ -132,6 +134,9 @@ Browser features:
 - **Chrome profile copy**: Import your real Chrome profile (cookies, logins, history)
 - **Human-like mode**: Realistic mouse/keyboard/scroll behavior for bot detection
 - **Smart form interaction**: Hidden radio/checkbox inputs are captured with their label text; click auto-falls back to label/JS for hidden elements; select dropdowns show available options with both display text and value attributes
+- **Shadow DOM**: Snapshot pierces shadow roots to expose web component internals
+- **Iframe support**: `browser_switch_frame` routes all interactions through a target iframe
+- **Vision click**: `browser_click_xy` enables coordinate-based clicking from screenshots
 
 ## Architecture
 

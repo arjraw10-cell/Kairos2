@@ -26,6 +26,8 @@ from .browser import (
     BrowserTabOpenTool,
     BrowserEvaluateTool,
     BrowserCloseTool,
+    BrowserClickXYTool,
+    BrowserSwitchFrameTool,
 )
 
 __all__ = [
@@ -54,4 +56,6 @@ __all__ = [
     "BrowserTabOpenTool",
     "BrowserEvaluateTool",
     "BrowserCloseTool",
+    "BrowserClickXYTool",
+    "BrowserSwitchFrameTool",
 ]

@@ -81,6 +81,7 @@ class _WorkerThread:
         """Worker loop: init Playwright, then process tasks."""
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
+        self._started.set()
 
         while True:
             task = self._task_queue.get()
@@ -144,6 +145,7 @@ class BrowserManager:
         self._headless: bool = True
         self._lock = threading.Lock()
         self._worker = _WorkerThread()
+        self._active_frame = None # Active frame for iframe support (None = top-level)
 
     # ------------------------------------------------------------------
     #  Properties
@@ -152,6 +154,12 @@ class BrowserManager:
     @property
     def is_open(self) -> bool:
         return self._browser is not None or self._context is not None
+
+    def _target(self):
+        """Return the active frame if one is set, otherwise the current page."""
+        if self._active_frame is not None:
+            return self._active_frame
+        return self.current_page
 
     @property
     def current_page(self):
@@ -497,6 +505,8 @@ class BrowserManager:
         page = self.current_page
         if not page:
             return "No active page. Launch the browser first."
+        # Clear any active frame — page load invalidates frame references
+        self._active_frame = None
         def _do():
             resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
             status = resp.status if resp else "unknown"
@@ -508,10 +518,93 @@ class BrowserManager:
         except Exception as e:
             return f"Navigation failed: {e}"
 
+    def click_xy(self, x: float, y: float) -> str:
+        """Click at absolute viewport coordinates (x, y)."""
+        page = self.current_page
+        if not page:
+            return "No active page."
+        def _do():
+            page.mouse.click(x, y)
+            return f"Clicked at ({x}, {y})"
+        try:
+            return self._worker.dispatch(_do, timeout=10)
+        except Exception as e:
+            return f"Click at ({x}, {y}) failed: {e}"
+
+    def switch_frame(self, frame_selector: Optional[str] = None) -> str:
+        """Switch the active context to an iframe, or back to the top-level page.
+
+        Args:
+            frame_selector: CSS selector for the <iframe> element, or a URL
+                            fragment to match frame.src.  Pass None or empty
+                            string to return to the top-level page.
+        Returns:
+            Status message with frame info.
+        """
+        page = self.current_page
+        if not page:
+            return "No active page."
+
+        # Reset to top-level
+        if not frame_selector:
+            self._active_frame = None
+            return "Switched back to top-level page."
+
+        def _do():
+            # Try matching by CSS selector on <iframe> elements first
+            frames = page.frames
+            # frame.name and frame.url are available
+            selector_lower = frame_selector.lower()
+            for f in frames:
+                if f == page.main_frame:
+                    continue
+                if (selector_lower in (f.url or "").lower()
+                        or selector_lower in (f.name or "").lower()):
+                    return f
+                # Also check the frame's parent <iframe> element's attributes
+                try:
+                    el = f.frame_locator_path  # not available in sync API
+                except AttributeError:
+                    pass
+            # Fallback: try Playwright's built-in frameLocator
+            try:
+                loc = page.frame_locator(frame_selector)
+                # We can't directly get a Frame from frame_locator, so use
+                # page.frames and check child_frames of the main frame
+                for f in page.main_frame.child_frames:
+                    if (selector_lower in (f.url or "").lower()
+                            or selector_lower in (f.name or "").lower()):
+                        return f
+            except Exception:
+                pass
+            return None
+
+        try:
+            frame = self._worker.dispatch(_do, timeout=10)
+            if frame is None:
+                return (
+                    f"No frame matching '{frame_selector}'.\n"
+                    f"Available frames:\n"
+                    + "\n".join(
+                        f"  - name={f.name!r} url={f.url}"
+                        for f in page.frames if f != page.main_frame
+                    )[:2000]
+                )
+            self._active_frame = frame
+            title = ""
+            try:
+                title = frame.url or ""
+            except Exception:
+                pass
+            return f"Switched to frame: {title}"
+        except Exception as e:
+            return f"Frame switch failed: {e}"
+
     def go_back(self) -> str:
         page = self.current_page
         if not page:
             return "No active page."
+        self._active_frame = None
         def _do():
             page.go_back(wait_until="domcontentloaded")
             return page.url
@@ -525,6 +618,7 @@ class BrowserManager:
         page = self.current_page
         if not page:
             return "No active page."
+        self._active_frame = None
         def _do():
             page.go_forward(wait_until="domcontentloaded")
             return page.url
@@ -538,6 +632,7 @@ class BrowserManager:
         page = self.current_page
         if not page:
             return "No active page."
+        self._active_frame = None
         def _do():
             page.reload(wait_until="domcontentloaded")
             return page.url
@@ -548,28 +643,31 @@ class BrowserManager:
             return f"Reload failed: {e}"
 
     def click(self, selector: str) -> str:
-        page = self.current_page
-        if not page:
+        target = self._target()
+        if not target:
             return "No active page."
         try:
-            self._worker.dispatch(lambda: page.locator(selector).click(timeout=10000), timeout=15)
+            self._worker.dispatch(lambda: target.locator(selector).click(timeout=10000), timeout=15)
             return f"Clicked: {selector}"
         except Exception as e:
             # Fallback 1: try by visible text
             try:
-                self._worker.dispatch(lambda: page.get_by_text(selector, exact=False).first.click(timeout=5000), timeout=10)
+                self._worker.dispatch(lambda: target.get_by_text(selector, exact=False).first.click(timeout=5000), timeout=10)
                 return f"Clicked element with text: {selector}"
             except Exception:
                 pass
             # Fallback 2: for hidden inputs (radio/checkbox), click the associated label via JS
             try:
                 def _click_label():
-                    el = page.locator(selector).first
+                    el = target.locator(selector).first
+                    # Guard: if the locator matches nothing, skip straight to JS fallback
+                    if el.count() == 0:
+                        return None
                     # Get the element's id
                     el_id = el.get_attribute("id")
                     if el_id:
                         # Try <label for="id"> (standard HTML)
-                        label_loc = page.locator(f'label[for="{el_id}"]')
+                        label_loc = target.locator(f'label[for="{el_id}"]')
                         if label_loc.count() > 0:
                             label_loc.first.click(timeout=3000)
                             return True
@@ -577,52 +675,54 @@ class BrowserManager:
                         # Moodle uses <div id="..._label"> instead of <label>.
                         aria_id = el.get_attribute("aria-labelledby")
                         if aria_id:
-                            aria_loc = page.locator(f'[id="{aria_id}"]')
+                            aria_loc = target.locator(f'[id="{aria_id}"]')
                             if aria_loc.count() > 0:
                                 aria_loc.first.click(timeout=3000)
                                 return True
                     # Try closest wrapping label
-                    wrapping = page.locator(f"label:has({selector})").first
+                    wrapping = target.locator(f"label:has({selector})").first
                     if wrapping.count() > 0:
                         wrapping.click(timeout=3000)
                         return True
-                    # Last resort: force click via JS using getElementById.
-                    # querySelector fails on IDs with colons (e.g. Moodle quiz
-                    # IDs like q10711386:4_answer4), but getElementById is
-                    # immune since it takes a raw string, not a CSS selector.
-                    try:
-                        result = page.evaluate("""(sel) => {
-                            // For [id="..."] attribute selectors, extract the raw ID
-                            let el = null;
-                            const idMatch = sel.match(/^\\[id="(.+)"\\]$/);
-                            if (idMatch) {
-                                el = document.getElementById(idMatch[1]);
-                            } else {
-                                el = document.querySelector(sel);
-                            }
-                            if (el) { el.click(); return true; }
-                            return false;
-                        }""", selector)
-                        if result:
-                            return True
-                    except Exception:
-                        pass
-                    return False
+                    return None
 
-                clicked = self._worker.dispatch(_click_label, timeout=10)
-                if clicked:
+                result = self._worker.dispatch(_click_label, timeout=5)
+                if result is True:
                     return f"Clicked label for hidden element: {selector}"
+            except Exception:
+                pass
+            # Fallback 3: force click via JS using getElementById.
+            # querySelector fails on IDs with colons (e.g. Moodle quiz
+            # IDs like q10711386:4_answer4), but getElementById is
+            # immune since it takes a raw string, not a CSS selector.
+            try:
+                def _js_click():
+                    result = target.evaluate("""(sel) => {
+                        let el = null;
+                        const idMatch = sel.match(/^\\[id="(.+)"\\]$/);
+                        if (idMatch) {
+                            el = document.getElementById(idMatch[1]);
+                        } else {
+                            el = document.querySelector(sel);
+                        }
+                        if (el) { el.click(); return true; }
+                        return false;
+                    }""", selector)
+                    return result
+                clicked = self._worker.dispatch(_js_click, timeout=5)
+                if clicked:
+                    return f"Clicked via JS: {selector}"
             except Exception:
                 pass
             return f"Click failed for '{selector}': {e}"
 
     def type_text(self, selector: str, text: str, press_enter: bool = False) -> str:
-        page = self.current_page
-        if not page:
+        target = self._target()
+        if not target:
             return "No active page."
 
         def _do_type():
-            loc = page.locator(selector)
+            loc = target.locator(selector)
             loc.click(timeout=5000)
             loc.fill("")
             loc.type(text, delay=30)
@@ -638,19 +738,19 @@ class BrowserManager:
         except Exception as e:
             try:
                 self._worker.dispatch(
-                    lambda: page.get_by_placeholder(selector, exact=False).first.fill(text), timeout=10
+                    lambda: target.get_by_placeholder(selector, exact=False).first.fill(text), timeout=10
                 )
                 return f"Typed into placeholder '{selector}': '{text}'"
             except Exception:
                 return f"Type failed for '{selector}': {e}"
 
     def select_option(self, selector: str, value: str) -> str:
-        page = self.current_page
-        if not page:
+        target = self._target()
+        if not target:
             return "No active page."
 
         def _do_select():
-            loc = page.locator(selector)
+            loc = target.locator(selector)
             # Try by value attribute first
             try:
                 loc.select_option(value=value, timeout=3000)
@@ -686,7 +786,7 @@ class BrowserManager:
                 # Parse [id="..."] attribute selectors → raw ID string
                 if selector.startswith('[id="') and selector.endswith('"]'):
                     raw_id = selector[5:-2]
-                    return page.evaluate(
+                    return target.evaluate(
                         "(id, val) => {"
                         "  const e = document.getElementById(id);"
                         "  if (!e) return null;"
@@ -706,19 +806,14 @@ class BrowserManager:
         return f"Select failed for '{selector}': '{value}' not found as value, label, or index"
 
     def evaluate(self, expression: str) -> str:
-        page = self.current_page
-        if not page:
+        target = self._target()
+        if not target:
             return "No active page."
         try:
-            # If expression is a string that contains 'return', wrap it
-            # in an arrow function so Playwright treats it as a function body
-            # rather than a top-level statement (where bare return is illegal).
-            # Simple expressions like "document.querySelector(...).innerHTML"
-            # are fine as-is since they don't use 'return'.
             fn_expression = expression
             if isinstance(expression, str) and 'return' in expression.split():
                 fn_expression = f'() => {{ {expression} }}'
-            result = self._worker.dispatch(lambda: page.evaluate(fn_expression), timeout=15)
+            result = self._worker.dispatch(lambda: target.evaluate(fn_expression), timeout=15)
             if result is None:
                 return "JavaScript executed (returned null/undefined)"
             if isinstance(result, str):
@@ -766,18 +861,18 @@ class BrowserManager:
             return None, f"Screenshot failed: {e}"
 
     def snapshot(self) -> str:
-        page = self.current_page
-        if not page:
+        target = self._target()
+        if not target:
             return "No active page."
 
         try:
-            data = self._worker.dispatch(lambda: page.evaluate(_SNAPSHOT_JS), timeout=15)
+            data = self._worker.dispatch(lambda: target.evaluate(_SNAPSHOT_JS), timeout=15)
             return self._format_snapshot(data)
         except Exception as e:
             try:
-                title = self._worker.dispatch(lambda: page.title(), timeout=5)
-                url = self._worker.dispatch(lambda: page.url, timeout=5)
-                text = self._worker.dispatch(lambda: page.inner_text("body"), timeout=10)
+                title = self._worker.dispatch(lambda: target.title() if hasattr(target, 'title') else '', timeout=5)
+                url = self._worker.dispatch(lambda: target.url if hasattr(target, 'url') else '', timeout=5)
+                text = self._worker.dispatch(lambda: target.inner_text("body") if hasattr(target, 'inner_text') else '', timeout=10)
                 if len(text) > 3000:
                     text = text[:3000] + "\n...[truncated]"
                 return f"Page: {title}\nURL: {url}\n\n{text}"
@@ -1054,6 +1149,30 @@ _SNAPSHOT_JS = """() => {
         text_blocks: []
     };
 
+    // --- Shadow DOM piercing ---
+    // Recursively walks into every .shadowRoot it finds, collecting elements
+    // that match the given selector from both light DOM and shadow trees.
+    function queryShadow(root, selector, maxDepth) {
+        maxDepth = maxDepth || 10;
+        const found = [];
+        function walk(node, depth) {
+            if (depth > maxDepth) return;
+            // Query the current scope (light DOM or shadow root)
+            const els = node.querySelectorAll(selector);
+            for (let i = 0; i < els.length; i++) found.push(els[i]);
+            // Recurse into child elements that have shadow roots
+            const allEls = node.querySelectorAll('*');
+            for (let i = 0; i < allEls.length; i++) {
+                const el = allEls[i];
+                if (el.shadowRoot) {
+                    walk(el.shadowRoot, depth + 1);
+                }
+            }
+        }
+        walk(root, 0);
+        return found;
+    }
+
     function getSelector(el) {
         // Use [id="..."] attribute selectors instead of #id with CSS.escape.
         // CSS.escape produces backslash-escaped selectors that double when
@@ -1160,7 +1279,7 @@ _SNAPSHOT_JS = """() => {
     }
 
     const interactiveSelectors = 'a, button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="radio"], [role="checkbox"], [role="option"], [role="listbox"], [role="combobox"], [role="menuitemcheckbox"], [role="menuitemradio"], [onclick]';
-    document.querySelectorAll(interactiveSelectors).forEach(el => {
+    queryShadow(document, interactiveSelectors).forEach(el => {
         const tag = el.tagName.toLowerCase();
 
         if (tag === 'input') {
@@ -1251,7 +1370,7 @@ _SNAPSHOT_JS = """() => {
         result.elements.push(entry);
     });
 
-    const labels = document.querySelectorAll('label');
+    const labels = queryShadow(document, 'label');
     let labelCount = 0;
     labels.forEach(el => {
         if (labelCount >= 30) return;
@@ -1269,7 +1388,7 @@ _SNAPSHOT_JS = """() => {
         labelCount++;
     });
 
-    document.querySelectorAll('h1, h2, h3, h4').forEach(el => {
+    queryShadow(document, 'h1, h2, h3, h4').forEach(el => {
         if (!isVisible(el)) return;
         const text = getText(el, 100);
         if (text) {
@@ -1280,7 +1399,7 @@ _SNAPSHOT_JS = """() => {
         }
     });
 
-    const textEls = document.querySelectorAll('p, label, li, dt, dd, [role="text"], [role="heading"]');
+    const textEls = queryShadow(document, 'p, label, li, dt, dd, [role="text"], [role="heading"]');
     let textCount = 0;
     textEls.forEach(el => {
         if (!isVisible(el) || textCount >= 40) return;

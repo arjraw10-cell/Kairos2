@@ -625,6 +625,8 @@ class CLI:
             _handling = [False]           # prevent recursion flag
             _prev_text = [buf.text]       # last known buffer state
             _pre_clip_seq = [_get_clipboard_sequence_number()]
+            _pending_paste = [None]       # clipboard text waiting to be matched
+            _last_clip_seq = [0]          # seq number when pending state started
 
             def _on_text_changed(b):
                 """Replace terminal-intercepted text paste with a token."""
@@ -638,43 +640,61 @@ class CLI:
                 # Buffer shrank (user deleted) — not a paste
                 if len(current) <= len(_prev_text[0]):
                     _prev_text[0] = current
+                    _pending_paste[0] = None
                     return
 
-                # Check if the clipboard changed since the prompt started.
-                # On Windows this is a single ctypes call (< 1 microsecond).
-                # On other platforms, fall back to buffer-growth heuristic.
-                clip_changed = False
+                # ---- Try to resolve a paste ----
+                paste_text = None   # clipboard text to match if found
+
+                # 1) Did the clipboard change since our last known sequence?
                 if _pre_clip_seq[0] > 0:
                     current_seq = _get_clipboard_sequence_number()
                     clip_changed = current_seq != _pre_clip_seq[0]
-                    # Always sync the sequence number immediately so we
-                    # don't re-trigger on the next keystroke when the
-                    # clipboard change wasn't an actual paste (e.g. a
-                    # clipboard manager or another app touched it once).
                     _pre_clip_seq[0] = current_seq
                 else:
-                    # Non-Windows: assume paste if buffer grew by 3+ chars
+                    # Non-Windows fallback: buffer grew by 3+ chars
+                    current_seq = 0
                     clip_changed = (len(current) - len(_prev_text[0])) >= 3
 
-                if not clip_changed:
+                if clip_changed:
+                    # Clipboard changed — read it and try to match
+                    clip_text = _get_clipboard_text_clean()
+                    if clip_text and len(clip_text) >= 3:
+                        if clip_text in current and clip_text not in _prev_text[0]:
+                            paste_text = clip_text
+                            _pending_paste[0] = None
+                        else:
+                            # Clipboard changed but text not found yet —
+                            # enter pending state so we keep trying on
+                            # subsequent keystrokes.
+                            _pending_paste[0] = clip_text
+                            _last_clip_seq[0] = current_seq
+
+                elif _pending_paste[0] is not None:
+                    # Clipboard didn't change, but we have a pending paste.
+                    # Check if clipboard changed *again* (new paste attempt).
+                    if _pre_clip_seq[0] > 0:
+                        current_seq = _get_clipboard_sequence_number()
+                        if current_seq != _last_clip_seq[0]:
+                            # Clipboard changed — update pending content
+                            new_clip = _get_clipboard_text_clean()
+                            if new_clip and len(new_clip) >= 3:
+                                _pending_paste[0] = new_clip
+                                _last_clip_seq[0] = current_seq
+                                _pre_clip_seq[0] = current_seq
+
+                    # Try to match the pending text in the current buffer
+                    clip_text = _pending_paste[0]
+                    if clip_text and clip_text in current and clip_text not in _prev_text[0]:
+                        paste_text = clip_text
+                        _pending_paste[0] = None
+
+                if paste_text is None:
                     _prev_text[0] = current
                     return
 
-                # Clipboard changed — read the text content (expensive, but
-                # only happens once per paste, not per keystroke)
-                clip_text = _get_clipboard_text_clean()
-                if not clip_text or len(clip_text) < 3:
-                    _prev_text[0] = current
-                    return
-
-                # Check that the clipboard text appears in the NEW content
-                # but NOT in the previous content — it was just added.
-                if clip_text not in current or clip_text in _prev_text[0]:
-                    _prev_text[0] = current
-                    return
-
-                # Read raw (non-stripped) version for the registry
-                clip_raw = _read_system_clipboard() or clip_text
+                # ---- Replace the pasted text with a token ----
+                clip_raw = _read_system_clipboard() or paste_text
 
                 _handling[0] = True
                 try:
@@ -682,13 +702,13 @@ class CLI:
                     _paste_registry[token] = {
                         "type": "text",
                         "text": clip_raw,
-                        "text_stripped": clip_text,
+                        "text_stripped": paste_text,
                     }
-                    idx = current.find(clip_text)
+                    idx = current.find(paste_text)
                     if idx == -1:
                         return
                     b.text = (current[:idx] + token
-                              + current[idx + len(clip_text):])
+                              + current[idx + len(paste_text):])
                     b.cursor_position = idx + len(token)
                     _prev_text[0] = b.text
                 finally:

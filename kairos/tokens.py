@@ -40,13 +40,51 @@ class TokenCounter:
             return "\n".join(parts)
         return ""
 
+    @staticmethod
+    def _estimate_image_tokens(content: list) -> int:
+        """Estimate tokens for image_url blocks in a vision content array.
+
+        Uses data URL length as a proxy for image size. Not exact, but
+        close enough for context tracking — and when the API reports
+        real usage, those numbers override this estimate entirely.
+        """
+        tokens = 0
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "image_url":
+                continue
+            url = block.get("image_url", {}).get("url", "")
+            if url.startswith("data:"):
+                # Rough estimate: 85 base tokens + ~1 token per 2000 chars of data URL
+                # Yields ~200 tokens for small images, ~1500-3000 for large photos
+                tokens += 85 + max(0, len(url) // 2000)
+            else:
+                # External URL — can't know actual size, assume base tokens
+                tokens += 85
+        return tokens
+
     def count_message(self, msg: dict) -> int:
-        """Count tokens in a single message dict."""
-        text = self._extract_text(msg.get("content", ""))
+        """Count tokens in a single message dict.
+
+        NOTE: Tool call arguments on assistant messages are intentionally
+        NOT counted here. They were already counted as output tokens when
+        generated (via add_output_tokens in step()). Counting them again
+        here as input would double-count the same bytes across turns.
+        """
+        content = msg.get("content", "")
+        # Extract text content
+        text = self._extract_text(content)
+
+        # Count image tokens if content is a vision content array
+        image_tokens = 0
+        if isinstance(content, list):
+            image_tokens = self._estimate_image_tokens(content)
+
+        # For messages with no extractable text at all, use str() as fallback
         if not text:
-            # Tool call messages, system prompts, etc.
             text = str(msg)
-        return len(self._enc.encode(text))
+        return len(self._enc.encode(text)) + image_tokens
 
     def count_history(self, messages: list[dict]) -> int:
         """Count total tokens in a list of messages."""
@@ -64,9 +102,20 @@ class TokenCounter:
         self.turn_output = 0
 
     def add_output_tokens(self, text: str):
-        """Accumulate output tokens during streaming."""
+        """Accumulate output tokens during streaming (tiktoken estimate)."""
         n = len(self._enc.encode(text or ""))
         self.turn_output += n
+
+    def set_turn_from_api(self, prompt_tokens: int, completion_tokens: int):
+        """Override turn counters with ground-truth values from the API.
+
+        Called when stream_options={"include_usage": True} returns real counts.
+        The API's prompt_tokens replaces the tiktoken estimate entirely,
+        and completion_tokens replaces the accumulated output estimate.
+        """
+        self.turn_input = prompt_tokens
+        self.context_tokens = prompt_tokens
+        self.turn_output = completion_tokens
 
     def finish_turn(self):
         """Called when a turn completes — update session totals."""

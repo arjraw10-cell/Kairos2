@@ -4,7 +4,7 @@
 
 ## Overview
 
-Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 24 tools. All file operations use absolute paths — no workspace containment.
+Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 26 tools. All file operations use absolute paths — no workspace containment.
 
 ## Project Structure
 
@@ -25,7 +25,7 @@ Agent2/
     ├── main.py             # CLI REPL loop, signal handlers, auto-save, paste resolution
     ├── config.py           # Lazy .env loading via lru_cache
     ├── agent.py            # Core agent: streaming, tool dispatch, compaction, error handling (~800 lines)
-    ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling (~600 lines)
+    ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling (~660 lines)
     ├── tokens.py           # TokenCounter using tiktoken
     ├── terminal_manager.py # Terminal lifecycle (background + blocking)
     ├── browser_manager.py  # Playwright/CloakBrowser in dedicated worker thread (~700 lines)
@@ -39,7 +39,7 @@ Agent2/
         ├── git.py          # GitTool — status, diff, log, commit, branch
         ├── terminal.py     # 5 terminal tool wrappers
         ├── subagent.py     # SubAgentTool — spawn/track child agents
-        ├── browser.py      # 12 browser tool wrappers
+        ├── browser.py      # 14 browser tool wrappers
         └── session.py      # SessionManager — save/load chats to chats/chats.json
 ```
 
@@ -125,7 +125,7 @@ agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream
 **Constructor**: `Agent(workspace: str)`
 - Creates `OpenAI` client from config
 - Sets `self.cwd = Path(workspace).resolve()`
-- Initializes all 24 tool instances
+- Initializes all 26 tool instances
 - Calls `_setup_system_prompt()` which builds the system prompt and initializes `conversation_history`
 
 **Key attributes**:
@@ -167,7 +167,7 @@ This means the AGENTS.md content is injected directly into every API call's syst
 
 #### Tool Schema (`_get_tool_schema()`)
 
-Returns a list of 24 OpenAI function tool definitions. If `self._is_subagent` is True, removes browser tools (12) and sub-agent tools (2), leaving 10 tools.
+Returns a list of 26 OpenAI function tool definitions. If `self._is_subagent` is True, removes browser tools (14) and sub-agent tools (2), leaving 10 tools.
 
 #### Tool Execution (`_execute_tool(name, args)`)
 
@@ -179,16 +179,17 @@ Static method. Returns a one-line human-readable summary string for each tool ca
 
 #### Streaming (`_stream_response()`)
 
-Returns `(full_content: str, assembled_tool_calls: List[Dict])`.
+Returns `(full_content: str, assembled_tool_calls: List[Dict], api_usage: Dict | None)`.
 
 **Retry logic**: Up to 3 attempts for retryable errors (rate limits, connection errors, 500/502/503/504). Exponential backoff with jitter.
 
 **Streaming loop**:
 1. Calls `on_stream_start()` callback
-2. Iterates over chunks from `client.chat.completions.create(..., stream=True)`
+2. Iterates over chunks from `client.chat.completions.create(..., stream=True, stream_options={"include_usage": True})`
 3. Accumulates `delta.content` → calls `on_stream_token(token)` for each chunk
 4. Accumulates `delta.tool_calls` by index (id, name, arguments deltas)
-5. Assembles tool calls: parses JSON arguments, returns list of `{id, name, arguments}` dicts
+5. Captures `chunk.usage` from the final chunk (prompt_tokens, completion_tokens) as ground-truth token counts
+6. Assembles tool calls: parses JSON arguments, returns list of `{id, name, arguments}` dicts plus the API usage
 
 **Interrupt checking**: `_check_interrupt()` is called per-chunk — raises `InterruptedError` if Ctrl+C was pressed.
 
@@ -197,15 +198,15 @@ Returns `(full_content: str, assembled_tool_calls: List[Dict])`.
 Returns `(response_text | None, tool_calls_made: List[Dict])`.
 
 1. Appends user message to `conversation_history` (as vision content array if `image_url` provided)
-2. `tokens.start_turn()` — counts input tokens
-3. `_stream_response()` — streams response
-4. `tokens.add_output_tokens()` — counts output tokens
+2. `tokens.start_turn()` — counts input tokens via tiktoken (estimate)
+3. `_stream_response()` — streams response, captures API usage from final chunk
+4. If API usage available: `tokens.set_turn_from_api()` replaces tiktoken estimates with ground-truth counts. Otherwise falls back to `tokens.add_output_tokens()` for tiktoken estimates
 5. Builds assistant message (with `tool_calls` if present)
 6. Calls `on_stream_end()` — this is where the CLI finalizes the display panel
 7. If no tool calls: calls `tokens.finish_turn()`, returns response
-8. If tool calls: executes each via `_execute_tool()`, appends tool results to history, truncates history if >100 messages, counts output tokens from tool results
+8. If tool calls: when using tiktoken fallback, counts tool call argument tokens via `add_output_tokens()` (API counts already include these); executes each via `_execute_tool()`, appends tool results to history, truncates history if >100 messages, calls `tokens.finish_turn()`
 
-**Important**: Tool results have `image_url` stripped before appending to history (prevents 400 errors from OpenRouter/providers that don't support images in tool messages).
+**Important**: Tool results have `image_url` stripped before appending to history (prevents 400 errors from OpenRouter/providers that don't support images in tool messages). Tool results are NOT counted as output tokens — they become input tokens in the next turn via `start_turn()`.
 
 #### Run (`run(user_message, image_url?)`)
 
@@ -280,7 +281,7 @@ Rebuilds system prompt, resets token counter, closes browser if open.
 - `_paste_handler(event)` — Ctrl+V key binding: text paste only (reads clipboard, inserts text token)
 - `_alt_v_handler(event)` — Alt+V key binding: image paste only (reads clipboard image, inserts image token; shows `[no image on clipboard]` if none)
 - `_backspace_handler(event)` — deletes entire paste token if cursor is inside one
-- `_on_text_changed(b)` — detects Windows Terminal paste using `GetClipboardSequenceNumber()` (a single ctypes call) to detect clipboard changes cheaply, then reads clipboard content only when a paste is actually detected. The sequence number is synced immediately after each check so a one-time clipboard change (e.g. from a clipboard manager or another app) doesn't cause repeated expensive subprocess calls on every subsequent keystroke.
+- `_on_text_changed(b)` — detects Windows Terminal paste using `GetClipboardSequenceNumber()` (a single ctypes call) to detect clipboard changes cheaply, then reads clipboard content only when a paste is actually detected. Uses a **pending state** mechanism: if the clipboard changes but the new text isn't found in the buffer yet (e.g. user copied text but hasn't pasted it), stores it in `_pending_paste` with a `_last_clip_seq` baseline. On subsequent keystrokes, checks `_last_clip_seq` against the current sequence number — if the clipboard changed again, updates `_pending_paste` to the new content before trying to match. This prevents the old bug where a clipboard change during typing would permanently swallow all future pastes because the baseline was synced prematurely.
 - Image pasting is explicit via Alt+V — no background polling or auto-detection
 
 **Clipboard helpers** (cross-platform):
@@ -308,11 +309,14 @@ Rebuilds system prompt, resets token counter, closes browser if open.
 - `context_window` — max context (default 999,000)
 
 **Methods**:
-- `start_turn(messages)` — counts all tokens in conversation_history, sets `context_tokens`
-- `add_output_tokens(text)` — encodes text and adds to `turn_output`
+- `start_turn(messages)` — counts all tokens in conversation_history via tiktoken, sets `context_tokens`
+- `add_output_tokens(text)` — encodes text and adds to `turn_output` (tiktoken estimate)
+- `set_turn_from_api(prompt_tokens, completion_tokens)` — overrides turn counters with ground-truth values from the API's `stream_options={"include_usage": True}` response
 - `finish_turn()` — adds turn totals to session totals
 - `context_pct` — property: `(context_tokens / context_window) * 100`
 - `format_status()` — `"Session: X in / Y out  |  Context: Z%  |  Turn: A in / B out"`
+
+**Counting strategy**: `count_message()` intentionally does NOT count tool call arguments on assistant messages — they were already counted as output tokens when generated via `add_output_tokens()`. This prevents double-counting the same bytes across turns. Image tokens on vision content blocks are estimated via `_estimate_image_tokens()` using data URL length as a proxy.
 
 ### `kairos/terminal_manager.py` — TerminalManager
 
@@ -341,7 +345,7 @@ All shared state is protected by `threading.Lock`.
 Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its entire lifetime (avoids greenlet errors).
 
 **Worker Thread** (`_WorkerThread`):
-- `start()` — spawns thread, initializes Playwright
+- `start()` — spawns thread, initializes Playwright, signals `_started` event when ready
 - `dispatch(fn, timeout)` — queues callable, blocks until result
 - `stop()` — sends sentinel, joins thread
 
@@ -354,16 +358,23 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 **CloakBrowser integration**: When `pip install cloakbrowser` is available, uses its stealth Chromium binary and `build_args()` for fingerprint patches. Falls back to standard Playwright Chromium.
 
 **Key operations** (all dispatched to worker thread):
-- `navigate(url)` — `page.goto(url, wait_until="domcontentloaded")`
-- `click(selector)` — tries CSS selector first, falls back to `page.get_by_text()`, then label/JS click for hidden elements (radio/checkbox), then `getElementById` via JS for IDs with special chars (colons, etc.)
-- `type_text(selector, text, press_enter?)` — `loc.fill("")` then `loc.type(text, delay=30)`
-- `select_option(selector, value)` — tries by HTML `value` attribute, then by visible `label` text, then by numeric index, then JS fallback via `getElementById` + `dispatchEvent('change')` for selectors that Playwright can't parse
-- `snapshot()` — executes `_SNAPSHOT_JS` (inline JS that extracts accessibility tree), formats into compact text. Question context lines (`↳ Q:`) are shown below radio/checkbox/select elements when available.
+- `navigate(url)` — `page.goto(url, wait_until="domcontentloaded")`, clears active frame
+- `click(selector)` — tries CSS selector first, falls back to `page.get_by_text()`, then label/JS click for hidden elements (radio/checkbox), then `getElementById` via JS for IDs with special chars (colons, etc.). Uses `_target()` for iframe support. `_click_label` has a `loc.count() == 0` guard to skip zero-match selectors immediately to JS fallback.
+- `click_xy(x, y)` — `page.mouse.click(x, y)` for coordinate-based clicking (vision fallback)
+- `switch_frame(frame_selector?)` — sets `_active_frame` to an iframe's Frame object; pass None to reset to top-level. All subsequent `click`, `type_text`, `select_option`, `evaluate`, and `snapshot` operations route through `_target()` which returns the active frame or top-level page.
+- `type_text(selector, text, press_enter?)` — `loc.fill("")` then `loc.type(text, delay=30)`. Uses `_target()`.
+- `select_option(selector, value)` — tries by HTML `value` attribute, then by visible `label` text, then by numeric index, then JS fallback via `getElementById` + `dispatchEvent('change')` for selectors that Playwright can't parse. Uses `_target()`.
+- `snapshot()` — executes `_SNAPSHOT_JS` (inline JS that extracts accessibility tree), formats into compact text. Uses `_target()` for iframe support. Question context lines (`↳ Q:`) are shown below radio/checkbox/select elements when available.
 - `screenshot(full_page?)` — saves PNG to `~/.kairos/screenshots/screenshot_<timestamp>.png`, returns file path
 - Tab management: `open_new_tab()`, `switch_tab()`, `list_tabs()`, `close_tab()`
-- `evaluate(expression)` — `page.evaluate(expression)`, returns JSON-stringified result
+- `evaluate(expression)` — `page.evaluate(expression)`, returns JSON-stringified result. Uses `_target()`.
+
+**Internal**:
+- `_target()` — returns `_active_frame` if set, otherwise `current_page`. Used by click, type_text, select_option, evaluate, snapshot to support iframe routing.
+- Frame references are cleared on `navigate()`, `go_back()`, `go_forward()`, and `reload()` since page loads invalidate frame objects.
 
 **Snapshot JS** (`_SNAPSHOT_JS`): Extracts:
+- **Shadow DOM piercing**: Uses `queryShadow()` to recursively walk into `.shadowRoot` on every element, making web components inside Shadow DOM visible
 - Interactive elements with computed CSS selectors (id > name > data-testid > class path)
 - Hidden radio/checkbox inputs (always included, even when CSS-hidden — commonly used in quiz forms)
 - Associated `<label>` text for radio/checkbox inputs (via `label[for]` and wrapping `<label>`)
@@ -484,7 +495,7 @@ class SubAgentTool:
 
 ### `kairos/tools/browser.py` — Browser Tools
 
-12 callable wrapper classes, each takes a `BrowserManager` instance:
+14 callable wrapper classes, each takes a `BrowserManager` instance:
 
 | Class | Method Called |
 |-------|-------------|
@@ -500,6 +511,8 @@ class SubAgentTool:
 | `BrowserTabOpenTool` | `bm.open_new_tab(url)` |
 | `BrowserEvaluateTool` | `bm.evaluate(expression)` |
 | `BrowserCloseTool` | `bm.close()` |
+| `BrowserClickXYTool` | `bm.click_xy(x, y)` — coordinate-based click for vision fallback |
+| `BrowserSwitchFrameTool` | `bm.switch_frame(frame_selector)` — switch into/out of iframes |
 
 Each returns `ToolResult`. `BrowserLaunchTool` catches `ImportError` specifically to give installation instructions.
 

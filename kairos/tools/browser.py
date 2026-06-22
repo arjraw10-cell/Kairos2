@@ -217,3 +217,34 @@ class BrowserCloseTool:
             return ToolResult(True, result)
         except Exception as e:
             return ToolResult(False, "", f"Close failed: {e}")
+
+
+class BrowserClickXYTool:
+    """Click at absolute viewport coordinates (x, y). Useful for vision-based
+    interaction — take a screenshot, locate the target, then click its coords."""
+
+    def __init__(self, browser_manager):
+        self.bm = browser_manager
+
+    def __call__(self, x: float, y: float) -> ToolResult:
+        try:
+            result = self.bm.click_xy(x, y)
+            return ToolResult(True, result)
+        except Exception as e:
+            return ToolResult(False, "", f"Click at ({x}, {y}) failed: {e}")
+
+
+class BrowserSwitchFrameTool:
+    """Switch the active context into an iframe, or back to top-level.
+    Pass None/empty to return to the top-level page.  Pass a CSS selector,
+    frame name, or URL fragment to match the target frame."""
+
+    def __init__(self, browser_manager):
+        self.bm = browser_manager
+
+    def __call__(self, frame_selector: Optional[str] = None) -> ToolResult:
+        try:
+            result = self.bm.switch_frame(frame_selector)
+            return ToolResult(True, result)
+        except Exception as e:
+            return ToolResult(False, "", f"Frame switch failed: {e}")
