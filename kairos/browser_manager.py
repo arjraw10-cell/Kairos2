@@ -120,7 +120,13 @@ class _WorkerThread:
 
         if "error" in result_holder:
             raise result_holder["error"]
-        return result_holder.get("result")
+        if "result" in result_holder:
+            return result_holder["result"]
+        # Timed out — task never completed, neither result nor error
+        raise TimeoutError(
+            f"Browser operation timed out after {timeout + 5}s. "
+            "The page may be unresponsive or the operation is taking too long."
+        )
 
     def stop(self):
         """Shut down the worker thread."""
@@ -515,7 +521,19 @@ class BrowserManager:
         try:
             status, title = self._worker.dispatch(_do, timeout=35)
             return f"Navigated to {url}\nStatus: {status}\nTitle: {title}"
+        except TimeoutError:
+            return (
+                f"Navigation timed out: {url}\n"
+                "The page took too long to load. It may be slow, unresponsive, or blocking."
+            )
         except Exception as e:
+            err_str = str(e)
+            if "ERR_NAME_NOT_RESOLVED" in err_str:
+                return f"Navigation failed: DNS resolution error — domain not found for: {url}"
+            if "ERR_CONNECTION" in err_str or "ERR_TIMED_OUT" in err_str:
+                return f"Navigation failed: connection error for {url} — site may be down or blocking."
+            if "net::ERR" in err_str:
+                return f"Navigation failed: network error for {url} — {err_str}"
             return f"Navigation failed: {e}"
 
     def click_xy(self, x: float, y: float) -> str:
@@ -646,103 +664,190 @@ class BrowserManager:
         target = self._target()
         if not target:
             return "No active page."
+
+        def _pre_click_state():
+            return {
+                "url": target.url,
+                "title": target.title() or "",
+            }
+        try:
+            pre_state = self._worker.dispatch(_pre_click_state, timeout=5)
+        except Exception:
+            pre_state = {}
+
+        clicked_method = None
         try:
             self._worker.dispatch(lambda: target.locator(selector).click(timeout=10000), timeout=15)
-            return f"Clicked: {selector}"
-        except Exception as e:
-            # Fallback 1: try by visible text
+            clicked_method = "CSS selector"
+        except Exception:
+            pass
+
+        if not clicked_method:
             try:
                 self._worker.dispatch(lambda: target.get_by_text(selector, exact=False).first.click(timeout=5000), timeout=10)
-                return f"Clicked element with text: {selector}"
+                clicked_method = "visible text"
             except Exception:
                 pass
-            # Fallback 2: for hidden inputs (radio/checkbox), click the associated label via JS
+
+        if not clicked_method:
             try:
                 def _click_label():
                     el = target.locator(selector).first
-                    # Guard: if the locator matches nothing, skip straight to JS fallback
                     if el.count() == 0:
                         return None
-                    # Get the element's id
                     el_id = el.get_attribute("id")
                     if el_id:
-                        # Try <label for="id"> (standard HTML)
                         label_loc = target.locator(f'label[for="{el_id}"]')
                         if label_loc.count() > 0:
                             label_loc.first.click(timeout=3000)
-                            return True
-                        # Try aria-labelledby target (Moodle LMS pattern).
-                        # Moodle uses <div id="..._label"> instead of <label>.
+                            return "label[for]"
                         aria_id = el.get_attribute("aria-labelledby")
                         if aria_id:
                             aria_loc = target.locator(f'[id="{aria_id}"]')
                             if aria_loc.count() > 0:
                                 aria_loc.first.click(timeout=3000)
-                                return True
-                    # Try closest wrapping label
+                                return "aria-labelledby"
                     wrapping = target.locator(f"label:has({selector})").first
                     if wrapping.count() > 0:
                         wrapping.click(timeout=3000)
-                        return True
+                        return "wrapping label"
+                    try:
+                        result = target.evaluate("""(sel) => {
+                            let el = null;
+                            const idMatch = sel.match(/^\[id="(.+)"\]$/);
+                            if (idMatch) {
+                                el = document.getElementById(idMatch[1]);
+                            } else {
+                                el = document.querySelector(sel);
+                            }
+                            if (el) { el.click(); return true; }
+                            return false;
+                        }""", selector)
+                        if result:
+                            return "JS getElementById"
+                    except Exception:
+                        pass
                     return None
 
-                result = self._worker.dispatch(_click_label, timeout=5)
-                if result is True:
-                    return f"Clicked label for hidden element: {selector}"
+                clicked_method = self._worker.dispatch(_click_label, timeout=10)
             except Exception:
                 pass
-            # Fallback 3: force click via JS using getElementById.
-            # querySelector fails on IDs with colons (e.g. Moodle quiz
-            # IDs like q10711386:4_answer4), but getElementById is
-            # immune since it takes a raw string, not a CSS selector.
-            try:
-                def _js_click():
-                    result = target.evaluate("""(sel) => {
-                        let el = null;
-                        const idMatch = sel.match(/^\\[id="(.+)"\\]$/);
-                        if (idMatch) {
-                            el = document.getElementById(idMatch[1]);
-                        } else {
-                            el = document.querySelector(sel);
-                        }
-                        if (el) { el.click(); return true; }
-                        return false;
-                    }""", selector)
-                    return result
-                clicked = self._worker.dispatch(_js_click, timeout=5)
-                if clicked:
-                    return f"Clicked via JS: {selector}"
-            except Exception:
-                pass
-            return f"Click failed for '{selector}': {e}"
+
+        if not clicked_method:
+            return f"Click failed for '{selector}': no matching element found by CSS, text, label, or JS"
+
+        def _post_click_state():
+            return {
+                "url": target.url,
+                "title": target.title() or "",
+                "modal_visible": bool(target.locator(".modal.show, .modal[style*='display: block'], [role='dialog']:not([hidden])").count()),
+                "dropdown_visible": bool(target.locator(".dropdown-menu.show, [role='listbox']:not([hidden])").count()),
+            }
+
+        try:
+            post_state = self._worker.dispatch(_post_click_state, timeout=5)
+        except Exception:
+            return f"Clicked: {selector} (via {clicked_method}) — could not verify page state after click"
+
+        changes = []
+        if post_state.get("url") != pre_state.get("url"):
+            changes.append(f"URL changed: {post_state['url']}")
+        if post_state.get("title") != pre_state.get("title"):
+            changes.append(f"Title changed: {post_state['title']}")
+
+        try:
+            def _check_radio_checkbox():
+                loc = target.locator(selector)
+                tag = loc.evaluate("el => el.tagName.toLowerCase()")
+                if tag == "input":
+                    input_type = loc.evaluate("el => el.type")
+                    checked = loc.evaluate("el => el.checked")
+                    return input_type, checked
+                return None, None
+            input_type, checked = self._worker.dispatch(_check_radio_checkbox, timeout=5)
+            if input_type in ("radio", "checkbox"):
+                changes.append(f"{input_type} checked={checked}")
+        except Exception:
+            pass
+
+        if post_state.get("modal_visible"):
+            changes.append("modal appeared")
+        if post_state.get("dropdown_visible"):
+            changes.append("dropdown appeared")
+
+        result = f"Clicked: {selector} (via {clicked_method})"
+        if changes:
+            result += f" — {'; '.join(changes)}"
+        else:
+            result += " — no visible page state change detected (element may not trigger navigation/DOM changes)"
+        return result
 
     def type_text(self, selector: str, text: str, press_enter: bool = False) -> str:
         target = self._target()
         if not target:
             return "No active page."
 
-        def _do_type():
+        def _do_type_fill():
+            loc = target.locator(selector)
+            loc.fill(text, timeout=5000)
+            return loc.input_value(timeout=3000)
+
+        def _do_type_keys():
             loc = target.locator(selector)
             loc.click(timeout=5000)
-            loc.fill("")
+            loc.fill("", timeout=3000)
             loc.type(text, delay=30)
-            if press_enter:
-                loc.press("Enter")
+            return loc.input_value(timeout=3000)
 
         try:
-            self._worker.dispatch(_do_type, timeout=15)
+            actual = self._worker.dispatch(_do_type_fill, timeout=15)
+        except Exception:
+            actual = None
+
+        if actual != text:
+            try:
+                actual = self._worker.dispatch(_do_type_keys, timeout=20)
+            except Exception:
+                actual = None
+
+        if actual != text:
+            try:
+                def _do_placeholder():
+                    loc = target.get_by_placeholder(selector, exact=False).first
+                    loc.fill(text, timeout=5000)
+                    return loc.input_value(timeout=3000)
+                actual = self._worker.dispatch(_do_placeholder, timeout=15)
+            except Exception:
+                pass
+
+        if actual == text:
             result = f"Typed into {selector}: '{text}'"
+            if press_enter:
+                self._worker.dispatch(
+                    lambda: target.locator(selector).press("Enter"), timeout=5
+                )
+                result += " + Enter"
+            return result
+        elif actual is not None and actual.strip() == text.strip():
+            result = f"Typed into {selector}: '{text}' (stripped match — value is '{actual}')"
+            if press_enter:
+                self._worker.dispatch(
+                    lambda: target.locator(selector).press("Enter"), timeout=5
+                )
+                result += " + Enter"
+            return result
+        elif actual is not None:
+            return (
+                f"WARNING: Typed into {selector} but verification failed!\n"
+                f"  Expected: '{text}'\n"
+                f"  Actual:   '{actual}'\n"
+                f"  The field may have a JS handler that cleared or modified the input."
+            )
+        else:
+            result = f"Typed into {selector}: '{text}' (could not verify — element may not be a standard input)"
             if press_enter:
                 result += " + Enter"
             return result
-        except Exception as e:
-            try:
-                self._worker.dispatch(
-                    lambda: target.get_by_placeholder(selector, exact=False).first.fill(text), timeout=10
-                )
-                return f"Typed into placeholder '{selector}': '{text}'"
-            except Exception:
-                return f"Type failed for '{selector}': {e}"
 
     def select_option(self, selector: str, value: str) -> str:
         target = self._target()
@@ -751,91 +856,107 @@ class BrowserManager:
 
         def _do_select():
             loc = target.locator(selector)
-            # Try by value attribute first
             try:
                 loc.select_option(value=value, timeout=3000)
-                return "value"
+                return "value", loc.input_value(timeout=3000)
             except Exception:
                 pass
-            # Try by visible label text (e.g. "to celebrate")
             try:
                 loc.select_option(label=value, timeout=3000)
-                return "label"
+                return "label", loc.input_value(timeout=3000)
             except Exception:
                 pass
-            # Try by numeric index
             try:
                 idx = int(value)
                 loc.select_option(index=idx, timeout=3000)
-                return "index"
+                return "index", loc.input_value(timeout=3000)
             except (ValueError, Exception):
                 pass
-            return None
+            return None, None
 
         try:
-            method = self._worker.dispatch(_do_select, timeout=10)
-            if method:
-                return f"Selected '{value}' in {selector} (matched by {method})"
-        except Exception as e:
-            pass  # Fall through to JS fallback
-
-        # Fallback: set via JS using getElementById (handles selectors like
-        # [id="menuq10711386:10_sub0"] that Playwright can't parse)
-        try:
-            def _do_js_select():
-                # Parse [id="..."] attribute selectors → raw ID string
-                if selector.startswith('[id="') and selector.endswith('"]'):
-                    raw_id = selector[5:-2]
-                    return target.evaluate(
-                        "(id, val) => {"
-                        "  const e = document.getElementById(id);"
-                        "  if (!e) return null;"
-                        "  e.value = val;"
-                        "  e.dispatchEvent(new Event('change', {bubbles: true}));"
-                        "  return e.value;"
-                        "}",
-                        raw_id, value,
-                    )
-                return None
-            result = self._worker.dispatch(_do_js_select, timeout=10)
-            if result is not None:
-                return f"Selected '{value}' in {selector} (via JS)"
+            method, actual_value = self._worker.dispatch(_do_select, timeout=10)
         except Exception:
-            pass
+            method, actual_value = None, None
 
-        return f"Select failed for '{selector}': '{value}' not found as value, label, or index"
+        if not method:
+            try:
+                def _do_js_select():
+                    if selector.startswith('[id="') and selector.endswith('"]'):
+                        raw_id = selector[5:-2]
+                        return target.evaluate(
+                            "(id, val) => {"
+                            "  const e = document.getElementById(id);"
+                            "  if (!e) return null;"
+                            "  e.value = val;"
+                            "  e.dispatchEvent(new Event('change', {bubbles: true}));"
+                            "  return e.value;"
+                            "}",
+                            raw_id, value,
+                        )
+                    return None
+                js_result = self._worker.dispatch(_do_js_select, timeout=10)
+                if js_result is not None:
+                    method = "JS getElementById"
+                    actual_value = js_result
+            except Exception:
+                pass
+
+        if not method:
+            return f"Select failed for '{selector}': '{value}' not found as value, label, or index"
+
+        if actual_value is not None and actual_value.strip() == value.strip():
+            return f"Selected '{value}' in {selector} (matched by {method}, verified)"
+        elif actual_value is not None and actual_value:
+            return (
+                f"WARNING: Selected '{value}' in {selector} via {method}, but verification shows "
+                f"different value: '{actual_value}'. The selection may not have taken effect."
+            )
+        elif actual_value is not None:
+            return f"Selected '{value}' in {selector} via {method}, but value read-back is empty (element may have fired a JS handler that reset it)"
+        else:
+            return f"Selected '{value}' in {selector} via {method} (could not verify — element may not support input_value() readback)"
 
     def evaluate(self, expression: str) -> str:
         target = self._target()
         if not target:
             return "No active page."
         try:
-            fn_expression = expression
-            if isinstance(expression, str) and 'return' in expression.split():
+            try:
+                result = self._worker.dispatch(
+                    lambda: target.evaluate(expression), timeout=15
+                )
+            except SyntaxError:
                 fn_expression = f'() => {{ {expression} }}'
-            result = self._worker.dispatch(lambda: target.evaluate(fn_expression), timeout=15)
+                result = self._worker.dispatch(
+                    lambda: target.evaluate(fn_expression), timeout=15
+                )
             if result is None:
                 return "JavaScript executed (returned null/undefined)"
             if isinstance(result, str):
                 return result if len(result) < 10000 else result[:10000] + "...[truncated]"
             return json.dumps(result, indent=2, default=str)
+        except SyntaxError:
+            return (
+                f"JavaScript syntax error in: {expression!r}\n"
+                "If you want to use 'return', pass the full function body."
+            )
         except Exception as e:
-            return f"JavaScript error: {e}"
+            return f"JavaScript error: {type(e).__name__}: {e}"
 
     # ------------------------------------------------------------------
     #  Observation
     # ------------------------------------------------------------------
 
-    def screenshot(self, full_page: bool = False) -> Tuple[Optional[bytes], str]:
-        """Capture a screenshot. Returns (png_bytes, message_with_file_path).
+    def screenshot(self, full_page: bool = False) -> Tuple[Optional[bytes], str, Optional[str]]:
+        """Capture a screenshot. Returns (png_bytes, message, data_url).
 
-        Screenshots are saved to ~/.kairos/screenshots/ with a timestamped name.
-        This avoids sending large base64 data through the API (which causes 400
-        errors with OpenRouter and similar providers).
+        Screenshots are saved to ~/.kairos/screenshots/ and also returned as a
+        base64 data URL so the model can see them via the read tool or vision API.
         """
         page = self.current_page
         if not page:
-            return None, "No active page."
+            return None, "No active page.", None
 
         screenshots_dir = Path("~/.kairos/screenshots").expanduser()
         screenshots_dir.mkdir(parents=True, exist_ok=True)
@@ -848,17 +969,19 @@ class BrowserManager:
         def _do():
             png_bytes = page.screenshot(full_page=full_page, type="png")
             filepath.write_bytes(png_bytes)
-            return png_bytes, page.url, len(png_bytes)
+            data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+            return png_bytes, page.url, len(png_bytes), data_url
 
         try:
-            png_bytes, url, size_bytes = self._worker.dispatch(_do, timeout=30)
+            png_bytes, url, size_bytes, data_url = self._worker.dispatch(_do, timeout=30)
             size_kb = size_bytes / 1024
-            return png_bytes, (
+            msg = (
                 f"Screenshot captured ({size_kb:.0f} KB) — {url}\n"
                 f"Saved to: {filepath}"
             )
+            return png_bytes, msg, data_url
         except Exception as e:
-            return None, f"Screenshot failed: {e}"
+            return None, f"Screenshot failed: {e}", None
 
     def snapshot(self) -> str:
         target = self._target()
@@ -1053,10 +1176,16 @@ class BrowserManager:
 
         if url_pattern:
             for i, page in enumerate(self._pages):
-                if url_pattern.lower() in page.url.lower():
+                try:
+                    page_url = self._worker.dispatch(
+                        lambda p=page: p.url, timeout=5
+                    )
+                except Exception:
+                    page_url = ""
+                if url_pattern.lower() in page_url.lower():
                     self._current_idx = i
                     title = _get_tab_title(page)
-                    return f"Switched to tab {i}: {title} — {page.url}"
+                    return f"Switched to tab {i}: {title} — {page_url}"
             return f"No tab matches URL pattern: '{url_pattern}'"
 
         if index is None:
@@ -1108,7 +1237,8 @@ class BrowserManager:
         if len(self._pages) == 1:
             return "Can't close the last tab. Use browser_close instead."
         try:
-            self._worker.dispatch(lambda i=index: self._pages[i].close(), timeout=10)
+            page_to_close = self._pages[index]
+            self._worker.dispatch(lambda p=page_to_close: p.close(), timeout=10)
         except Exception:
             pass
         self._pages.pop(index)

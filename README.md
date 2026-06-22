@@ -4,15 +4,16 @@ A minimal personal coding agent in Python.
 
 ## Features
 
-- **26 Tools**: File operations, terminal management, search, git, sub-agents, and a full browser automation suite (with shadow DOM, iframe, and vision-click support)
+- **29 Tools**: File operations, terminal management, search, git, sub-agents, skills, and a full browser automation suite (with shadow DOM, iframe, and vision-click support)
 - **Absolute Paths**: All file operations use absolute paths — no workspace restrictions
 - **Streaming First**: Tokens print as they arrive; no waiting for full responses
 - **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange. Uses ground-truth counts from the API when available (`stream_options={"include_usage": True}`), with tiktoken estimates as fallback
 - **Auto-Compaction**: Conversation history is automatically summarized when context usage exceeds 80%
 - **Sub-Agents**: Spawn autonomous child agents to work on tasks in parallel
 - **Browser Automation**: Full Playwright/CloakBrowser integration with stealth mode, persistent profiles, multi-tab, and CDP support
+- **Skills**: Self-extensible skill system — agent can create/load skills stored as `SKILL.md` files in `skills/` directory
 - **Paste System**: Ctrl+V pastes text, Alt+V pastes images. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. Smart clipboard detection with pending state: if the clipboard changes while typing, the new content is remembered and matched once it actually appears in the buffer, preventing missed pastes.
-- **Chat Persistence**: All sessions saved to `chats/chats.json` with auto-save every 60 seconds and on window close. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions.
+- **Chat Persistence**: All sessions saved to `chats/chats.json` with auto-save every 60 seconds and on window close. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions. **Atomic writes** via temp-file + rename prevent corruption from interrupted saves. **Corruption recovery** auto-heals damaged files by parsing up to the last valid JSON boundary.
 - **`/resume`**: Load previous chats via numbered picker
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
 - **Streaming Display**: Real-time tokens in a live-updating panel (grey for thinking, green for final response)
@@ -106,7 +107,17 @@ python main.py /path/to/project  # specific workspace
 | `spawn_subagent(prompt, mode?)` | Spawn an autonomous child agent — `blocking` (waits) or `non-blocking` (returns ID) |
 | `get_subagent_result(subagent_id)` | Poll a non-blocking sub-agent for its result |
 
-Sub-agents have access to file, search, git, and terminal tools but cannot spawn further sub-agents or use browser tools.
+Sub-agents have access to file, search, git, terminal, and skill tools but cannot spawn further sub-agents or use browser tools.
+
+### Skill Tools
+
+| Tool | Description |
+|------|-------------|
+| `list_skills()` | List all available skill names (from `skills/` directory) |
+| `load_skill(skill_name)` | Load and return a skill's full `SKILL.md` content |
+| `write_skill(skill_name, content, overwrite?)` | Create or update a skill's `SKILL.md` (default: refuses if exists; `overwrite=true` to replace) |
+
+Skills are stored in `skills/<skill-name>/SKILL.md`. Only skill names are injected into the system prompt — full content is loaded on demand via `load_skill`. The agent can write its own skills with `write_skill`.
 
 ### Browser Tools
 
@@ -114,11 +125,11 @@ Sub-agents have access to file, search, git, and terminal tools but cannot spawn
 |------|-------------|
 | `browser_launch(profile?, proxy?, humanize?, chrome_profile?, connect_cdp?)` | Launch a browser (Playwright or CloakBrowser stealth) |
 | `browser_navigate(url)` | Navigate to a URL |
-| `browser_click(selector)` | Click an element (CSS selector, text, or label — auto-fallback for hidden inputs like radio buttons; uses `getElementById` for IDs with special chars) |
-| `browser_type(selector, text, press_enter?)` | Type into an input field |
-| `browser_select(selector, value)` | Select a dropdown option (tries by value, then visible label text, then index, then JS fallback via `getElementById`) |
+| `browser_click(selector)` | Click an element (CSS selector, text, or label — auto-fallback for hidden inputs like radio buttons; uses `getElementById` for IDs with special chars). **Verifies** post-click: checks URL/title changes, modal/dropdown appearance, radio/checkbox state. |
+| `browser_type(selector, text, press_enter?)` | Type into an input field. **Verifies** by reading back `input_value()` — tries `fill()`, then `type()`, then placeholder fallback. Reports exact match or WARNING with expected vs actual. |
+| `browser_select(selector, value)` | Select a dropdown option (tries by value, then visible label text, then index, then JS fallback via `getElementById`). **Verifies** by reading back the selected value. |
 | `browser_snapshot()` | Get a compact text representation of the page (interactive elements, select options, radio labels, form state, question context for quiz pages) |
-| `browser_screenshot(full_page?)` | Capture a screenshot (saved to `~/.kairos/screenshots/`) |
+| `browser_screenshot(full_page?)` | Capture a screenshot (saved to `~/.kairos/screenshots/` and returned as image data the model can analyze) |
 | `browser_tab_list()` | List all open tabs |
 | `browser_tab_switch(index?, url_pattern?)` | Switch tabs by index or URL pattern |
 | `browser_tab_open(url?)` | Open a new tab |
@@ -160,6 +171,7 @@ kairos/
     ├── terminal.py         # Terminal tool wrappers
     ├── subagent.py         # Sub-agent spawn and tracking
     ├── browser.py          # Browser tool wrappers
+    ├── skills.py           # Skill manager (list, load, write skills)
     └── session.py          # Chat save/load manager
 ```
 
@@ -172,6 +184,10 @@ Tokens are streamed in real-time. During the agent's reasoning phase, a grey pan
 ### Compaction
 
 When the conversation context exceeds 80% of the context window, old messages are automatically summarized into a structured checkpoint (Goal, Progress, Key Decisions, Next Steps) and replaced. Recent context (~20k tokens) is preserved. You can also trigger this manually with `/compact`.
+
+### Skills
+
+Skills are self-contained knowledge modules stored in `skills/<skill-name>/SKILL.md`. At startup, only skill **names** are injected into the system prompt (lightweight). When the agent wants to use a skill, it calls `load_skill(skill_name)` to fetch the full content into context. The agent can also create new skills via `write_skill(skill_name, content)`.
 
 ### AGENTS.md
 
@@ -192,6 +208,7 @@ Chat history is saved:
 4. **Interruptible** — Ctrl+C hard-interrupts; Escape gracefully stops between steps
 5. **Token Aware** — Session, context, and turn token counts displayed
 6. **Minimal Dependencies** — `openai`, `python-dotenv`, `rich`, `prompt_toolkit`, `tiktoken`, `playwright`
+7. **Loud by Default** — Tools always report what they did. Success includes specifics (e.g. "Wrote 42 lines to `main.py`"). Failure clearly states what went wrong. Nothing happens silently — overwrites, creations, and deletions are always announced.
 
 ## License
 

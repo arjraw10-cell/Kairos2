@@ -29,6 +29,7 @@ from .browser import (
     BrowserClickXYTool,
     BrowserSwitchFrameTool,
 )
+from .skills import SkillManager
 
 __all__ = [
     "ToolResult",
@@ -58,4 +59,5 @@ __all__ = [
     "BrowserCloseTool",
     "BrowserClickXYTool",
     "BrowserSwitchFrameTool",
+    "SkillManager",
 ]

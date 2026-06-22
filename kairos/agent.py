@@ -22,6 +22,7 @@ from .tools import (
     SearchTool,
     GitTool,
     SubAgentTool,
+    SkillManager,
     BrowserLaunchTool,
     BrowserNavigateTool,
     BrowserClickTool,
@@ -96,6 +97,9 @@ class Agent:
         self.browser_click_xy_tool = BrowserClickXYTool(self.browser_manager)
         self.browser_switch_frame_tool = BrowserSwitchFrameTool(self.browser_manager)
 
+        # Skills
+        self.skill_manager = SkillManager(str(self.cwd / "skills"))
+
         # Callbacks wired from CLI
         self.on_tool_call: Optional[Callable[[str, dict], None]] = None
         self.on_stream_start: Optional[Callable[[], None]] = None
@@ -116,7 +120,8 @@ class Agent:
             "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, inspect version control, and browse the web.\n\n"
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
-            "You have 26 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n Whenver the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, you should look for the AGENTS.md file in that directory."
+            "You have 29 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong — use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
+            "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, you should look for the AGENTS.md file in that directory.\n\n"
             "## Browser Tools\n"
             "You can browse the web using browser tools. The workflow is:\n"
             "1. `browser_launch` \u2014 start the browser (optionally with a named profile for persistent sessions)\n"
@@ -152,6 +157,22 @@ class Agent:
                 "Follow any instructions or conventions described in it. "
                 "If you make code changes, remember to also update this AGENTS.md and README.md.\n\n"
                 f"{agents_md}"
+            )
+
+        # Auto-inject available skill names
+        skill_names = self.skill_manager._discover_skills()
+        if skill_names:
+            base += (
+                "\n\n## Skills\n"
+                "Available skills: " + ", ".join(skill_names) + "\n"
+                "Use load_skill(skill_name) to read a skill's full content when needed.\n"
+                "Use write_skill(skill_name, content) to create a new skill, "
+                "or write_skill(skill_name, content, overwrite=true) to update an existing one."
+            )
+        else:
+            base += (
+                "\n\n## Skills\n"
+                "No skills available yet. Use write_skill(skill_name, content) to create one."
             )
 
         self.system_prompt = base
@@ -634,11 +655,9 @@ class Agent:
                     "name": "browser_screenshot",
                     "description": (
                         "Capture a visual screenshot of the current page. "
-                        "Saved to ~/.kairos/screenshots/ and the file path is returned. "
-                        "Use when you need to verify visual layout, "
-                        "see images, or when the text snapshot isn't enough. "
-                        "NOTE: do NOT use this tool — it saves a file but does not return "
-                        "image data to the model. Use browser_snapshot instead for page inspection."
+                        "Saved to ~/.kairos/screenshots/ and returned as image data the model can see. "
+                        "Use when you need to verify visual layout, see images, or when the text snapshot isn't enough. "
+                        "The screenshot is automatically injected as a vision image so you can analyze it."
                     ),
                     "parameters": {
                         "type": "object",
@@ -783,6 +802,73 @@ class Agent:
                     },
                 },
             },
+            # ---- Skill Tools ----
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_skills",
+                    "description": (
+                        "List all available skills by name. "
+                        "Skills are stored in the workspace's skills/ directory. "
+                        "Each skill is a folder containing a SKILL.md file. "
+                        "Use load_skill to read a skill's full content."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "load_skill",
+                    "description": (
+                        "Load a skill by name and return its full SKILL.md content. "
+                        "Use list_skills first to see available skill names."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "skill_name": {
+                                "type": "string",
+                                "description": "Name of the skill (folder name under skills/)",
+                            },
+                        },
+                        "required": ["skill_name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_skill",
+                    "description": (
+                        "Create or update a skill's SKILL.md file. "
+                        "Creates the skill folder automatically. "
+                        "If the skill already exists, you must set overwrite=true to replace it."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "skill_name": {
+                                "type": "string",
+                                "description": "Name for the skill (folder name under skills/)",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Full content for the SKILL.md file",
+                            },
+                            "overwrite": {
+                                "type": "boolean",
+                                "description": "Set to true to overwrite an existing skill (default: false)",
+                            },
+                        },
+                        "required": ["skill_name", "content"],
+                    },
+                },
+            },
         ]
 
         if self._is_subagent:
@@ -874,6 +960,14 @@ class Agent:
             ).to_dict(),
             "browser_switch_frame": lambda a: self.browser_switch_frame_tool(
                 a.get("frame_selector")
+            ).to_dict(),
+            # Skill tools
+            "list_skills": lambda a: self.skill_manager.list_skills().to_dict(),
+            "load_skill": lambda a: self.skill_manager.load_skill(
+                a["skill_name"]
+            ).to_dict(),
+            "write_skill": lambda a: self.skill_manager.write_skill(
+                a["skill_name"], a["content"], overwrite=a.get("overwrite", False)
             ).to_dict(),
         }
 
@@ -971,6 +1065,15 @@ class Agent:
         if name == "browser_switch_frame":
             sel = args.get("frame_selector", "")
             return f"switch to frame: {sel}" if sel else "switch to top-level page"
+        # Skill tool summaries
+        if name == "list_skills":
+            return "list skills"
+        if name == "load_skill":
+            return f"load skill: {args.get('skill_name', '?')}"
+        if name == "write_skill":
+            skill = args.get("skill_name", "?")
+            ow = " (overwrite)" if args.get("overwrite") else ""
+            return f"write skill: {skill}{ow}"
         return name
 
     # ------------------------------------------------------------------ #
@@ -997,9 +1100,69 @@ class Agent:
     def _truncate_history_if_needed(self):
         if len(self.conversation_history) >= 1 + self.MAX_HISTORY_MESSAGES:
             system = self.conversation_history[0]
-            self.conversation_history = [system] + self.conversation_history[
-                -(self.MAX_HISTORY_MESSAGES) :
-            ]
+
+            # Standard truncation: keep system + last MAX_HISTORY_MESSAGES
+            tail = self.conversation_history[-(self.MAX_HISTORY_MESSAGES) :]
+
+            # Safety: ensure at least one user message survives truncation.
+            # Some APIs require a user message in the conversation history.
+            # During long tool-call chains (assistant + tool messages piling
+            # up), the user message can get pushed out of the window.
+            has_user = any(m.get("role") == "user" for m in tail)
+            if not has_user:
+                # Find the last user message in the full history and expand
+                # the window to include it (plus everything after it).
+                for i in range(len(self.conversation_history) - 1, 0, -1):
+                    if self.conversation_history[i].get("role") == "user":
+                        tail = self.conversation_history[i:]
+                        break
+
+            self.conversation_history = [system] + tail
+
+    def _validate_history_before_api(self) -> Optional[str]:
+        """Sanitize conversation history before sending to the API.
+
+        Handles two structural problems that cause 400 errors:
+
+        1. **No user message**: Some APIs reject requests with no user message.
+           Triggered by truncation dropping the user message during long
+           tool-call chains, or compaction landing on a bad boundary.
+           Recovery: auto-compact to restore a valid state.
+
+        2. **Invalid message ordering**: The OpenAI API requires alternating
+           user/assistant messages.  A stale tool result left over from a
+           previous step, or a truncation cut at a bad point, can leave the
+           history ending with: [..., tool, tool, user] — which is invalid.
+           Recovery: trim trailing tool messages that lack a preceding
+           assistant message in the recent window.
+
+        Returns a status message if recovery was performed, or None.
+        """
+        history = self.conversation_history
+        if len(history) <= 2:
+            return None
+
+        # --- Check 1: must have at least one user message ---
+        has_user = any(m.get("role") == "user" for m in history)
+        if not has_user:
+            return self.compact()
+
+        # --- Check 2: fix invalid tool message sequences ---
+        # Walk backward from the end.  If we hit tool messages before
+        # reaching an assistant message (or the start), those tools are
+        # orphaned (their assistant message was truncated away) and will
+        # cause a 400 error.
+        i = len(history) - 1
+        while i > 0 and history[i].get("role") == "tool":
+            i -= 1
+        # i now points to the last non-tool message from the end.
+        # If it's not an assistant, the trailing tools are orphaned.
+        if i > 0 and history[i].get("role") != "assistant":
+            orphan_count = len(history) - 1 - i
+            self.conversation_history = history[: i + 1]
+            return f"Removed {orphan_count} orphaned tool message(s) to fix history ordering."
+
+        return None
 
     # ------------------------------------------------------------------ #
     #  Compaction                                                          #
@@ -1545,6 +1708,12 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 user_msg = {"role": "user", "content": user_message}
             self.conversation_history.append(user_msg)
 
+        # Safety: ensure history has at least one user message before calling
+        # the API (some providers reject requests without one).
+        recovery = self._validate_history_before_api()
+        if recovery and self.on_compact:
+            self.on_compact(recovery)
+
         # Count input tokens for this turn
         self.tokens.start_turn(self.conversation_history)
 
@@ -1601,6 +1770,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
         # Execute tool calls
         tool_results = []
+        tool_image_data_urls = []  # Collect screenshots to inject as vision messages
         for tc in assembled_tool_calls:
             self._check_interrupt()
 
@@ -1612,10 +1782,12 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
             result_json = self._execute_tool(func_name, func_args)
 
-            # Parse result — discard image data since tool messages with
-            # images cause 400 errors on OpenRouter and most providers.
+            # Parse result — extract image data before sending tool message
+            # (tool messages can't carry images on most providers).
             result_dict = json.loads(result_json)
-            result_dict.pop("image_url", None)  # Discard — never safe in tool messages
+            image_data_url = result_dict.pop("image_url", None)  # Extract before tool msg
+            if image_data_url:
+                tool_image_data_urls.append(image_data_url)
             text_content = json.dumps(result_dict)
 
             tool_msg = {
@@ -1628,6 +1800,15 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             tool_results.append(tool_msg)
 
         self.conversation_history.extend(tool_results)
+
+        # Inject any image results as a user vision message so the model
+        # can actually see them (tool messages can't carry images).
+        if tool_image_data_urls:
+            image_parts = [{"type": "text", "text": "[Screenshot captured — the image below shows the current browser page]"}]
+            for img_url in tool_image_data_urls:
+                image_parts.append({"type": "image_url", "image_url": {"url": img_url}})
+            self.conversation_history.append({"role": "user", "content": image_parts})
+
         self._truncate_history_if_needed()
 
         self.tokens.finish_turn()
@@ -1673,7 +1854,12 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 if response:
                     return response
                 if not tool_calls:
-                    # No response and no tool calls — retry the API call
+                    # No response and no tool calls — retry the API call.
+                    # Remove the empty assistant message so the history still
+                    # ends with the user message (avoids the "Cannot have 2 or
+                    # more assistant messages at the end of the list" 400 error).
+                    if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
+                        self.conversation_history.pop()
                     if empty_retry_count < max_empty_retries:
                         empty_retry_count += 1
                         if self.on_compact:

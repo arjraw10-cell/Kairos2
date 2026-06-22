@@ -68,7 +68,7 @@ _kb = KeyBindings()
 def _get_clipboard_sequence_number() -> int:
     """Return the current clipboard sequence number (Windows only).
 
-    This is a single ctypes call — virtually free. The number increments
+    This is a single ctypes call -- virtually free. The number increments
     whenever clipboard content changes, letting us detect pastes without
     spawning subprocesses on every keystroke.
 
@@ -81,6 +81,40 @@ def _get_clipboard_sequence_number() -> int:
         return ctypes.windll.user32.GetClipboardSequenceNumber()
     except Exception:
         return 0
+
+
+def _ctypes_read_clipboard() -> str:
+    """Read clipboard text via Win32 API. Sub-millisecond on Windows.
+
+    Uses direct ctypes calls (OpenClipboard / GetClipboardData / GlobalLock)
+    instead of spawning PowerShell.  Returns empty string on failure or
+    non-Windows.
+    """
+    if sys.platform != "win32":
+        return _read_system_clipboard()
+    try:
+        import ctypes
+        CF_UNICODETEXT = 13
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        if not user32.OpenClipboard(0):
+            return ""
+        try:
+            if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                return ""
+            h = user32.GetClipboardData(CF_UNICODETEXT)
+            if not h:
+                return ""
+            p = kernel32.GlobalLock(h)
+            if not p:
+                return ""
+            text = ctypes.c_wchar_p(p).value or ""
+            kernel32.GlobalUnlock(h)
+            return text
+        finally:
+            user32.CloseClipboard()
+    except Exception:
+        return ""
 
 
 # ------------------------------------------------------------------ #
@@ -618,15 +652,22 @@ class CLI:
             buf = self._prompt_session.default_buffer
 
             # ---- Text paste detection via on_text_changed ----
-            # Windows Terminal intercepts Ctrl+V and pastes raw characters
-            # before prompt_toolkit sees a key event.  We detect this by
-            # watching for clipboard sequence number changes (cheap!) then
-            # reading clipboard only when a change is detected.
+            # Windows Terminal intercepts Ctrl+V and writes raw characters to
+            # the buffer one at a time (growth=1 per keystroke).  We detect
+            # pastes by reading the clipboard via a fast ctypes Win32 call
+            # (~0.001ms) on every text increase and checking if the clipboard
+            # text now appears in the buffer.  This works regardless of when
+            # the text was copied (before or after prompt start).
+            #
+            # For long text that arrives character-by-character, we hold a
+            # pending state and check each subsequent event until the full
+            # clipboard text appears in the buffer.
             _handling = [False]           # prevent recursion flag
             _prev_text = [buf.text]       # last known buffer state
             _pre_clip_seq = [_get_clipboard_sequence_number()]
             _pending_paste = [None]       # clipboard text waiting to be matched
             _last_clip_seq = [0]          # seq number when pending state started
+            _pending_count = [0]          # events since pending started (timeout)
 
             def _on_text_changed(b):
                 """Replace terminal-intercepted text paste with a token."""
@@ -658,17 +699,20 @@ class CLI:
 
                 if clip_changed:
                     # Clipboard changed — read it and try to match
-                    clip_text = _get_clipboard_text_clean()
+                    clip_raw = _ctypes_read_clipboard()
+                    clip_text = clip_raw.strip() if clip_raw else ""
                     if clip_text and len(clip_text) >= 3:
                         if clip_text in current and clip_text not in _prev_text[0]:
                             paste_text = clip_text
                             _pending_paste[0] = None
+                            _pending_count[0] = 0
                         else:
                             # Clipboard changed but text not found yet —
                             # enter pending state so we keep trying on
                             # subsequent keystrokes.
                             _pending_paste[0] = clip_text
                             _last_clip_seq[0] = current_seq
+                            _pending_count[0] = 0
 
                 elif _pending_paste[0] is not None:
                     # Clipboard didn't change, but we have a pending paste.
@@ -677,24 +721,34 @@ class CLI:
                         current_seq = _get_clipboard_sequence_number()
                         if current_seq != _last_clip_seq[0]:
                             # Clipboard changed — update pending content
-                            new_clip = _get_clipboard_text_clean()
+                            new_raw = _ctypes_read_clipboard()
+                            new_clip = new_raw.strip() if new_raw else ""
                             if new_clip and len(new_clip) >= 3:
                                 _pending_paste[0] = new_clip
                                 _last_clip_seq[0] = current_seq
                                 _pre_clip_seq[0] = current_seq
+                                _pending_count[0] = 0
 
                     # Try to match the pending text in the current buffer
                     clip_text = _pending_paste[0]
                     if clip_text and clip_text in current and clip_text not in _prev_text[0]:
                         paste_text = clip_text
                         _pending_paste[0] = None
+                        _pending_count[0] = 0
+                    else:
+                        _pending_count[0] += 1
+                        if _pending_count[0] > 100:
+                            _pending_paste[0] = None
+                            _pending_count[0] = 0
+                        else:
+                            return
 
                 if paste_text is None:
                     _prev_text[0] = current
                     return
 
                 # ---- Replace the pasted text with a token ----
-                clip_raw = _read_system_clipboard() or paste_text
+                clip_raw = _ctypes_read_clipboard() or paste_text
 
                 _handling[0] = True
                 try:

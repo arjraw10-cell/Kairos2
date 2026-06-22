@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -20,13 +22,71 @@ class SessionManager:
 
     def _load_all(self) -> Dict[str, Any]:
         path = self._chat_file()
-        if path.exists():
+        if not path.exists():
+            return {}
+        try:
             return json.loads(path.read_text(encoding="utf-8"))
-        return {}
+        except json.JSONDecodeError:
+            # File is corrupted (e.g. from interrupted write). Try to recover
+            # by parsing up to the last valid JSON boundary.
+            content = path.read_text(encoding="utf-8")
+            decoder = json.JSONDecoder()
+            try:
+                data, _ = decoder.raw_decode(content)
+                if isinstance(data, dict):
+                    # Re-save the recovered data to fix the file
+                    self._save_all(data)
+                    return data
+            except json.JSONDecodeError:
+                pass
+            # Last resort: try each JSON block and merge
+            all_data: Dict[str, Any] = {}
+            pos = 0
+            while pos < len(content):
+                while pos < len(content) and content[pos] in " \t\n\r":
+                    pos += 1
+                if pos >= len(content):
+                    break
+                try:
+                    obj, end = decoder.raw_decode(content, pos)
+                    if isinstance(obj, dict):
+                        all_data.update(obj)
+                    pos = end
+                except json.JSONDecodeError:
+                    break
+            if all_data:
+                self._save_all(all_data)
+                return all_data
+            # Completely unrecoverable — start fresh
+            return {}
 
     def _save_all(self, data: Dict[str, Any]):
+        """Write chats.json atomically via temp-file + rename.
+
+        This prevents file corruption from interrupted writes (Ctrl+C, crash)
+        because the target file is only replaced after the full write succeeds.
+        """
         path = self._chat_file()
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp", prefix="chats_"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_f:
+                tmp_f.write(
+                    json.dumps(data, indent=2, ensure_ascii=False)
+                )
+                tmp_f.flush()
+                os.fsync(tmp_f.fileno())
+            # Atomic replace (on Windows this overwrites the target)
+            shutil.move(tmp_path, str(path))
+        except BaseException:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def _extract_preview(conversation_history: List[Dict[str, Any]]) -> str:
