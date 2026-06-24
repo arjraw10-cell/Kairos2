@@ -4,7 +4,7 @@ A minimal personal coding agent in Python.
 
 ## Features
 
-- **29 Tools**: File operations, terminal management, search, git, sub-agents, skills, and a full browser automation suite (with shadow DOM, iframe, and vision-click support)
+- **40 Tools**: File operations, terminal management, search, git, sub-agents, skills, and a comprehensive browser automation suite (30 browser tools including hover, drag, wait_for, select_index, scroll, wait, send_keys, search_page, find_elements, index-based click/type, go_back/go_forward/reload, and CDP cross-origin iframe support)
 - **Absolute Paths**: All file operations use absolute paths — no workspace restrictions
 - **Streaming First**: Tokens print as they arrive; no waiting for full responses
 - **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange. Uses ground-truth counts from the API when available (`stream_options={"include_usage": True}`), with tiktoken estimates as fallback
@@ -12,9 +12,9 @@ A minimal personal coding agent in Python.
 - **Sub-Agents**: Spawn autonomous child agents to work on tasks in parallel
 - **Browser Automation**: Full Playwright/CloakBrowser integration with stealth mode, persistent profiles, multi-tab, and CDP support
 - **Skills**: Self-extensible skill system — agent can create/load skills stored as `SKILL.md` files in `skills/` directory
-- **Paste System**: Ctrl+V pastes text, Alt+V pastes images. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. Smart clipboard detection with pending state: if the clipboard changes while typing, the new content is remembered and matched once it actually appears in the buffer, preventing missed pastes.
+- **Paste System**: Text pastes are detected automatically via bracketed paste (modern terminals wrap pasted text in escape sequences, making it arrive as one atomic chunk). Alt+V pastes images from the clipboard. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content.
 - **Chat Persistence**: All sessions saved to `chats/chats.json` with auto-save every 60 seconds and on window close. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions. **Atomic writes** via temp-file + rename prevent corruption from interrupted saves. **Corruption recovery** auto-heals damaged files by parsing up to the last valid JSON boundary.
-- **`/resume`**: Load previous chats via numbered picker
+- **`/resume`**: Load previous chats via numbered picker — only resumes from completed agent responses (mid-execution chats with incomplete tool calls are rejected with a warning)
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
 - **Streaming Display**: Real-time tokens in a live-updating panel (grey for thinking, green for final response)
 - **Tool Summaries**: One-line display when tools are called (e.g., `read file: /path`)
@@ -124,19 +124,35 @@ Skills are stored in `skills/<skill-name>/SKILL.md`. Only skill names are inject
 | Tool | Description |
 |------|-------------|
 | `browser_launch(profile?, proxy?, humanize?, chrome_profile?, connect_cdp?)` | Launch a browser (Playwright or CloakBrowser stealth) |
-| `browser_navigate(url)` | Navigate to a URL |
-| `browser_click(selector)` | Click an element (CSS selector, text, or label — auto-fallback for hidden inputs like radio buttons; uses `getElementById` for IDs with special chars). **Verifies** post-click: checks URL/title changes, modal/dropdown appearance, radio/checkbox state. |
-| `browser_type(selector, text, press_enter?)` | Type into an input field. **Verifies** by reading back `input_value()` — tries `fill()`, then `type()`, then placeholder fallback. Reports exact match or WARNING with expected vs actual. |
-| `browser_select(selector, value)` | Select a dropdown option (tries by value, then visible label text, then index, then JS fallback via `getElementById`). **Verifies** by reading back the selected value. |
-| `browser_snapshot()` | Get a compact text representation of the page (interactive elements, select options, radio labels, form state, question context for quiz pages) |
-| `browser_screenshot(full_page?)` | Capture a screenshot (saved to `~/.kairos/screenshots/` and returned as image data the model can analyze) |
+| `browser_navigate(url)` | Navigate to a URL. Always auto-screenshots + auto-snapshots (navigation = significant change). |
+| `browser_go_back()` | Navigate back in browser history. Auto-snapshots if page changed significantly. |
+| `browser_go_forward()` | Navigate forward in browser history. Auto-snapshots if page changed significantly. |
+| `browser_reload()` | Reload the current page. Auto-snapshots on reload. |
+| `browser_click(selector)` | Click an element (CSS selector, text, or label — auto-fallback chain). Verifies post-click. Auto-detects new tabs. Smart auto-snapshot on significant DOM changes. |
+| `browser_click_index(index)` | **Click by snapshot index [0],[1]...** — PREFERRED, most reliable method. Smart auto-snapshot. |
+| `browser_type(selector, text, press_enter?)` | Type into an input field. Verifies by reading back value. Smart auto-snapshot. |
+| `browser_type_index(index, text, press_enter?)` | **Type by snapshot index** — PREFERRED over selector-based. Smart auto-snapshot. |
+| `browser_select(selector, value)` | Select a dropdown option (by value, label, index, or JS fallback). Verifies. Smart auto-snapshot. |
+| `browser_select_index(index, value)` | **Select by snapshot index** — PREFERRED over selector-based. Validates target is `<select>`. Smart auto-snapshot. |
+| `browser_scroll(direction?, pages?)` | Scroll up/down by viewport heights (default 1.0 = full viewport). Smart auto-snapshot. |
+| `browser_wait(seconds?)` | Wait for animations/AJAX to complete (max 30s). Smart auto-snapshot. |
+| `browser_wait_for(selector?, text?, timeout?)` | Wait for a specific element to become visible or text to appear — more efficient than blind waiting. Smart auto-snapshot. |
+| `browser_send_keys(keys)` | Send keyboard shortcuts (Enter, Tab, Control+a, ArrowDown, etc.). Smart auto-snapshot. |
+| `browser_search_page(pattern, regex?, case_sensitive?, max_results?)` | **Grep the live page** for text patterns — zero LLM cost, instant results |
+| `browser_find_elements(selector, max_results?)` | **Query DOM by CSS selector** — zero LLM cost, instant element listing |
+| `browser_snapshot()` | Get a compact text representation of the page with element indices, CSS selectors, headings, text, form state, and cross-origin iframe content |
+| `browser_screenshot(full_page?)` | Capture a screenshot (saved to `~/.kairos/screenshots/` and returned as vision data) |
 | `browser_tab_list()` | List all open tabs |
 | `browser_tab_switch(index?, url_pattern?)` | Switch tabs by index or URL pattern |
 | `browser_tab_open(url?)` | Open a new tab |
 | `browser_evaluate(expression)` | Execute JavaScript in the page |
 | `browser_close()` | Close the browser and clean up |
-| `browser_click_xy(x, y)` | Click at absolute viewport coordinates (vision-based fallback) |
-| `browser_switch_frame(frame_selector?)` | Switch into an iframe, or back to top-level |
+| `browser_click_xy(x, y)` | Click at absolute viewport coordinates (vision-based fallback). Smart auto-snapshot. |
+| `browser_hover(selector)` | Hover over an element to trigger hover states (dropdowns, tooltips, hover cards). Smart auto-snapshot. |
+| `browser_hover_index(index)` | **Hover by snapshot index** — PREFERRED. Smart auto-snapshot. |
+| `browser_drag(selector_from, selector_to)` | Drag an element to another element (for file uploads, sortable lists, Kanban boards). Smart auto-snapshot. |
+| `browser_drag_xy(x1, y1, x2, y2)` | Drag from one coordinate to another. Smart auto-snapshot. |
+| `browser_switch_frame(frame_selector?)` | Switch into an iframe (including cross-origin via CDP), or back to top-level |
 
 Browser features:
 - **Persistent profiles**: Cookies, localStorage, and cache survive across sessions (`~/.kairos/profiles/`)
@@ -144,8 +160,16 @@ Browser features:
 - **CDP mode**: Connect to an already-running Chrome instance (`chrome --remote-debugging-port=9222`)
 - **Chrome profile copy**: Import your real Chrome profile (cookies, logins, history)
 - **Human-like mode**: Realistic mouse/keyboard/scroll behavior for bot detection
+- **Index-based interaction**: Snapshot shows element indices [0],[1],[2]... use `browser_click_index`/`browser_type_index` for reliable, selector-free interaction
+- **Auto new-tab detection**: When a click opens a new tab (target="_blank"), automatically switches to it
+- **Smart auto-snapshot**: All interaction tools automatically detect significant page changes via DOM fingerprinting (URL/title change, modals, new iframes, big DOM shifts) and append a snapshot + screenshot only when warranted — eliminating both the token waste of always-snapshotting and the blind spots of never-snapshotting
 - **Smart form interaction**: Hidden radio/checkbox inputs are captured with their label text; click auto-falls back to label/JS for hidden elements; select dropdowns show available options with both display text and value attributes
 - **Shadow DOM**: Snapshot pierces shadow roots to expose web component internals
+- **Ancestor visibility**: Snapshot checks ALL ancestors for display/visibility/opacity — prevents selecting hidden elements
+- **Off-viewport detection**: Elements flagged as offscreen vs truly hidden
+- **Cross-origin iframes**: CDP-based a11y tree access for cross-origin iframe content (e.g., embedded Google Docs, payment forms)
+- **In-page search**: `browser_search_page` greps the live DOM without LLM cost
+- **DOM queries**: `browser_find_elements` queries by CSS selector for instant element discovery
 - **Iframe support**: `browser_switch_frame` routes all interactions through a target iframe
 - **Vision click**: `browser_click_xy` enables coordinate-based clicking from screenshots
 
@@ -160,7 +184,8 @@ kairos/
 ├── cli.py                  # Terminal UI (streaming panels, thinking dots, paste handling)
 ├── tokens.py               # Token counting with tiktoken (session/context/turn)
 ├── terminal_manager.py     # Terminal lifecycle (background shells, blocking subprocesses)
-├── browser_manager.py      # Playwright/CloakBrowser lifecycle in a dedicated worker thread
+├── browser_manager.py      # Playwright/CloakBrowser lifecycle in a dedicated worker thread + CDP cross-origin iframe support + smart auto-snapshot
+├── cdp_manager.py          # CDPManager — low-level Chrome DevTools Protocol access (a11y tree, frame detection)
 └── tools/
     ├── base.py             # ToolResult class
     ├── read.py             # Read file (text + images)
@@ -170,7 +195,7 @@ kairos/
     ├── git.py              # Git subcommand dispatcher
     ├── terminal.py         # Terminal tool wrappers
     ├── subagent.py         # Sub-agent spawn and tracking
-    ├── browser.py          # Browser tool wrappers
+    ├── browser.py          # Browser tool wrappers (30 tools, smart auto-snapshot)
     ├── skills.py           # Skill manager (list, load, write skills)
     └── session.py          # Chat save/load manager
 ```

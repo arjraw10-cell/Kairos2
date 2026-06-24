@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -78,8 +77,18 @@ class SessionManager:
                 )
                 tmp_f.flush()
                 os.fsync(tmp_f.fileno())
-            # Atomic replace (on Windows this overwrites the target)
-            shutil.move(tmp_path, str(path))
+            # Atomic replace via os.replace() — works on both Windows and Unix
+            # without requiring exclusive file access. Retry briefly on
+            # PermissionError (transient locks from antivirus / indexer).
+            for attempt in range(3):
+                try:
+                    os.replace(tmp_path, str(path))
+                    break
+                except PermissionError:
+                    if attempt < 2:
+                        time.sleep(0.05 * (attempt + 1))  # 50ms, 100ms backoff
+                    else:
+                        raise
         except BaseException:
             # Clean up temp file on failure
             try:

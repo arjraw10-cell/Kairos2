@@ -11,34 +11,19 @@ from .terminal_manager import TerminalManager
 from .browser_manager import BrowserManager
 from .tokens import TokenCounter
 from .tools import (
-    ReadTool,
-    WriteTool,
-    EditTool,
-    NewTerminalTool,
-    ExecuteCommandTool,
-    ReadLogsTool,
-    CloseTerminalTool,
-    GetTerminalInfoTool,
-    SearchTool,
-    GitTool,
-    SubAgentTool,
-    SkillManager,
-    BrowserLaunchTool,
-    BrowserNavigateTool,
-    BrowserClickTool,
-    BrowserTypeTool,
-    BrowserSelectTool,
-    BrowserSnapshotTool,
-    BrowserScreenshotTool,
-    BrowserTabListTool,
-    BrowserTabSwitchTool,
-    BrowserTabOpenTool,
-    BrowserEvaluateTool,
-    BrowserCloseTool,
-    BrowserClickXYTool,
-    BrowserSwitchFrameTool,
+    ReadTool, WriteTool, EditTool,
+    NewTerminalTool, ExecuteCommandTool, ReadLogsTool, CloseTerminalTool, GetTerminalInfoTool,
+    SearchTool, GitTool, SubAgentTool,
+    BrowserLaunchTool, BrowserNavigateTool, BrowserClickTool, BrowserClickIndexTool,
+    BrowserTypeTool, BrowserTypeIndexTool, BrowserSelectTool, BrowserSelectIndexTool,
+    BrowserSnapshotTool, BrowserScreenshotTool, BrowserScrollTool, BrowserWaitTool,
+    BrowserSendKeysTool, BrowserSearchPageTool, BrowserFindElementsTool,
+    BrowserTabListTool, BrowserTabSwitchTool, BrowserTabOpenTool, BrowserEvaluateTool,
+    BrowserGoBackTool, BrowserGoForwardTool, BrowserReloadTool, BrowserCloseTool,
+    BrowserClickXYTool, BrowserSwitchFrameTool,
+    BrowserHoverTool, BrowserHoverIndexTool, BrowserDragTool, BrowserDragXYTool, BrowserWaitForTool,
 )
-
+from .tools.skills import SkillManager
 
 class Agent:
     MAX_HISTORY_MESSAGES = 100
@@ -85,17 +70,34 @@ class Agent:
         self.browser_launch_tool = BrowserLaunchTool(self.browser_manager)
         self.browser_navigate_tool = BrowserNavigateTool(self.browser_manager)
         self.browser_click_tool = BrowserClickTool(self.browser_manager)
+        self.browser_click_index_tool = BrowserClickIndexTool(self.browser_manager)
         self.browser_type_tool = BrowserTypeTool(self.browser_manager)
+        self.browser_type_index_tool = BrowserTypeIndexTool(self.browser_manager)
         self.browser_select_tool = BrowserSelectTool(self.browser_manager)
+        self.browser_select_index_tool = BrowserSelectIndexTool(self.browser_manager)
         self.browser_snapshot_tool = BrowserSnapshotTool(self.browser_manager)
         self.browser_screenshot_tool = BrowserScreenshotTool(self.browser_manager)
+        self.browser_scroll_tool = BrowserScrollTool(self.browser_manager)
+        self.browser_wait_tool = BrowserWaitTool(self.browser_manager)
+        self.browser_send_keys_tool = BrowserSendKeysTool(self.browser_manager)
+        self.browser_search_page_tool = BrowserSearchPageTool(self.browser_manager)
+        self.browser_find_elements_tool = BrowserFindElementsTool(self.browser_manager)
+
         self.browser_tab_list_tool = BrowserTabListTool(self.browser_manager)
         self.browser_tab_switch_tool = BrowserTabSwitchTool(self.browser_manager)
         self.browser_tab_open_tool = BrowserTabOpenTool(self.browser_manager)
         self.browser_evaluate_tool = BrowserEvaluateTool(self.browser_manager)
+        self.browser_go_back_tool = BrowserGoBackTool(self.browser_manager)
+        self.browser_go_forward_tool = BrowserGoForwardTool(self.browser_manager)
+        self.browser_reload_tool = BrowserReloadTool(self.browser_manager)
         self.browser_close_tool = BrowserCloseTool(self.browser_manager)
         self.browser_click_xy_tool = BrowserClickXYTool(self.browser_manager)
         self.browser_switch_frame_tool = BrowserSwitchFrameTool(self.browser_manager)
+        self.browser_hover_tool = BrowserHoverTool(self.browser_manager)
+        self.browser_hover_index_tool = BrowserHoverIndexTool(self.browser_manager)
+        self.browser_drag_tool = BrowserDragTool(self.browser_manager)
+        self.browser_drag_xy_tool = BrowserDragXYTool(self.browser_manager)
+        self.browser_wait_for_tool = BrowserWaitForTool(self.browser_manager)
 
         # Skills
         self.skill_manager = SkillManager(str(self.cwd / "skills"))
@@ -111,28 +113,36 @@ class Agent:
         self.conversation_history: List[Dict[str, Any]] = []
         self._setup_system_prompt()
 
-    # ------------------------------------------------------------------ #
-    #  System prompt                                                       #
-    # ------------------------------------------------------------------ #
-
     def _setup_system_prompt(self):
         base = (
             "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, inspect version control, and browse the web.\n\n"
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
-            "You have 29 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong — use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
+            "You have 29 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
             "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, you should look for the AGENTS.md file in that directory.\n\n"
             "## Browser Tools\n"
             "You can browse the web using browser tools. The workflow is:\n"
             "1. `browser_launch` \u2014 start the browser (optionally with a named profile for persistent sessions)\n"
             "2. `browser_navigate` \u2014 go to a URL\n"
-            "3. `browser_snapshot` \u2014 observe the page (shows interactive elements with their CSS selectors)\n"
-            "4. `browser_click` / `browser_type` / `browser_select` \u2014 interact with elements\n"
-            "5. `browser_screenshot` \u2014 capture visual screenshot (saves to ~/.kairos/screenshots/, read the file to view)\n"
-            "6. `browser_tab_open` / `browser_tab_switch` / `browser_tab_list` \u2014 manage multiple tabs\n"
-            "7. `browser_close` \u2014 shut down when done\n\n"
-            "Always use `browser_snapshot` after navigating or interacting to see the updated page state. "
-            "Use `browser_screenshot` when you need visual verification. "
+            "3. `browser_snapshot` \u2014 observe the page (shows elements with indices [0],[1]... and CSS selectors)\n"
+            "4. `browser_click_index` / `browser_type_index` \u2014 interact by element index (PREFERRED)\n"
+            "   Also: `browser_click` / `browser_type` with CSS selectors (fallback)\n"
+            "5. `browser_scroll` \u2014 scroll up/down by viewport heights\n"
+            "6. `browser_search_page` \u2014 grep the live page for text (zero LLM cost)\n"
+            "7. `browser_find_elements` \u2014 query DOM by CSS selector (zero LLM cost)\n"
+            "8. `browser_send_keys` \u2014 keyboard shortcuts (Enter, Tab, Control+a, etc.)\n"
+            "9. `browser_screenshot` \u2014 capture visual screenshot (saves to ~/.kairos/screenshots/)\n"
+            "10. `browser_tab_open` / `browser_tab_switch` / `browser_tab_list` \u2014 manage multiple tabs\n"
+            "11. `browser_go_back` / `browser_go_forward` / `browser_reload` \u2014 navigation history\n"
+            "12. `browser_wait` \u2014 wait for animations/AJAX to complete\n"
+            "13. `browser_wait_for` \u2014 wait for a specific element or text to appear (more efficient than blind waiting)\n"
+            "14. `browser_switch_frame` \u2014 enter/exit iframes (including cross-origin via CDP)\n"
+            "15. `browser_hover` / `browser_hover_index` \u2014 hover over elements (for dropdowns, tooltips)\n"
+            "16. `browser_drag` / `browser_drag_xy` \u2014 drag and drop (for file uploads, sortable lists)\n"
+            "17. `browser_close` \u2014 shut down when done\n\n"
+            "PREFER index-based tools (browser_click_index, browser_type_index, browser_select_index, browser_hover_index) over selector-based ones.\n"
+            "All interaction tools automatically detect significant page changes (popups, navigation, big DOM shifts) and snapshot+screen when needed.\n"
+            "You can still use browser_snapshot and browser_screenshot explicitly when you want to observe the page.\n"
             "Use named profiles (e.g. profile=\"Arjun\") to keep logins and cookies across sessions.\n\n"
             f"## Workspace\nYour current workspace is: {self.cwd}"
         )
@@ -144,7 +154,7 @@ class Agent:
             if agents_md_path.is_file():
                 agents_md = agents_md_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
-            pass  # best-effort; don't break the prompt if the file can't be read
+            pass
 
         if agents_md:
             base += (
@@ -178,30 +188,17 @@ class Agent:
         self.system_prompt = base
         self.conversation_history = [{"role": "system", "content": self.system_prompt}]
 
-    # ------------------------------------------------------------------ #
-    #  Tool schema for OpenAI                                              #
-    # ------------------------------------------------------------------ #
-
     def _get_tool_schema(self) -> List[Dict[str, Any]]:
         tools = [
             {
                 "type": "function",
                 "function": {
                     "name": "read",
-                    "description": (
-                        "Read the contents of a file at the given absolute path. "
-                        "Returns the full text, or an error if the file doesn't exist, isn't a regular file, or is too large (text >100KB, images >20MB). "
-                        "Supports image files (png, jpg, gif, webp, bmp, tiff, svg) — images are returned as visual data you can analyze. "
-                        "Use this before editing to understand the current state. Use this after writing to verify correctness. "
-                        "If you get 'File not found', check the path. If you get 'Not a file', you're pointing at a directory — use execute_command with 'ls' or 'dir'."
-                    ),
+                    "description": "Read the contents of a file at the given absolute path.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Absolute file path",
-                            }
+                            "path": {"type": "string", "description": "Absolute file path"}
                         },
                         "required": ["path"],
                     },
@@ -211,22 +208,12 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "write",
-                    "description": (
-                        "Create or overwrite a file at the given absolute path with the provided content. "
-                        "Parent directories are created automatically. Written as UTF-8. "
-                        "Use this to create new files or replace entire contents. If you only need to change part of a file, use edit instead — it's safer because it won't accidentally delete content."
-                    ),
+                    "description": "Create or overwrite a file at the given absolute path.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Absolute file path",
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "File content",
-                            },
+                            "path": {"type": "string", "description": "Absolute file path"},
+                            "content": {"type": "string", "description": "File content"},
                         },
                         "required": ["path", "content"],
                     },
@@ -236,27 +223,13 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "edit",
-                    "description": (
-                        "Strict find-and-replace on a file. oldText must appear exactly ONCE. "
-                        "If zero matches: fails with info about what was found. If multiple matches: fails with line numbers of each. "
-                        "Before editing, read the file to find the exact text. Copy it precisely including whitespace. "
-                        "After editing, read the file to verify. If edit fails because of multiple matches, use a longer snippet with surrounding context."
-                    ),
+                    "description": "Strict find-and-replace on a file. oldText must appear exactly ONCE.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Absolute file path",
-                            },
-                            "oldText": {
-                                "type": "string",
-                                "description": "Exact text to find (must appear exactly once)",
-                            },
-                            "newText": {
-                                "type": "string",
-                                "description": "Replacement text",
-                            },
+                            "path": {"type": "string", "description": "Absolute file path"},
+                            "oldText": {"type": "string", "description": "Exact text to find (must appear exactly once)"},
+                            "newText": {"type": "string", "description": "Replacement text"},
                         },
                         "required": ["path", "oldText", "newText"],
                     },
@@ -266,32 +239,14 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "search",
-                    "description": (
-                        "Search file contents using regular expressions, like ripgrep. "
-                        "Returns matches with file paths, line numbers, and matching lines. "
-                        "Skips binary files and common non-source directories (.git, node_modules, __pycache__, .venv). "
-                        "Use this to find where a function is defined, where a variable is used, or to understand codebase structure. "
-                        "Search is your primary tool for discovery — use it before reading files when you don't know what to read yet."
-                    ),
+                    "description": "Search file contents using regular expressions, like ripgrep.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "pattern": {
-                                "type": "string",
-                                "description": "Regex pattern to match against file contents",
-                            },
-                            "path": {
-                                "type": "string",
-                                "description": "Directory to search in (defaults to cwd)",
-                            },
-                            "include": {
-                                "type": "string",
-                                "description": "Filename glob filter (e.g. '*.py', '*.{ts,tsx}')",
-                            },
-                            "max_results": {
-                                "type": "integer",
-                                "description": "Max matches to return (default 50)",
-                            },
+                            "pattern": {"type": "string", "description": "Regex pattern to match against file contents"},
+                            "path": {"type": "string", "description": "Directory to search in (defaults to cwd)"},
+                            "include": {"type": "string", "description": "Filename glob filter"},
+                            "max_results": {"type": "integer", "description": "Max matches to return (default 50)"},
                         },
                         "required": ["pattern"],
                     },
@@ -301,31 +256,14 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "git",
-                    "description": (
-                        "Run git commands in the workspace. "
-                        "Sub-commands: status (modified/staged files), diff (actual changes, optionally scoped to a file), "
-                        "log (recent commits, default 10), commit (stage all + commit with message), branch (list branches). "
-                        "Use status and diff before making changes. Use log to understand recent history."
-                    ),
+                    "description": "Run git commands in the workspace. Sub-commands: status, diff, log, commit, branch.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "command": {
-                                "type": "string",
-                                "description": "Git sub-command: status, diff, log, commit, branch",
-                            },
-                            "path": {
-                                "type": "string",
-                                "description": "File path for diff (optional)",
-                            },
-                            "count": {
-                                "type": "integer",
-                                "description": "Number of log entries (default 10)",
-                            },
-                            "message": {
-                                "type": "string",
-                                "description": "Commit message (required for commit)",
-                            },
+                            "command": {"type": "string", "description": "Git sub-command: status, diff, log, commit, branch"},
+                            "path": {"type": "string", "description": "File path for diff (optional)"},
+                            "count": {"type": "integer", "description": "Number of log entries (default 10)"},
+                            "message": {"type": "string", "description": "Commit message (required for commit)"},
                         },
                         "required": ["command"],
                     },
@@ -335,18 +273,11 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "new_terminal",
-                    "description": (
-                        "Create a new terminal session. Returns a terminal ID. "
-                        "Background (true): stays open, output accumulates in a buffer. Use for long-running processes or multiple sequential commands. "
-                        "Blocking (false): runs one command and closes. You must provide a timeout to prevent hanging. Use for quick isolated commands."
-                    ),
+                    "description": "Create a new terminal session. Returns a terminal ID.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "background": {
-                                "type": "boolean",
-                                "description": "True=persistent shell, False=one-shot",
-                            }
+                            "background": {"type": "boolean", "description": "True=persistent shell, False=one-shot"},
                         },
                         "required": ["background"],
                     },
@@ -356,31 +287,14 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "execute_command",
-                    "description": (
-                        "Execute a shell command in a terminal. "
-                        "For background terminals: command is sent to stdin, output appears in log buffer (read with read_logs). "
-                        "For blocking terminals: command runs and returns all output (stdout+stderr) when done or timed out. "
-                        "is_background must match the terminal type. Timeout is required for blocking terminals."
-                    ),
+                    "description": "Execute a shell command in a terminal.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "terminal_id": {
-                                "type": "integer",
-                                "description": "Terminal ID from new_terminal",
-                            },
-                            "command": {
-                                "type": "string",
-                                "description": "Shell command to execute",
-                            },
-                            "timeout": {
-                                "type": "integer",
-                                "description": "Seconds before kill (required for blocking)",
-                            },
-                            "is_background": {
-                                "type": "boolean",
-                                "description": "Must match terminal type",
-                            },
+                            "terminal_id": {"type": "integer", "description": "Terminal ID from new_terminal"},
+                            "command": {"type": "string", "description": "Shell command to execute"},
+                            "timeout": {"type": "integer", "description": "Seconds before kill (required for blocking)"},
+                            "is_background": {"type": "boolean", "description": "Must match terminal type"},
                         },
                         "required": ["terminal_id", "command", "is_background"],
                     },
@@ -390,26 +304,13 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "read_logs",
-                    "description": (
-                        "Read output from a background terminal by line number range. "
-                        "Lines accumulate across commands — use start_line to skip old output. "
-                        "If start_line exceeds available lines, the terminal hasn't produced that much output yet."
-                    ),
+                    "description": "Read output from a background terminal by line number range.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "terminal_id": {
-                                "type": "integer",
-                                "description": "Background terminal ID",
-                            },
-                            "start_line": {
-                                "type": "integer",
-                                "description": "First line to read (1-indexed)",
-                            },
-                            "end_line": {
-                                "type": "integer",
-                                "description": "Last line (optional, defaults to end)",
-                            },
+                            "terminal_id": {"type": "integer", "description": "Background terminal ID"},
+                            "start_line": {"type": "integer", "description": "First line to read (1-indexed)"},
+                            "end_line": {"type": "integer", "description": "Last line (optional)"},
                         },
                         "required": ["terminal_id", "start_line"],
                     },
@@ -419,17 +320,11 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "close_terminal",
-                    "description": (
-                        "Close a terminal and release its resources. The process is terminated. "
-                        "Always close terminals you're done with to avoid resource leaks."
-                    ),
+                    "description": "Close a terminal and release its resources.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "terminal_id": {
-                                "type": "integer",
-                                "description": "Terminal ID to close",
-                            }
+                            "terminal_id": {"type": "integer", "description": "Terminal ID to close"},
                         },
                         "required": ["terminal_id"],
                     },
@@ -439,17 +334,11 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "get_terminal_info",
-                    "description": (
-                        "Get info about a terminal: ID, background/blocking, closed status, line count. "
-                        "Use to check if a background terminal has output before reading logs."
-                    ),
+                    "description": "Get info about a terminal: ID, background/blocking, closed status, line count.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "terminal_id": {
-                                "type": "integer",
-                                "description": "Terminal ID",
-                            }
+                            "terminal_id": {"type": "integer", "description": "Terminal ID"},
                         },
                         "required": ["terminal_id"],
                     },
@@ -459,23 +348,12 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "spawn_subagent",
-                    "description": (
-                        "Spawn a sub-agent to work on a task autonomously. "
-                        "The sub-agent has all the same tools (read, write, edit, search, git, terminal) "
-                        "but operates in its own conversation context. "
-                        "Blocking mode waits for completion; non-blocking mode returns an ID to poll later."
-                    ),
+                    "description": "Spawn a sub-agent to work on a task autonomously.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "prompt": {
-                                "type": "string",
-                                "description": "The task / instruction to give the sub-agent",
-                            },
-                            "mode": {
-                                "type": "string",
-                                "description": "'blocking' (default) or 'non-blocking'",
-                            },
+                            "prompt": {"type": "string", "description": "The task / instruction to give the sub-agent"},
+                            "mode": {"type": "string", "description": "'blocking' (default) or 'non-blocking'"},
                         },
                         "required": ["prompt"],
                     },
@@ -485,17 +363,11 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "get_subagent_result",
-                    "description": (
-                        "Retrieve the result of a non-blocking sub-agent. "
-                        "Returns the sub-agent's response when done, or 'Running...' if still in progress."
-                    ),
+                    "description": "Retrieve the result of a non-blocking sub-agent.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "subagent_id": {
-                                "type": "string",
-                                "description": "The ID returned by spawn_subagent",
-                            },
+                            "subagent_id": {"type": "string", "description": "The ID returned by spawn_subagent"},
                         },
                         "required": ["subagent_id"],
                     },
@@ -506,38 +378,15 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "browser_launch",
-                    "description": (
-                        "Launch a stealth browser. Returns an error if browser dependencies are not installed "
-                        "(pip install playwright && playwright install chromium, or pip install cloakbrowser). "
-                        "Use profile to launch with a persistent named profile (cookies, localStorage, cache survive across sessions). "
-                        "Without profile, creates an ephemeral session. "
-                        "Use humanize=True for human-like mouse/keyboard behavior to pass bot detection. "
-                        "Use proxy for HTTP/SOCKS5 proxy. "
-                        "Close the existing browser first if one is already running."
-                    ),
+                    "description": "Launch a stealth browser.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "profile": {
-                                "type": "string",
-                                "description": "Named persistent profile (e.g. 'Arjun', 'work'). Cookies and state persist across sessions under ~/.kairos/profiles/<name>. Omit for ephemeral session.",
-                            },
-                            "proxy": {
-                                "type": "string",
-                                "description": "Proxy server URL, e.g. 'http://user:pass@proxy:8080' or 'socks5://user:pass@proxy:1080'",
-                            },
-                            "humanize": {
-                                "type": "boolean",
-                                "description": "Enable human-like mouse curves, typing timing, and scroll behavior (requires cloakbrowser).",
-                            },
-                            "chrome_profile": {
-                                "type": "string",
-                                "description": "Path to a real Chrome user data directory or profile folder to copy (e.g. 'C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default'). Copies the profile so your real Chrome isn't affected. Chrome MUST be closed when using this.",
-                            },
-                            "connect_cdp": {
-                                "type": "string",
-                                "description": "Connect to an already-running Chrome via CDP. Pass the debugging URL, e.g. 'http://localhost:9222'. Launch Chrome yourself with: chrome --remote-debugging-port=9222. This uses your REAL browser with all logins, extensions, cookies — no copying needed.",
-                            },
+                            "profile": {"type": "string", "description": "Named persistent profile (e.g. 'Arjun', 'work')."},
+                            "proxy": {"type": "string", "description": "Proxy server URL"},
+                            "humanize": {"type": "boolean", "description": "Enable human-like mouse/keyboard behavior"},
+                            "chrome_profile": {"type": "string", "description": "Path to Chrome user data directory to copy"},
+                            "connect_cdp": {"type": "string", "description": "Connect to running Chrome via CDP"},
                         },
                         "required": [],
                     },
@@ -551,10 +400,7 @@ class Agent:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "URL to navigate to (include https://)",
-                            }
+                            "url": {"type": "string", "description": "URL to navigate to (include https://)"},
                         },
                         "required": ["url"],
                     },
@@ -563,19 +409,36 @@ class Agent:
             {
                 "type": "function",
                 "function": {
+                    "name": "browser_go_back",
+                    "description": "Navigate back in browser history.",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_go_forward",
+                    "description": "Navigate forward in browser history.",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_reload",
+                    "description": "Reload the current page.",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "browser_click",
-                    "description": (
-                        "Click an element on the page. Accepts CSS selectors (#id, .class, tag), "
-                        "text selectors (text=Button Text), or plain text that will be matched as a fallback. "
-                        "Use browser_snapshot first to see available elements and their selectors."
-                    ),
+                    "description": "Click an element on the page. TIP: Use browser_click_index instead for more reliable clicks.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "selector": {
-                                "type": "string",
-                                "description": "CSS selector, text selector, or visible text to click",
-                            }
+                            "selector": {"type": "string", "description": "CSS selector, text selector, or visible text to click"},
                         },
                         "required": ["selector"],
                     },
@@ -584,29 +447,46 @@ class Agent:
             {
                 "type": "function",
                 "function": {
-                    "name": "browser_type",
-                    "description": (
-                        "Type text into an input, textarea, or other editable element. "
-                        "Clears existing content first, then types character by character with a small delay. "
-                        "Use browser_snapshot first to find the input's selector."
-                    ),
+                    "name": "browser_click_index",
+                    "description": "Click an element by its snapshot index number. PREFERRED over browser_click for reliability.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "selector": {
-                                "type": "string",
-                                "description": "CSS selector or placeholder text of the input field",
-                            },
-                            "text": {
-                                "type": "string",
-                                "description": "Text to type",
-                            },
-                            "press_enter": {
-                                "type": "boolean",
-                                "description": "Press Enter after typing (useful for search boxes)",
-                            },
+                            "index": {"type": "integer", "description": "Element index from browser_snapshot"},
+                        },
+                        "required": ["index"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_type",
+                    "description": "Type text into an input field. TIP: Use browser_type_index instead for more reliable input.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "selector": {"type": "string", "description": "CSS selector or placeholder text of the input field"},
+                            "text": {"type": "string", "description": "Text to type"},
+                            "press_enter": {"type": "boolean", "description": "Press Enter after typing"},
                         },
                         "required": ["selector", "text"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_type_index",
+                    "description": "Type text into an input element by its snapshot index number. PREFERRED over browser_type.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer", "description": "Element index from browser_snapshot"},
+                            "text": {"type": "string", "description": "Text to type"},
+                            "press_enter": {"type": "boolean", "description": "Press Enter after typing"},
+                        },
+                        "required": ["index", "text"],
                     },
                 },
             },
@@ -618,14 +498,8 @@ class Agent:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "selector": {
-                                "type": "string",
-                                "description": "CSS selector of the <select> element",
-                            },
-                            "value": {
-                                "type": "string",
-                                "description": "Value attribute of the option to select",
-                            },
+                            "selector": {"type": "string", "description": "CSS selector of the <select> element"},
+                            "value": {"type": "string", "description": "Value attribute of the option to select"},
                         },
                         "required": ["selector", "value"],
                     },
@@ -634,38 +508,35 @@ class Agent:
             {
                 "type": "function",
                 "function": {
-                    "name": "browser_snapshot",
-                    "description": (
-                        "Get a compact text representation of the current page. Shows the page title, URL, "
-                        "all interactive elements (links, buttons, inputs, selects) with their text and CSS selectors, "
-                        "headings, key text content, and current form state. "
-                        "This is your PRIMARY way to observe a page \u2014 use it after navigating or interacting "
-                        "to see what's on the page and get selectors for your next action."
-                    ),
+                    "name": "browser_select_index",
+                    "description": "Select an option from a <select> dropdown by snapshot index. PREFERRED over browser_select.",
                     "parameters": {
                         "type": "object",
-                        "properties": {},
-                        "required": [],
+                        "properties": {
+                            "index": {"type": "integer", "description": "Element index from browser_snapshot (must be a <select>)"},
+                            "value": {"type": "string", "description": "Value, label text, or numeric index of the option to select"},
+                        },
+                        "required": ["index", "value"],
                     },
                 },
             },
             {
                 "type": "function",
                 "function": {
+                    "name": "browser_snapshot",
+                    "description": "Get a compact text representation of the current page. PRIMARY way to observe a page.",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "browser_screenshot",
-                    "description": (
-                        "Capture a visual screenshot of the current page. "
-                        "Saved to ~/.kairos/screenshots/ and returned as image data the model can see. "
-                        "Use when you need to verify visual layout, see images, or when the text snapshot isn't enough. "
-                        "The screenshot is automatically injected as a vision image so you can analyze it."
-                    ),
+                    "description": "Capture a visual screenshot of the current page.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "full_page": {
-                                "type": "boolean",
-                                "description": "Capture the entire scrollable page (default false: viewport only)",
-                            }
+                            "full_page": {"type": "boolean", "description": "Capture the entire scrollable page (default false)"},
                         },
                         "required": [],
                     },
@@ -675,12 +546,8 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "browser_tab_list",
-                    "description": "List all open browser tabs with their index, title, and URL. The active tab is marked with *.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "required": [],
-                    },
+                    "description": "List all open browser tabs with their index, title, and URL.",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
                 },
             },
             {
@@ -691,14 +558,8 @@ class Agent:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "index": {
-                                "type": "integer",
-                                "description": "Tab index (0-based, from browser_tab_list)",
-                            },
-                            "url_pattern": {
-                                "type": "string",
-                                "description": "Switch to the first tab whose URL contains this text",
-                            },
+                            "index": {"type": "integer", "description": "Tab index (0-based, from browser_tab_list)"},
+                            "url_pattern": {"type": "string", "description": "Switch to the first tab whose URL contains this text"},
                         },
                         "required": [],
                     },
@@ -712,10 +573,7 @@ class Agent:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "URL to open in the new tab (optional)",
-                            }
+                            "url": {"type": "string", "description": "URL to open in the new tab (optional)"},
                         },
                         "required": [],
                     },
@@ -725,17 +583,11 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "browser_evaluate",
-                    "description": (
-                        "Execute JavaScript in the current page and return the result. "
-                        "Use for advanced interactions, reading page data, or anything not covered by the other browser tools."
-                    ),
+                    "description": "Execute JavaScript in the current page and return the result.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "expression": {
-                                "type": "string",
-                                "description": "JavaScript expression or function body to evaluate",
-                            }
+                            "expression": {"type": "string", "description": "JavaScript expression or function body to evaluate"},
                         },
                         "required": ["expression"],
                     },
@@ -746,34 +598,19 @@ class Agent:
                 "function": {
                     "name": "browser_close",
                     "description": "Close the browser and clean up all resources. Always close when done browsing.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "required": [],
-                    },
+                    "parameters": {"type": "object", "properties": {}, "required": []},
                 },
             },
             {
                 "type": "function",
                 "function": {
                     "name": "browser_click_xy",
-                    "description": (
-                        "Click at absolute viewport coordinates (x, y). "
-                        "Useful for vision-based interaction: take a screenshot, visually locate "
-                        "the target element, then click its coordinates. "
-                        "The x coordinate is horizontal (left=0), y is vertical (top=0)."
-                    ),
+                    "description": "Click at absolute viewport coordinates (x, y). Useful for vision-based interaction.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "x": {
-                                "type": "number",
-                                "description": "Horizontal pixel coordinate (left=0)",
-                            },
-                            "y": {
-                                "type": "number",
-                                "description": "Vertical pixel coordinate (top=0)",
-                            },
+                            "x": {"type": "number", "description": "Horizontal pixel coordinate (left=0)"},
+                            "y": {"type": "number", "description": "Vertical pixel coordinate (top=0)"},
                         },
                         "required": ["x", "y"],
                     },
@@ -782,23 +619,165 @@ class Agent:
             {
                 "type": "function",
                 "function": {
-                    "name": "browser_switch_frame",
-                    "description": (
-                        "Switch the active context into an iframe, or back to the top-level page. "
-                        "Pass a CSS selector, frame name, or URL fragment to target an iframe. "
-                        "Pass None or empty string to return to the top-level page. "
-                        "After switching, all browser_click, browser_type, browser_select, "
-                        "browser_snapshot, and browser_evaluate operations route through that frame."
-                    ),
+                    "name": "browser_scroll",
+                    "description": "Scroll the page up or down.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "frame_selector": {
-                                "type": "string",
-                                "description": "CSS selector, frame name, or URL fragment to match the iframe. Empty/null to return to top-level.",
-                            }
+                            "direction": {"type": "string", "enum": ["down", "up"], "description": "Scroll direction"},
+                            "pages": {"type": "number", "description": "Number of viewport heights to scroll (default 1.0)"},
                         },
                         "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_wait",
+                    "description": "Wait for a specified number of seconds (max 30). Useful for letting animations/AJAX complete.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "seconds": {"type": "integer", "description": "Seconds to wait (default 3, max 30)"},
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_wait_for",
+                    "description": "Wait for a specific element to become visible or text to appear on the page. More efficient than browser_wait for AJAX/dynamic content.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "selector": {"type": "string", "description": "CSS selector of element to wait for (provide selector OR text, not both)"},
+                            "text": {"type": "string", "description": "Text to wait for appearing on page (provide selector OR text, not both)"},
+                            "timeout": {"type": "integer", "description": "Max seconds to wait (default 10, max 30)"},
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_send_keys",
+                    "description": "Send a keyboard key or shortcut. Examples: 'Enter', 'Tab', 'Escape', 'Control+a'.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "keys": {"type": "string", "description": "Key name or shortcut (e.g. 'Enter', 'Control+a', 'Tab')"},
+                        },
+                        "required": ["keys"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_search_page",
+                    "description": "Search for text on the current page (like grep on the live DOM). Zero LLM cost.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {"type": "string", "description": "Text or regex pattern to search for"},
+                            "regex": {"type": "boolean", "description": "Treat pattern as regex (default false)"},
+                            "case_sensitive": {"type": "boolean", "description": "Case-sensitive search (default false)"},
+                            "max_results": {"type": "integer", "description": "Max matches to return (default 20)"},
+                        },
+                        "required": ["pattern"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_find_elements",
+                    "description": "Query DOM elements by CSS selector. Returns matching elements with index, tag, and text. Zero LLM cost.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "selector": {"type": "string", "description": "CSS selector query"},
+                            "max_results": {"type": "integer", "description": "Max elements to return (default 50)"},
+                        },
+                        "required": ["selector"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_switch_frame",
+                    "description": "Switch the active context into an iframe, or back to the top-level page.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "frame_selector": {"type": "string", "description": "CSS selector, frame name, or URL fragment to match the iframe. Empty/null to return to top-level."},
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_hover",
+                    "description": "Hover over an element to trigger hover states (dropdown menus, tooltips, hover cards).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "selector": {"type": "string", "description": "CSS selector or text to hover over"},
+                        },
+                        "required": ["selector"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_hover_index",
+                    "description": "Hover over an element by its snapshot index number. PREFERRED over browser_hover.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer", "description": "Element index from browser_snapshot"},
+                        },
+                        "required": ["index"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_drag",
+                    "description": "Drag an element to another element. Use for file uploads, sortable lists, Kanban boards.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "selector_from": {"type": "string", "description": "CSS selector of the element to drag"},
+                            "selector_to": {"type": "string", "description": "CSS selector of the destination element"},
+                        },
+                        "required": ["selector_from", "selector_to"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_drag_xy",
+                    "description": "Drag from one viewport coordinate to another.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "x1": {"type": "number", "description": "Start X coordinate"},
+                            "y1": {"type": "number", "description": "Start Y coordinate"},
+                            "x2": {"type": "number", "description": "End X coordinate"},
+                            "y2": {"type": "number", "description": "End Y coordinate"},
+                        },
+                        "required": ["x1", "y1", "x2", "y2"],
                     },
                 },
             },
@@ -807,34 +786,19 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "list_skills",
-                    "description": (
-                        "List all available skills by name. "
-                        "Skills are stored in the workspace's skills/ directory. "
-                        "Each skill is a folder containing a SKILL.md file. "
-                        "Use load_skill to read a skill's full content."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "required": [],
-                    },
+                    "description": "List all available skills by name.",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
                 },
             },
             {
                 "type": "function",
                 "function": {
                     "name": "load_skill",
-                    "description": (
-                        "Load a skill by name and return its full SKILL.md content. "
-                        "Use list_skills first to see available skill names."
-                    ),
+                    "description": "Load a skill by name and return its full SKILL.md content.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "skill_name": {
-                                "type": "string",
-                                "description": "Name of the skill (folder name under skills/)",
-                            },
+                            "skill_name": {"type": "string", "description": "Name of the skill (folder name under skills/)"},
                         },
                         "required": ["skill_name"],
                     },
@@ -844,26 +808,13 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "write_skill",
-                    "description": (
-                        "Create or update a skill's SKILL.md file. "
-                        "Creates the skill folder automatically. "
-                        "If the skill already exists, you must set overwrite=true to replace it."
-                    ),
+                    "description": "Create or update a skill's SKILL.md file.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "skill_name": {
-                                "type": "string",
-                                "description": "Name for the skill (folder name under skills/)",
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "Full content for the SKILL.md file",
-                            },
-                            "overwrite": {
-                                "type": "boolean",
-                                "description": "Set to true to overwrite an existing skill (default: false)",
-                            },
+                            "skill_name": {"type": "string", "description": "Name for the skill (folder name under skills/)"},
+                            "content": {"type": "string", "description": "Full content for the SKILL.md file"},
+                            "overwrite": {"type": "boolean", "description": "Set to true to overwrite an existing skill (default: false)"},
                         },
                         "required": ["skill_name", "content"],
                     },
@@ -874,107 +825,77 @@ class Agent:
         if self._is_subagent:
             tools = [t for t in tools if t["function"]["name"] not in (
                 "spawn_subagent", "get_subagent_result",
-                "browser_launch", "browser_navigate", "browser_click",
-                "browser_type", "browser_select", "browser_snapshot",
-                "browser_screenshot", "browser_tab_list", "browser_tab_switch",
-                "browser_tab_open", "browser_evaluate", "browser_close",
-                "browser_click_xy", "browser_switch_frame",
+                "browser_launch", "browser_navigate", "browser_click", "browser_click_index",
+                "browser_type", "browser_type_index", "browser_select", "browser_select_index",
+                "browser_snapshot", "browser_screenshot", "browser_scroll", "browser_wait", "browser_wait_for",
+                "browser_send_keys", "browser_search_page", "browser_find_elements",
+                "browser_tab_list", "browser_tab_switch", "browser_tab_open",
+                "browser_evaluate", "browser_close", "browser_click_xy",
+                "browser_switch_frame", "browser_go_back", "browser_go_forward", "browser_reload",
+                "browser_hover", "browser_hover_index",
+                "browser_drag", "browser_drag_xy",
             )]
         return tools
-
-    # ------------------------------------------------------------------ #
-    #  Tool execution                                                      #
-    #  Tool execution                                                      #
-    # ------------------------------------------------------------------ #
 
     def _execute_tool(self, name: str, args: Dict[str, Any]) -> str:
         """Execute a tool and return the result as a JSON string."""
         dispatch = {
             "read": lambda a: self.read_tool(a["path"]).to_dict(),
             "write": lambda a: self.write_tool(a["path"], a["content"]).to_dict(),
-            "edit": lambda a: self.edit_tool(
-                a["path"], a["oldText"], a["newText"]
-            ).to_dict(),
-            "search": lambda a: self.search_tool(
-                a["pattern"], a.get("path"), a.get("include"), a.get("max_results", 50)
-            ).to_dict(),
-            "git": lambda a: self.git_tool(
-                a["command"],
-                path=a.get("path"),
-                count=a.get("count", 10),
-                message=a.get("message", ""),
-            ).to_dict(),
+            "edit": lambda a: self.edit_tool(a["path"], a["oldText"], a["newText"]).to_dict(),
+            "search": lambda a: self.search_tool(a["pattern"], a.get("path"), a.get("include"), a.get("max_results", 50)).to_dict(),
+            "git": lambda a: self.git_tool(a["command"], path=a.get("path"), count=a.get("count", 10), message=a.get("message", "")).to_dict(),
             "new_terminal": lambda a: self.new_terminal_tool(a["background"]).to_dict(),
-            "execute_command": lambda a: self.execute_command_tool(
-                a["terminal_id"], a["command"], a.get("timeout"), a.get("is_background")
-            ).to_dict(),
-            "read_logs": lambda a: self.read_logs_tool(
-                a["terminal_id"], a["start_line"], a.get("end_line")
-            ).to_dict(),
-            "close_terminal": lambda a: self.close_terminal_tool(
-                a["terminal_id"]
-            ).to_dict(),
-            "get_terminal_info": lambda a: self.get_terminal_info_tool(
-                a["terminal_id"]
-            ).to_dict(),
-            "spawn_subagent": lambda a: self.subagent_tool.spawn(
-                a["prompt"], a.get("mode", "blocking")
-            ).to_dict(),
-            "get_subagent_result": lambda a: self.subagent_tool.get_result(
-                a["subagent_id"]
-            ).to_dict(),
+            "execute_command": lambda a: self.execute_command_tool(a["terminal_id"], a["command"], a.get("timeout"), a.get("is_background")).to_dict(),
+            "read_logs": lambda a: self.read_logs_tool(a["terminal_id"], a["start_line"], a.get("end_line")).to_dict(),
+            "close_terminal": lambda a: self.close_terminal_tool(a["terminal_id"]).to_dict(),
+            "get_terminal_info": lambda a: self.get_terminal_info_tool(a["terminal_id"]).to_dict(),
+            "spawn_subagent": lambda a: self.subagent_tool.spawn(a["prompt"], a.get("mode", "blocking")).to_dict(),
+            "get_subagent_result": lambda a: self.subagent_tool.get_result(a["subagent_id"]).to_dict(),
             # Browser tools
             "browser_launch": lambda a: self.browser_launch_tool(
-                profile=a.get("profile"),
-                headless=False,
-                proxy=a.get("proxy"),
-                humanize=a.get("humanize", False),
-                chrome_profile=a.get("chrome_profile"),
-                connect_cdp=a.get("connect_cdp"),
+                profile=a.get("profile"), headless=a.get("headless", True), proxy=a.get("proxy"),
+                humanize=a.get("humanize", False), chrome_profile=a.get("chrome_profile"), connect_cdp=a.get("connect_cdp"),
             ).to_dict(),
             "browser_navigate": lambda a: self.browser_navigate_tool(a["url"]).to_dict(),
+            "browser_go_back": lambda a: self.browser_go_back_tool().to_dict(),
+            "browser_go_forward": lambda a: self.browser_go_forward_tool().to_dict(),
+            "browser_reload": lambda a: self.browser_reload_tool().to_dict(),
             "browser_click": lambda a: self.browser_click_tool(a["selector"]).to_dict(),
-            "browser_type": lambda a: self.browser_type_tool(
-                a["selector"], a["text"], press_enter=a.get("press_enter", False)
-            ).to_dict(),
-            "browser_select": lambda a: self.browser_select_tool(
-                a["selector"], a["value"]
-            ).to_dict(),
+            "browser_click_index": lambda a: self.browser_click_index_tool(a["index"]).to_dict(),
+            "browser_type": lambda a: self.browser_type_tool(a["selector"], a["text"], press_enter=a.get("press_enter", False)).to_dict(),
+            "browser_type_index": lambda a: self.browser_type_index_tool(a["index"], a["text"], press_enter=a.get("press_enter", False)).to_dict(),
+            "browser_select": lambda a: self.browser_select_tool(a["selector"], a["value"]).to_dict(),
+            "browser_select_index": lambda a: self.browser_select_index_tool(a["index"], a["value"]).to_dict(),
             "browser_snapshot": lambda a: self.browser_snapshot_tool().to_dict(),
-            "browser_screenshot": lambda a: self.browser_screenshot_tool(
-                full_page=a.get("full_page", False)
+            "browser_screenshot": lambda a: self.browser_screenshot_tool(full_page=a.get("full_page", False)).to_dict(),
+            "browser_scroll": lambda a: self.browser_scroll_tool(direction=a.get("direction", "down"), pages=a.get("pages", 1.0)).to_dict(),
+            "browser_wait": lambda a: self.browser_wait_tool(seconds=a.get("seconds", 3)).to_dict(),
+            "browser_wait_for": lambda a: self.browser_wait_for_tool(selector=a.get("selector"), text=a.get("text"), timeout=a.get("timeout", 10)).to_dict(),
+            "browser_send_keys": lambda a: self.browser_send_keys_tool(keys=a["keys"]).to_dict(),
+            "browser_search_page": lambda a: self.browser_search_page_tool(
+                a["pattern"], regex=a.get("regex", False), case_sensitive=a.get("case_sensitive", False), max_results=a.get("max_results", 20),
             ).to_dict(),
+            "browser_find_elements": lambda a: self.browser_find_elements_tool(a["selector"], max_results=a.get("max_results", 50)).to_dict(),
             "browser_tab_list": lambda a: self.browser_tab_list_tool().to_dict(),
-            "browser_tab_switch": lambda a: self.browser_tab_switch_tool(
-                index=a.get("index"), url_pattern=a.get("url_pattern")
-            ).to_dict(),
-            "browser_tab_open": lambda a: self.browser_tab_open_tool(
-                url=a.get("url")
-            ).to_dict(),
-            "browser_evaluate": lambda a: self.browser_evaluate_tool(
-                a["expression"]
-            ).to_dict(),
+            "browser_tab_switch": lambda a: self.browser_tab_switch_tool(index=a.get("index"), url_pattern=a.get("url_pattern")).to_dict(),
+            "browser_tab_open": lambda a: self.browser_tab_open_tool(url=a.get("url")).to_dict(),
+            "browser_evaluate": lambda a: self.browser_evaluate_tool(a["expression"]).to_dict(),
             "browser_close": lambda a: self.browser_close_tool().to_dict(),
-            "browser_click_xy": lambda a: self.browser_click_xy_tool(
-                a["x"], a["y"]
-            ).to_dict(),
-            "browser_switch_frame": lambda a: self.browser_switch_frame_tool(
-                a.get("frame_selector")
-            ).to_dict(),
+            "browser_click_xy": lambda a: self.browser_click_xy_tool(a["x"], a["y"]).to_dict(),
+            "browser_switch_frame": lambda a: self.browser_switch_frame_tool(a.get("frame_selector")).to_dict(),
+            "browser_hover": lambda a: self.browser_hover_tool(a["selector"]).to_dict(),
+            "browser_hover_index": lambda a: self.browser_hover_index_tool(a["index"]).to_dict(),
+            "browser_drag": lambda a: self.browser_drag_tool(a["selector_from"], a["selector_to"]).to_dict(),
+            "browser_drag_xy": lambda a: self.browser_drag_xy_tool(a["x1"], a["y1"], a["x2"], a["y2"]).to_dict(),
             # Skill tools
             "list_skills": lambda a: self.skill_manager.list_skills().to_dict(),
-            "load_skill": lambda a: self.skill_manager.load_skill(
-                a["skill_name"]
-            ).to_dict(),
-            "write_skill": lambda a: self.skill_manager.write_skill(
-                a["skill_name"], a["content"], overwrite=a.get("overwrite", False)
-            ).to_dict(),
+            "load_skill": lambda a: self.skill_manager.load_skill(a["skill_name"]).to_dict(),
+            "write_skill": lambda a: self.skill_manager.write_skill(a["skill_name"], a["content"], overwrite=a.get("overwrite", False)).to_dict(),
         }
 
         if name not in dispatch:
-            return json.dumps(
-                {"success": False, "output": "", "error": f"Unknown tool: {name}"}
-            )
+            return json.dumps({"success": False, "output": "", "error": f"Unknown tool: {name}"})
 
         try:
             result = dispatch[name](args)
@@ -982,75 +903,68 @@ class Agent:
         except Exception as e:
             return json.dumps({"success": False, "output": "", "error": str(e)})
 
-    # ------------------------------------------------------------------ #
-    #  Tool call summary for CLI                                           #
-    # ------------------------------------------------------------------ #
-
     @staticmethod
     def _tool_summary(name: str, args: Dict[str, Any]) -> str:
-        if name == "read":
-            return f"read file: {args.get('path', '?')}"
-        if name == "write":
-            return f"wrote file: {args.get('path', '?')}"
-        if name == "edit":
-            return f"edited file: {args.get('path', '?')}"
-        if name == "search":
-            return f"search: '{args.get('pattern', '?')}' in {args.get('path', 'cwd')}"
+        if name == "read": return f"read file: {args.get('path', '?')}"
+        if name == "write": return f"wrote file: {args.get('path', '?')}"
+        if name == "edit": return f"edited file: {args.get('path', '?')}"
+        if name == "search": return f"search: '{args.get('pattern', '?')}' in {args.get('path', 'cwd')}"
         if name == "git":
             cmd = args.get("command", "?")
-            if cmd == "commit":
-                return f"git commit: {args.get('message', '')[:40]}"
+            if cmd == "commit": return f"git commit: {args.get('message', '')[:40]}"
             return f"git {cmd}"
-        if name == "new_terminal":
-            kind = "background" if args.get("background") else "blocking"
-            return f"opened {kind} terminal"
-        if name == "execute_command":
-            return (
-                f"terminal {args.get('terminal_id', '?')}: {args.get('command', '?')}"
-            )
-        if name == "read_logs":
-            return f"read terminal {args.get('terminal_id', '?')} logs"
-        if name == "close_terminal":
-            return f"closed terminal {args.get('terminal_id', '?')}"
-        if name == "get_terminal_info":
-            return f"info on terminal {args.get('terminal_id', '?')}"
+        if name == "new_terminal": return f"opened {'background' if args.get('background') else 'blocking'} terminal"
+        if name == "execute_command": return f"terminal {args.get('terminal_id', '?')}: {args.get('command', '?')}"
+        if name == "read_logs": return f"read terminal {args.get('terminal_id', '?')} logs"
+        if name == "close_terminal": return f"closed terminal {args.get('terminal_id', '?')}"
+        if name == "get_terminal_info": return f"info on terminal {args.get('terminal_id', '?')}"
         if name == "spawn_subagent":
             mode = args.get("mode", "blocking")
             prompt_preview = args.get("prompt", "")[:40]
             return f"spawn {mode} subagent: {prompt_preview}"
-        if name == "get_subagent_result":
-            return f"get subagent result: {args.get('subagent_id', '?')}"
+        if name == "get_subagent_result": return f"get subagent result: {args.get('subagent_id', '?')}"
         # Browser tool summaries
         if name == "browser_launch":
             profile = args.get("profile")
             chrome = args.get("chrome_profile")
             cdp = args.get("connect_cdp")
-            if cdp:
-                return f"connect to Chrome via CDP: {cdp}"
-            if chrome:
-                return f"launch with Chrome profile: {chrome}"
+            if cdp: return f"connect to Chrome via CDP: {cdp}"
+            if chrome: return f"launch with Chrome profile: {chrome}"
             return f"launch browser" + (f" (profile: {profile})" if profile else "")
-        if name == "browser_navigate":
-            return f"navigate to: {args.get('url', '?')}"
-        if name == "browser_click":
-            return f"click: {args.get('selector', '?')}"
+        if name == "browser_navigate": return f"navigate to: {args.get('url', '?')}"
+        if name == "browser_go_back": return "go back"
+        if name == "browser_go_forward": return "go forward"
+        if name == "browser_reload": return "reload page"
+        if name == "browser_click": return f"click: {args.get('selector', '?')}"
+        if name == "browser_click_index": return f"click element [{args.get('index', '?')}]"
         if name == "browser_type":
             text_preview = (args.get("text", "") or "")[:30]
             return f"type into {args.get('selector', '?')}: \"{text_preview}\""
-        if name == "browser_select":
-            return f"select '{args.get('value', '?')}' in {args.get('selector', '?')}"
-        if name == "browser_snapshot":
-            return "snapshot current page"
+        if name == "browser_type_index":
+            text_preview = (args.get("text", "") or "")[:30]
+            return f"type into [{args.get('index', '?')}]: \"{text_preview}\""
+        if name == "browser_select": return f"select '{args.get('value', '?')}' in {args.get('selector', '?')}"
+        if name == "browser_select_index": return f"select '{args.get('value', '?')}' in [{args.get('index', '?')}]"
+        if name == "browser_snapshot": return "snapshot current page"
         if name == "browser_screenshot":
             kind = "full page" if args.get("full_page") else "viewport"
             return f"screenshot ({kind})"
-        if name == "browser_tab_list":
-            return "list tabs"
+        if name == "browser_scroll":
+            d = args.get("direction", "down")
+            p = args.get("pages", 1.0)
+            return f"scroll {d} {p} pages"
+        if name == "browser_wait": return f"wait {args.get('seconds', 3)}s"
+        if name == "browser_wait_for":
+            target = args.get("selector") or args.get("text", "?")
+            return f"wait for: {target}"
+        if name == "browser_send_keys": return f"send keys: {args.get('keys', '?')}"
+        if name == "browser_search_page": return f"search page for: '{args.get('pattern', '?')}'"
+        if name == "browser_find_elements": return f"find elements: {args.get('selector', '?')}"
+        if name == "browser_tab_list": return "list tabs"
         if name == "browser_tab_switch":
             idx = args.get("index")
             pattern = args.get("url_pattern")
-            if idx is not None:
-                return f"switch to tab {idx}"
+            if idx is not None: return f"switch to tab {idx}"
             return f"switch to tab matching: {pattern or '?'}"
         if name == "browser_tab_open":
             url = args.get("url")
@@ -1058,27 +972,23 @@ class Agent:
         if name == "browser_evaluate":
             expr_preview = (args.get("expression", "") or "")[:40]
             return f"evaluate JS: {expr_preview}"
-        if name == "browser_close":
-            return "close browser"
-        if name == "browser_click_xy":
-            return f"click at ({args.get('x', '?')}, {args.get('y', '?')})"
+        if name == "browser_close": return "close browser"
+        if name == "browser_click_xy": return f"click at ({args.get('x', '?')}, {args.get('y', '?')})"
         if name == "browser_switch_frame":
             sel = args.get("frame_selector", "")
             return f"switch to frame: {sel}" if sel else "switch to top-level page"
+        if name == "browser_hover": return f"hover: {args.get('selector', '?')}"
+        if name == "browser_hover_index": return f"hover element [{args.get('index', '?')}]"
+        if name == "browser_drag": return f"drag '{args.get('selector_from', '?')}' -> '{args.get('selector_to', '?')}'"
+        if name == "browser_drag_xy": return f"drag ({args.get('x1', '?')}, {args.get('y1', '?')}) -> ({args.get('x2', '?')}, {args.get('y2', '?')})"
         # Skill tool summaries
-        if name == "list_skills":
-            return "list skills"
-        if name == "load_skill":
-            return f"load skill: {args.get('skill_name', '?')}"
+        if name == "list_skills": return "list skills"
+        if name == "load_skill": return f"load skill: {args.get('skill_name', '?')}"
         if name == "write_skill":
             skill = args.get("skill_name", "?")
             ow = " (overwrite)" if args.get("overwrite") else ""
             return f"write skill: {skill}{ow}"
         return name
-
-    # ------------------------------------------------------------------ #
-    #  Content helpers                                                     #
-    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _get_text_content(content) -> str:
@@ -1093,84 +1003,37 @@ class Agent:
             return "\n".join(parts)
         return ""
 
-    # ------------------------------------------------------------------ #
-    #  Conversation history                                                #
-    # ------------------------------------------------------------------ #
-
     def _truncate_history_if_needed(self):
         if len(self.conversation_history) >= 1 + self.MAX_HISTORY_MESSAGES:
             system = self.conversation_history[0]
-
-            # Standard truncation: keep system + last MAX_HISTORY_MESSAGES
-            tail = self.conversation_history[-(self.MAX_HISTORY_MESSAGES) :]
-
-            # Safety: ensure at least one user message survives truncation.
-            # Some APIs require a user message in the conversation history.
-            # During long tool-call chains (assistant + tool messages piling
-            # up), the user message can get pushed out of the window.
+            tail = self.conversation_history[-(self.MAX_HISTORY_MESSAGES):]
             has_user = any(m.get("role") == "user" for m in tail)
             if not has_user:
-                # Find the last user message in the full history and expand
-                # the window to include it (plus everything after it).
                 for i in range(len(self.conversation_history) - 1, 0, -1):
                     if self.conversation_history[i].get("role") == "user":
                         tail = self.conversation_history[i:]
                         break
-
             self.conversation_history = [system] + tail
 
     def _validate_history_before_api(self) -> Optional[str]:
-        """Sanitize conversation history before sending to the API.
-
-        Handles two structural problems that cause 400 errors:
-
-        1. **No user message**: Some APIs reject requests with no user message.
-           Triggered by truncation dropping the user message during long
-           tool-call chains, or compaction landing on a bad boundary.
-           Recovery: auto-compact to restore a valid state.
-
-        2. **Invalid message ordering**: The OpenAI API requires alternating
-           user/assistant messages.  A stale tool result left over from a
-           previous step, or a truncation cut at a bad point, can leave the
-           history ending with: [..., tool, tool, user] — which is invalid.
-           Recovery: trim trailing tool messages that lack a preceding
-           assistant message in the recent window.
-
-        Returns a status message if recovery was performed, or None.
-        """
         history = self.conversation_history
         if len(history) <= 2:
             return None
-
-        # --- Check 1: must have at least one user message ---
         has_user = any(m.get("role") == "user" for m in history)
         if not has_user:
             return self.compact()
-
-        # --- Check 2: fix invalid tool message sequences ---
-        # Walk backward from the end.  If we hit tool messages before
-        # reaching an assistant message (or the start), those tools are
-        # orphaned (their assistant message was truncated away) and will
-        # cause a 400 error.
         i = len(history) - 1
         while i > 0 and history[i].get("role") == "tool":
             i -= 1
-        # i now points to the last non-tool message from the end.
-        # If it's not an assistant, the trailing tools are orphaned.
         if i > 0 and history[i].get("role") != "assistant":
             orphan_count = len(history) - 1 - i
-            self.conversation_history = history[: i + 1]
+            self.conversation_history = history[:i + 1]
             return f"Removed {orphan_count} orphaned tool message(s) to fix history ordering."
-
         return None
 
-    # ------------------------------------------------------------------ #
-    #  Compaction                                                          #
-    # ------------------------------------------------------------------ #
-
-    COMPACT_RESERVE_TOKENS = 16384  # tokens reserved for summary prompt + output
-    COMPACT_KEEP_RECENT = 20000  # tokens of recent context to keep
-    COMPACT_THRESHOLD_PCT = 80.0  # auto-compact when context exceeds this %
+    COMPACT_RESERVE_TOKENS = 16384
+    COMPACT_KEEP_RECENT = 20000
+    COMPACT_THRESHOLD_PCT = 80.0
 
     COMPACT_SYSTEM_PROMPT = (
         "You are a context summarization assistant. "
@@ -1246,102 +1109,58 @@ Use this EXACT format:
 Keep each section concise. Preserve exact file paths, function names, and error messages."""
 
     def _should_auto_compact(self) -> bool:
-        """Check if context is getting too full and should be auto-compacted."""
         if self.tokens.context_window == 0:
             return False
         return self.tokens.context_pct >= self.COMPACT_THRESHOLD_PCT
 
     def _find_compact_boundary(self) -> int:
-        """Find the message index where we should split: summarize [boundary:] and keep [:boundary].
-
-        Walks backward from the end, accumulating token counts, and stops when
-        we've kept approximately COMPACT_KEEP_RECENT tokens.
-        """
         keep_tokens = self.COMPACT_KEEP_RECENT
         accumulated = 0
-
-        # Walk backward from end, find a good cut point (must be at a user or assistant message)
         for i in range(len(self.conversation_history) - 1, 0, -1):
             msg = self.conversation_history[i]
-            role = msg.get("role", "")
-
-            # Count tokens for this message
             text = self._get_text_content(msg.get("content", "") or "")
-            # Also count tool call arguments if present
             if msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     func = tc.get("function", {})
                     text += func.get("name", "") + func.get("arguments", "")
-            msg_tokens = (
-                len(self.tokens._enc.encode(text)) + 4
-            )  # +4 for message overhead
+            msg_tokens = len(self.tokens._enc.encode(text)) + 4
             accumulated += msg_tokens
-
             if accumulated >= keep_tokens:
-                # Found our boundary — find the nearest user message at or after
-                # this point.  The messages before it become the summary, and the
-                # recent messages (starting with a user msg) stay in context.
                 for j in range(i, len(self.conversation_history)):
                     if self.conversation_history[j].get("role") == "user":
                         return j
-                # No user message at or after i — fall through to return min(2, ...)
-
-        # Couldn't find a good boundary — keep first 2 messages at minimum
         return min(2, len(self.conversation_history) - 1)
 
     def _serialize_messages_for_summary(self, messages: list) -> str:
-        """Serialize a slice of conversation history into readable text for summarization."""
         parts = []
         for msg in messages:
             role = msg.get("role", "unknown")
             raw_content = msg.get("content", "") or ""
             content = self._get_text_content(raw_content)
-
             if role == "system":
-                continue  # Skip system prompts in summary input
-
+                continue
             if role == "tool":
-                # Tool results — include brief version
                 tool_name = msg.get("name", "tool")
-                # Truncate large outputs
                 if len(content) > 500:
                     content = content[:500] + "... [truncated]"
                 parts.append(f"[Tool result from {tool_name}]: {content}")
             elif role == "assistant":
                 tool_calls = msg.get("tool_calls")
                 if tool_calls:
-                    calls_str = ", ".join(
-                        tc.get("function", {}).get("name", "?") for tc in tool_calls
-                    )
-                    parts.append(
-                        f"Assistant (called tools: {calls_str}): {content or '(no text)'}"
-                    )
+                    calls_str = ", ".join(tc.get("function", {}).get("name", "?") for tc in tool_calls)
+                    parts.append(f"Assistant (called tools: {calls_str}): {content or '(no text)'}")
                 else:
                     parts.append(f"Assistant: {content}")
             elif role == "user":
                 parts.append(f"User: {content}")
-
         return "\n\n".join(parts)
 
-    def _generate_summary(
-        self, messages_to_summarize: list, previous_summary: Optional[str] = None
-    ) -> str:
-        """Use the LLM to generate a summary of old messages."""
+    def _generate_summary(self, messages_to_summarize: list, previous_summary: Optional[str] = None) -> str:
         prompt = self._serialize_messages_for_summary(messages_to_summarize)
-
         if previous_summary:
-            full_prompt = (
-                f"<conversation>\n{prompt}\n</conversation>\n\n"
-                f"<previous-summary>\n{previous_summary}\n</previous-summary>\n\n"
-                f"{self.COMPACT_UPDATE_PROMPT}"
-            )
+            full_prompt = f"<conversation>\n{prompt}\n</conversation>\n\n<previous-summary>\n{previous_summary}\n</previous-summary>\n\n{self.COMPACT_UPDATE_PROMPT}"
         else:
-            full_prompt = (
-                f"<conversation>\n{prompt}\n</conversation>\n\n"
-                f"{self.COMPACT_SUMMARY_PROMPT}"
-            )
-
-        # Use a separate, non-streaming call for summarization
+            full_prompt = f"<conversation>\n{prompt}\n</conversation>\n\n{self.COMPACT_SUMMARY_PROMPT}"
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -1353,36 +1172,24 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             )
         except Exception as e:
             raise Exception(self._format_api_error(e)) from e
-
         return response.choices[0].message.content or "(compaction produced no summary)"
 
     def compact(self) -> str:
-        """Manually compact conversation history. Returns a status message."""
         history = self.conversation_history
         if len(history) <= 2:
-            return "Nothing to compact — conversation is still short."
-
+            return "Nothing to compact \u2014 conversation is still short."
         boundary = self._find_compact_boundary()
-
-        # Safety: ensure boundary always starts at a user message.
-        # If _find_compact_boundary fell through, try finding any user msg.
         if boundary >= len(history) or history[boundary].get("role") != "user":
             for idx in range(2, len(history)):
                 if history[idx].get("role") == "user":
                     boundary = idx
                     break
             else:
-                return "Nothing to compact — couldn't find a user message boundary."
-
-        to_summarize = history[1:boundary]  # Old messages to summarize (skip system at index 0)
-
-        # Nothing old to summarize — boundary is right at the start
+                return "Nothing to compact \u2014 couldn't find a user message boundary."
+        to_summarize = history[1:boundary]
         if not to_summarize:
-            return "Nothing to compact — all messages are recent."
-
+            return "Nothing to compact \u2014 all messages are recent."
         system_msg = history[0]
-
-        # Check for existing compaction summary
         existing_summary = None
         if (
             len(history) > 1
@@ -1390,38 +1197,24 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             and history[1].get("name") == "compaction"
         ):
             existing_summary = history[1].get("content")
-
-        # Generate summary of the OLD messages
         summary = self._generate_summary(to_summarize, existing_summary)
-
-        # Build new history: [system, compaction summary, recent messages]
         compaction_msg = {
             "role": "system",
             "name": "compaction",
-            "content": f"[Conversation compacted — summary of prior history]\n\n{summary}",
+            "content": f"[Conversation compacted \u2014 summary of prior history]\n\n{summary}",
         }
-
-        recent = history[boundary:]  # Recent messages to keep as-is
+        recent = history[boundary:]
         self.conversation_history = [system_msg, compaction_msg] + recent
-
-        # Re-count tokens
         self.tokens.start_turn(self.conversation_history)
         self.tokens.finish_turn()
-
         return f"Compacted: summarized {len(to_summarize)} messages into checkpoint."
 
     def auto_compact_if_needed(self) -> Optional[str]:
-        """Auto-compact if context is too full. Returns status message or None."""
         if not self._should_auto_compact():
             return None
         return self.compact()
 
-    # ------------------------------------------------------------------ #
-    #  Interrupt                                                           #
-    # ------------------------------------------------------------------ #
-
     def interrupt(self):
-        """Hard interrupt — aborts mid-step (Ctrl+C)."""
         self._interrupt_event.set()
 
     def _check_interrupt(self):
@@ -1430,72 +1223,41 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             raise InterruptedError("Interrupted by user")
 
     def request_stop(self):
-        """Graceful stop — finishes current step, then stops (Escape).
-
-        After the current API call + tool calls complete, run() will return
-        instead of making another API call.
-        """
         self._stop_requested = True
 
     def _should_stop(self) -> bool:
-        """Check (and consume) the graceful-stop flag."""
         if self._stop_requested:
             self._stop_requested = False
             return True
         return False
 
-    # ------------------------------------------------------------------ #
-    #  Prepare messages for API (inject images into tool results)          #
-    # ------------------------------------------------------------------ #
-
     def _prepare_messages_for_api(self) -> List[Dict[str, Any]]:
-        """Convert conversation history to API format.
-
-        IMPORTANT: Images are only sent in user messages (where OpenAI/OpenRouter
-        support them). Tool messages with images have the image data stripped to
-        avoid 400 errors from providers that don't support images in tool messages.
-        """
         messages = []
         for msg in self.conversation_history:
             if msg.get("role") == "tool" and "_image_url" in msg:
-                # Strip image data — tool messages must be text-only for
-                # OpenRouter and most providers.  If the model needs to see
-                # the image, it should come through a user message.
-                messages.append(
-                    {
-                        "tool_call_id": msg["tool_call_id"],
-                        "role": "tool",
-                        "name": msg.get("name", ""),
-                        "content": msg["content"],
-                    }
-                )
+                messages.append({
+                    "tool_call_id": msg["tool_call_id"],
+                    "role": "tool",
+                    "name": msg.get("name", ""),
+                    "content": msg["content"],
+                })
             else:
                 messages.append(msg)
         return messages
 
-    # ------------------------------------------------------------------ #
-    #  Error formatting helpers                                            #
-    # ------------------------------------------------------------------ #
-
     def _format_api_error(self, e: Exception) -> str:
-        """Extract maximum detail from an OpenAI API exception."""
         lines = [f"OpenAI API Error: {type(e).__name__}\n"]
-
         if isinstance(e, APIStatusError):
             lines.append(f"  Status Code: {e.status_code}")
             lines.append(f"  Request ID:  {e.request_id or '(none)'}")
-
-            # Response body — often contains the real error message
             body = getattr(e, "body", None)
             if body:
                 if isinstance(body, dict):
-                    # Pretty-print error details from the API
                     error_obj = body.get("error", body)
                     if isinstance(error_obj, dict):
                         lines.append(f"  Error Type:  {error_obj.get('type', '(none)')}")
                         lines.append(f"  Error Code:  {error_obj.get('code', '(none)')}")
                         lines.append(f"  Message:     {error_obj.get('message', str(body))}")
-                        # Param is often useful
                         param = error_obj.get("param")
                         if param:
                             lines.append(f"  Param:       {param}")
@@ -1503,60 +1265,33 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                         lines.append(f"  Body: {body}")
                 else:
                     lines.append(f"  Body: {body}")
-
-            # HTTP response text if available
             resp = getattr(e, "response", None)
             if resp is not None:
                 text = getattr(resp, "text", None)
                 if text and text != str(body):
                     lines.append(f"  Response:    {text[:500]}")
-
         elif isinstance(e, AuthenticationError):
             lines.append("  Hint: Check your OPENAI_API_KEY and OPENAI_BASE_URL in .env")
-            body = getattr(e, "body", None)
-            if body:
-                lines.append(f"  Body: {body}")
-
         elif isinstance(e, RateLimitError):
             lines.append("  Hint: You are being rate-limited. Wait a moment and retry.")
-            body = getattr(e, "body", None)
-            if body:
-                lines.append(f"  Body: {body}")
-
         elif isinstance(e, APIConnectionError):
             lines.append(f"  Hint: Could not connect to {self.client.base_url}")
             lines.append("  Check that the API server is running and reachable.")
-            cause = getattr(e, "cause", None)
-            if cause:
-                lines.append(f"  Underlying: {cause}")
-
         else:
-            # Generic exception — show everything we can
             lines.append(f"  Message: {str(e)}")
-            body = getattr(e, "body", None)
-            if body:
-                lines.append(f"  Body: {body}")
-
-        # Always show the model and base URL for context
         lines.append(f"\n  Config:")
         lines.append(f"    Model:    {self.model}")
         lines.append(f"    Base URL: {self.client.base_url}")
-
         return "\n".join(lines)
 
     @staticmethod
     def _is_retryable_error(e: Exception) -> bool:
-        """Check if an error is transient and worth retrying."""
         if isinstance(e, (RateLimitError, APIConnectionError)):
             return True
         if isinstance(e, APIStatusError):
             return e.status_code in (500, 502, 503, 504)
         err = str(e).lower()
         return any(c in err for c in ["timeout", "connection", "network"])
-
-    # ------------------------------------------------------------------ #
-    #  OpenAI call with retry (non-streaming, for fallback)                #
-    # ------------------------------------------------------------------ #
 
     def _call_openai_with_retry(self, max_retries: int = 3, base_delay: float = 1.0):
         last_exc = None
@@ -1572,30 +1307,13 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 last_exc = e
                 if not self._is_retryable_error(e) or attempt == max_retries - 1:
                     break
-                time.sleep(base_delay * (2**attempt) + 0.5 * attempt)
-
-        # All retries failed — wrap with full details
+                time.sleep(base_delay * (2 ** attempt) + 0.5 * attempt)
         raise Exception(self._format_api_error(last_exc)) from last_exc
 
-    # ------------------------------------------------------------------ #
-    #  Streaming API call                                                  #
-    # ------------------------------------------------------------------ #
-
-    def _stream_response(
-        self,
-    ) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, int]]]:
-        """
-        Stream a response from OpenAI. Yields content tokens via on_stream
-        callback as they arrive. Returns (full_content, assembled_tool_calls, api_usage).
-
-        Each tool call is: {"id": str, "name": str, "arguments": dict}
-        api_usage is {"prompt_tokens": int, "completion_tokens": int} or None
-        if the API didn't report usage.
-        """
+    def _stream_response(self) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, int]]]:
         max_retries = 3
         base_delay = 1.0
         last_exc = None
-
         stream = None
         for attempt in range(max_retries):
             try:
@@ -1612,43 +1330,30 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 last_exc = e
                 if not self._is_retryable_error(e) or attempt == max_retries - 1:
                     break
-                time.sleep(base_delay * (2**attempt) + 0.5 * attempt)
-
+                time.sleep(base_delay * (2 ** attempt) + 0.5 * attempt)
         if stream is None:
-            # All retries failed — wrap with full details
             raise Exception(self._format_api_error(last_exc)) from last_exc
-
-        # Notify that streaming has begun
         if self.on_stream_start:
             self.on_stream_start()
-
         content = ""
-        tool_calls: Dict[int, Dict[str, str]] = {}  # index -> {id, name, arguments}
-        api_usage = None  # Ground-truth token counts from the API (final chunk)
-
+        tool_calls: Dict[int, Dict[str, str]] = {}
+        api_usage = None
         for chunk in stream:
             self._check_interrupt()
-
             if not chunk.choices:
-                # Final chunk with usage info (stream_options={"include_usage": True})
                 if chunk.usage:
                     api_usage = {
                         "prompt_tokens": chunk.usage.prompt_tokens or 0,
                         "completion_tokens": chunk.usage.completion_tokens or 0,
                     }
                 continue
-
             delta = chunk.choices[0].delta
             if not delta:
                 continue
-
-            # Text content
             if delta.content:
                 content += delta.content
                 if self.on_stream_token:
                     self.on_stream_token(delta.content)
-
-            # Tool call deltas
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     idx = tc.index
@@ -1661,8 +1366,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                             tool_calls[idx]["name"] = tc.function.name
                         if tc.function.arguments:
                             tool_calls[idx]["arguments"] += tc.function.arguments
-
-        # Assemble tool calls into the format the rest of the code expects
         assembled = []
         for idx in sorted(tool_calls.keys()):
             tc = tool_calls[idx]
@@ -1670,33 +1373,13 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 args = json.loads(tc["arguments"])
             except json.JSONDecodeError:
                 args = {}
-            assembled.append(
-                {
-                    "id": tc["id"],
-                    "name": tc["name"],
-                    "arguments": args,
-                }
-            )
-
+            assembled.append({"id": tc["id"], "name": tc["name"], "arguments": args})
         return content, assembled, api_usage
 
-    # ------------------------------------------------------------------ #
-    #  Agent loop                                                          #
-    # ------------------------------------------------------------------ #
-
-    def step(
-        self, user_message: Optional[str] = None, image_url: Optional[str] = None
-    ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
-        """Run one step. Returns (response_text | None, tool_calls_made).
-
-        If image_url is provided, the user message is sent as a vision content
-        array so the model can see the image.
-        """
+    def step(self, user_message: Optional[str] = None, image_url: Optional[str] = None) -> Tuple[Optional[str], List[Dict[str, Any]]]:
         self._check_interrupt()
-
         if user_message is not None:
             if image_url:
-                # Vision message: content array with text + image
                 user_msg: Dict[str, Any] = {
                     "role": "user",
                     "content": [
@@ -1707,165 +1390,95 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             else:
                 user_msg = {"role": "user", "content": user_message}
             self.conversation_history.append(user_msg)
-
-        # Safety: ensure history has at least one user message before calling
-        # the API (some providers reject requests without one).
         recovery = self._validate_history_before_api()
         if recovery and self.on_compact:
             self.on_compact(recovery)
-
-        # Count input tokens for this turn
         self.tokens.start_turn(self.conversation_history)
-
-        # Stream the response
         content, assembled_tool_calls, api_usage = self._stream_response()
-
-        # Use ground-truth token counts from the API when available,
-        # falling back to tiktoken estimates
         if api_usage:
-            self.tokens.set_turn_from_api(
-                api_usage["prompt_tokens"], api_usage["completion_tokens"]
-            )
+            self.tokens.set_turn_from_api(api_usage["prompt_tokens"], api_usage["completion_tokens"])
         else:
-            # Fallback: count output tokens from content
             self.tokens.add_output_tokens(content)
-
-        # Build the assistant message for history
-        assistant_msg: Dict[str, Any] = {
-            "role": "assistant",
-            "content": content or None,
-        }
-
-        # Notify stream end (handles display for both thinking and final response)
+        assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content or None}
         if self.on_stream_end:
             self.on_stream_end(content, bool(assembled_tool_calls))
-
         if assembled_tool_calls:
-            # Format tool calls for the API message
             assistant_msg["tool_calls"] = [
                 {
                     "id": tc["id"],
                     "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["arguments"]),
-                    },
+                    "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])},
                 }
                 for tc in assembled_tool_calls
             ]
-
-            # When using API counts, tool call arguments are already included
-            # in the completion_tokens. Only add them when using tiktoken estimates.
             if not api_usage:
                 for tc in assembled_tool_calls:
                     self.tokens.add_output_tokens(tc["name"] + json.dumps(tc["arguments"]))
-
         self.conversation_history.append(assistant_msg)
-
         if not assembled_tool_calls:
             self.tokens.finish_turn()
             if self.on_token_update:
                 self.on_token_update(self.tokens)
             return content, []
-
-        # Execute tool calls
         tool_results = []
-        tool_image_data_urls = []  # Collect screenshots to inject as vision messages
+        tool_image_data_urls = []
         for tc in assembled_tool_calls:
             self._check_interrupt()
-
             func_name = tc["name"]
             func_args = tc["arguments"]
-
             if self.on_tool_call:
                 self.on_tool_call(func_name, func_args)
-
             result_json = self._execute_tool(func_name, func_args)
-
-            # Parse result — extract image data before sending tool message
-            # (tool messages can't carry images on most providers).
             result_dict = json.loads(result_json)
-            image_data_url = result_dict.pop("image_url", None)  # Extract before tool msg
+            image_data_url = result_dict.pop("image_url", None)
             if image_data_url:
                 tool_image_data_urls.append(image_data_url)
             text_content = json.dumps(result_dict)
-
             tool_msg = {
                 "tool_call_id": tc["id"],
                 "role": "tool",
                 "name": func_name,
                 "content": text_content,
             }
-
             tool_results.append(tool_msg)
-
         self.conversation_history.extend(tool_results)
-
-        # Inject any image results as a user vision message so the model
-        # can actually see them (tool messages can't carry images).
         if tool_image_data_urls:
-            image_parts = [{"type": "text", "text": "[Screenshot captured — the image below shows the current browser page]"}]
+            image_parts = [{"type": "text", "text": "[Screenshot captured \u2014 the image below shows the current browser page]"}]
             for img_url in tool_image_data_urls:
                 image_parts.append({"type": "image_url", "image_url": {"url": img_url}})
             self.conversation_history.append({"role": "user", "content": image_parts})
-
         self._truncate_history_if_needed()
-
         self.tokens.finish_turn()
         if self.on_token_update:
             self.on_token_update(self.tokens)
-
         return None, assembled_tool_calls
 
-    def run(
-        self,
-        user_message: str,
-        image_url: Optional[str] = None,
-    ) -> Optional[str]:
-        """Run the full loop until a final response, interrupt, or graceful stop.
-
-        If image_url is provided, it is attached to the first user message as
-        vision content (only the initial message, not follow-up tool loops).
-        """
+    def run(self, user_message: str, image_url: Optional[str] = None) -> Optional[str]:
         self._interrupt_event.clear()
         current = user_message
-        _first_image = image_url  # Only attach to the very first step
-
-        max_empty_retries = 2  # Retry up to 2 times if agent returns no response
+        _first_image = image_url
+        max_empty_retries = 2
         empty_retry_count = 0
-
         try:
             while True:
-                # Check for graceful stop (Escape) — only between steps,
-                # not mid-step.  This lets any in-progress tool calls finish.
                 if self._should_stop():
-                    return "[Stopped — waiting for your input]"
-
-                # Auto-compact if context is getting full
+                    return "[Stopped \u2014 waiting for your input]"
                 if current is not None:
                     compact_msg = self.auto_compact_if_needed()
                     if compact_msg and self.on_compact:
                         self.on_compact(compact_msg)
-
                 response, tool_calls = self.step(current, image_url=_first_image)
-                _first_image = None  # Don't re-attach on subsequent steps
+                _first_image = None
                 current = None
-
                 if response:
                     return response
                 if not tool_calls:
-                    # No response and no tool calls — retry the API call.
-                    # Remove the empty assistant message so the history still
-                    # ends with the user message (avoids the "Cannot have 2 or
-                    # more assistant messages at the end of the list" 400 error).
                     if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
                         self.conversation_history.pop()
                     if empty_retry_count < max_empty_retries:
                         empty_retry_count += 1
                         if self.on_compact:
-                            self.on_compact(
-                                f"No response from API — retrying ({empty_retry_count}/{max_empty_retries})..."
-                            )
+                            self.on_compact(f"No response from API \u2014 retrying ({empty_retry_count}/{max_empty_retries})...")
                         continue
                     return "Agent returned without a response."
         except InterruptedError:
@@ -1874,7 +1487,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
     def reset(self):
         self._setup_system_prompt()
         self.tokens = TokenCounter(self.model)
-        # Close any open browser session
         if self.browser_manager.is_open:
             try:
                 self.browser_manager.close()

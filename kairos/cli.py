@@ -62,59 +62,29 @@ _kb = KeyBindings()
 
 
 # ------------------------------------------------------------------ #
-#  Clipboard sequence number (cheap change detection on Windows)      #
+#  Paste detection helpers                                             #
 # ------------------------------------------------------------------ #
 
-def _get_clipboard_sequence_number() -> int:
-    """Return the current clipboard sequence number (Windows only).
+def _diff_inserted_text(old: str, new: str) -> Optional[str]:
+    """Given old and new buffer text where *new* contains *old* with a single
+    contiguous insertion, return the inserted text.
 
-    This is a single ctypes call -- virtually free. The number increments
-    whenever clipboard content changes, letting us detect pastes without
-    spawning subprocesses on every keystroke.
-
-    Returns 0 on non-Windows or on failure.
+    Works by finding the longest common prefix and suffix, then extracting
+    what lies between them.  Returns ``None`` if no clean insertion can be
+    isolated (e.g. multiple edits or overlapping text).
     """
-    if sys.platform != "win32":
-        return 0
-    try:
-        import ctypes
-        return ctypes.windll.user32.GetClipboardSequenceNumber()
-    except Exception:
-        return 0
+    prefix_len = 0
+    while prefix_len < len(old) and prefix_len < len(new) and old[prefix_len] == new[prefix_len]:
+        prefix_len += 1
 
+    old_tail = len(old)
+    new_tail = len(new)
+    while old_tail > prefix_len and new_tail > prefix_len and old[old_tail - 1] == new[new_tail - 1]:
+        old_tail -= 1
+        new_tail -= 1
 
-def _ctypes_read_clipboard() -> str:
-    """Read clipboard text via Win32 API. Sub-millisecond on Windows.
-
-    Uses direct ctypes calls (OpenClipboard / GetClipboardData / GlobalLock)
-    instead of spawning PowerShell.  Returns empty string on failure or
-    non-Windows.
-    """
-    if sys.platform != "win32":
-        return _read_system_clipboard()
-    try:
-        import ctypes
-        CF_UNICODETEXT = 13
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        if not user32.OpenClipboard(0):
-            return ""
-        try:
-            if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
-                return ""
-            h = user32.GetClipboardData(CF_UNICODETEXT)
-            if not h:
-                return ""
-            p = kernel32.GlobalLock(h)
-            if not p:
-                return ""
-            text = ctypes.c_wchar_p(p).value or ""
-            kernel32.GlobalUnlock(h)
-            return text
-        finally:
-            user32.CloseClipboard()
-    except Exception:
-        return ""
+    inserted = new[prefix_len:new_tail]
+    return inserted if inserted else None
 
 
 # ------------------------------------------------------------------ #
@@ -255,47 +225,25 @@ def _image_data_to_url(data: bytes) -> str:
     return f"data:{mime};base64,{b64}"
 
 
-# ------------------------------------------------------------------ #
-#  Clipboard monitoring helpers                                       #
-# ------------------------------------------------------------------ #
+def _get_clipboard_sequence_number() -> int:
+    """Get the OS clipboard sequence number. Returns 0 on non-Windows platforms.
 
-def _get_clipboard_text_clean() -> str:
-    """Read clipboard text, stripped. Returns empty string on failure."""
-    try:
-        t = _read_system_clipboard()
-        return t.strip() if t else ""
-    except Exception:
-        return ""
-
-
-# ------------------------------------------------------------------ #
-#  Key bindings (work on terminals that pass Ctrl+V through)          #
-# ------------------------------------------------------------------ #
-
-@_kb.add("c-v")
-def _paste_handler(event):
-    """Handle Ctrl+V on terminals that pass the key event through.
-
-    Text paste only. Images are pasted via Alt+V (see _alt_v_handler).
-
-    On Windows Terminal, Ctrl+V is intercepted by the terminal itself
-    and this handler is NEVER called.  For that case, ``get_user_input()``
-    uses ``Buffer.on_text_changed`` to detect text pastes.
+    On Windows, each copy/paste increments this counter, so comparing before
+    and after a buffer change tells us whether the clipboard was involved —
+    which is the reliable signal that a Ctrl+V paste occurred.
     """
-    try:
-        buf = event.app.current_buffer
-        text = _read_system_clipboard()
-        if text:
-            token = _make_text_token()
-            _paste_registry[token] = {
-                "type": "text",
-                "text": text,
-                "text_stripped": text.strip(),
-            }
-            buf.insert_text(token)
-    except Exception:
-        pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            return ctypes.windll.user32.GetClipboardSequenceNumber()
+        except Exception:
+            return 0
+    return 0
 
+
+# ------------------------------------------------------------------ #
+#  Key bindings (Alt+V for images, backspace deletes paste tokens)    #
+# ------------------------------------------------------------------ #
 
 @_kb.add("escape", "v")
 def _alt_v_handler(event):
@@ -366,7 +314,7 @@ class CLI:
         self._stream_text = ""
         self._skip_print_response = False
 
-        # PromptSession with paste support (Ctrl+V / Alt+V)
+        # PromptSession with paste support (Alt+V for images)
         self._prompt_session = PromptSession(
             key_bindings=_kb,
             enable_open_in_editor=False,
@@ -651,26 +599,17 @@ class CLI:
 
             buf = self._prompt_session.default_buffer
 
-            # ---- Text paste detection via on_text_changed ----
-            # Windows Terminal intercepts Ctrl+V and writes raw characters to
-            # the buffer one at a time (growth=1 per keystroke).  We detect
-            # pastes by reading the clipboard via a fast ctypes Win32 call
-            # (~0.001ms) on every text increase and checking if the clipboard
-            # text now appears in the buffer.  This works regardless of when
-            # the text was copied (before or after prompt start).
-            #
-            # For long text that arrives character-by-character, we hold a
-            # pending state and check each subsequent event until the full
-            # clipboard text appears in the buffer.
-            _handling = [False]           # prevent recursion flag
-            _prev_text = [buf.text]       # last known buffer state
-            _pre_clip_seq = [_get_clipboard_sequence_number()]
-            _pending_paste = [None]       # clipboard text waiting to be matched
-            _last_clip_seq = [0]          # seq number when pending state started
-            _pending_count = [0]          # events since pending started (timeout)
+            # ---- Text paste detection via bracketed paste + on_text_changed ----
+            # Most modern terminals (incl. Windows Terminal) support bracketed
+            # paste, which wraps pasted text in ESC[200~...ESC[201~.  prompt_toolkit
+            # handles the escape sequences automatically and delivers the full
+            # text to on_text_changed in one shot.  We detect a paste by checking
+            # for a single contiguous insertion into the buffer.
+            _handling = [False]       # prevent recursion flag
+            _prev_text = [buf.text]   # last known buffer state
+            _last_clip_seq = [_get_clipboard_sequence_number()]  # baseline before prompt
 
             def _on_text_changed(b):
-                """Replace terminal-intercepted text paste with a token."""
                 if _handling[0]:
                     return
 
@@ -681,90 +620,36 @@ class CLI:
                 # Buffer shrank (user deleted) — not a paste
                 if len(current) <= len(_prev_text[0]):
                     _prev_text[0] = current
-                    _pending_paste[0] = None
                     return
 
-                # ---- Try to resolve a paste ----
-                paste_text = None   # clipboard text to match if found
-
-                # 1) Did the clipboard change since our last known sequence?
-                if _pre_clip_seq[0] > 0:
-                    current_seq = _get_clipboard_sequence_number()
-                    clip_changed = current_seq != _pre_clip_seq[0]
-                    _pre_clip_seq[0] = current_seq
-                else:
-                    # Non-Windows fallback: buffer grew by 3+ chars
-                    current_seq = 0
-                    clip_changed = (len(current) - len(_prev_text[0])) >= 3
-
-                if clip_changed:
-                    # Clipboard changed — read it and try to match
-                    clip_raw = _ctypes_read_clipboard()
-                    clip_text = clip_raw.strip() if clip_raw else ""
-                    if clip_text and len(clip_text) >= 3:
-                        if clip_text in current and clip_text not in _prev_text[0]:
-                            paste_text = clip_text
-                            _pending_paste[0] = None
-                            _pending_count[0] = 0
-                        else:
-                            # Clipboard changed but text not found yet —
-                            # enter pending state so we keep trying on
-                            # subsequent keystrokes.
-                            _pending_paste[0] = clip_text
-                            _last_clip_seq[0] = current_seq
-                            _pending_count[0] = 0
-
-                elif _pending_paste[0] is not None:
-                    # Clipboard didn't change, but we have a pending paste.
-                    # Check if clipboard changed *again* (new paste attempt).
-                    if _pre_clip_seq[0] > 0:
-                        current_seq = _get_clipboard_sequence_number()
-                        if current_seq != _last_clip_seq[0]:
-                            # Clipboard changed — update pending content
-                            new_raw = _ctypes_read_clipboard()
-                            new_clip = new_raw.strip() if new_raw else ""
-                            if new_clip and len(new_clip) >= 3:
-                                _pending_paste[0] = new_clip
-                                _last_clip_seq[0] = current_seq
-                                _pre_clip_seq[0] = current_seq
-                                _pending_count[0] = 0
-
-                    # Try to match the pending text in the current buffer
-                    clip_text = _pending_paste[0]
-                    if clip_text and clip_text in current and clip_text not in _prev_text[0]:
-                        paste_text = clip_text
-                        _pending_paste[0] = None
-                        _pending_count[0] = 0
-                    else:
-                        _pending_count[0] += 1
-                        if _pending_count[0] > 100:
-                            _pending_paste[0] = None
-                            _pending_count[0] = 0
-                        else:
-                            return
-
-                if paste_text is None:
+                # Only treat as paste if the clipboard sequence number changed
+                # (i.e. the user actually pressed Ctrl+V / did a clipboard paste).
+                current_seq = _get_clipboard_sequence_number()
+                if current_seq == _last_clip_seq[0]:
+                    # No clipboard activity — this is regular typing, leave it alone
                     _prev_text[0] = current
                     return
 
-                # ---- Replace the pasted text with a token ----
-                clip_raw = _ctypes_read_clipboard() or paste_text
+                # Clipboard changed since last check — extract the inserted text
+                inserted = _diff_inserted_text(_prev_text[0], current)
+                if not inserted or len(inserted) < 1:
+                    _prev_text[0] = current
+                    _last_clip_seq[0] = current_seq
+                    return
 
+                # We have a paste — replace it with a token
                 _handling[0] = True
                 try:
                     token = _make_text_token()
                     _paste_registry[token] = {
                         "type": "text",
-                        "text": clip_raw,
-                        "text_stripped": paste_text,
+                        "text": inserted,
+                        "text_stripped": inserted.strip(),
                     }
-                    idx = current.find(paste_text)
-                    if idx == -1:
-                        return
-                    b.text = (current[:idx] + token
-                              + current[idx + len(paste_text):])
-                    b.cursor_position = idx + len(token)
+                    b.text = current.replace(inserted, token, 1)
+                    b.cursor_position = b.text.find(token) + len(token)
                     _prev_text[0] = b.text
+                    _last_clip_seq[0] = _get_clipboard_sequence_number()
                 finally:
                     _handling[0] = False
 

@@ -20,6 +20,68 @@ _agent: Agent | None = None
 _auto_save_lock = threading.Lock()
 
 
+def _is_screenshot_injection(msg: dict) -> bool:
+    """Check if a user message is a screenshot injection from the agent
+    (e.g. '[Screenshot captured — ...]'), not a real user message."""
+    content = msg.get("content", "")
+    if isinstance(content, list) and len(content) > 0:
+        first_block = content[0]
+        if isinstance(first_block, dict) and first_block.get("type") == "text":
+            text = first_block.get("text", "")
+            if text.startswith("[Screenshot captured"):
+                return True
+    return False
+
+
+def _sanitize_history_for_resume(
+    history: list[dict],
+) -> tuple[list[dict] | None, str]:
+    """Walk backward through conversation history to find the last clean
+    agent response (an assistant message *without* tool_calls).
+
+    Skips over dirty messages:
+      - tool result messages
+      - assistant messages with tool_calls (incomplete execution)
+      - user screenshot injection messages
+
+    Returns (sanitized_history, last_agent_content) on success.
+    Returns (None, "") if there is no clean agent response to resume from.
+    """
+    if not history or len(history) <= 1:
+        return None, ""
+
+    i = len(history) - 1
+    while i > 0:  # index 0 is always the system prompt — never skip it
+        msg = history[i]
+        role = msg.get("role", "")
+
+        # Tool messages → always dirty, skip
+        if role == "tool":
+            i -= 1
+            continue
+
+        # User message → screenshot injection is dirty, real user is a hard stop
+        if role == "user":
+            if _is_screenshot_injection(msg):
+                i -= 1
+                continue
+            # Real user message — no clean agent response exists above this
+            break
+
+        # Assistant message
+        if role == "assistant":
+            if msg.get("tool_calls"):
+                # Dirty: agent called tools but execution never completed
+                i -= 1
+                continue
+            # Clean: final response with no tool calls
+            sanitized = history[: i + 1]
+            content = msg.get("content") or ""
+            return sanitized, content
+
+    return None, ""
+
+
 def _save_now():
     """Save current chat history to disk (thread-safe)."""
     with _auto_save_lock:
@@ -141,7 +203,7 @@ def main():
     cli.print_banner()
     cli.print_info("Type your request, 'exit' to quit, '/resume' to load a chat")
     cli.print_info("'/compact' to compact conversation, Ctrl+C to hard-interrupt")
-    cli.print_info("Escape to stop after current step, Ctrl+V to paste text, Alt+V to paste images")
+    cli.print_info("Escape to stop after current step, paste text directly or Alt+V for images")
     cli.print_info("Commands: 'clear', 'reset', '/exit', '/quit'")
     cli.console.print()
 
@@ -198,7 +260,7 @@ def main():
                 continue
 
             if user_input.lower() == "reset":
-                session_mgr.save_chat(agent.get_history())
+                _save_now()
                 session_mgr.new_session()
                 agent.reset()
                 cli.print_info("Conversation history reset")
@@ -211,7 +273,7 @@ def main():
                 continue
 
             if user_input.lower() == "/paste":
-                cli.print_info("Ctrl+V pastes text from your clipboard.")
+                cli.print_info("Paste text directly — it's detected automatically.")
                 cli.print_info("Alt+V pastes images from your clipboard.")
                 cli.print_info(
                     "Text shows as (Pasted Text #N), images show as (Pasted Image #N)."
@@ -230,11 +292,21 @@ def main():
                 if selected_id:
                     history = session_mgr.load_session(selected_id)
                     if history:
-                        session_mgr.save_chat(agent.get_history())
+                        sanitized, last_msg = _sanitize_history_for_resume(history)
+                        if sanitized is None:
+                            cli.print_info(
+                                f"Chat '{selected_id}' was interrupted mid-execution "
+                                "and has no completed agent response to resume from."
+                            )
+                            cli.print_info("Skipping this chat.")
+                            continue
+                        _save_now()
                         agent.reset()
-                        agent.conversation_history = history
+                        agent.conversation_history = sanitized
                         session_mgr.set_current_session(selected_id)
                         cli.print_info(f"Loaded chat: {selected_id}")
+                        if last_msg:
+                            cli.print_response(last_msg)
                 continue
 
             # --- Resolve paste tokens -> extract text + images ----------
@@ -289,7 +361,7 @@ def main():
             continue
 
     # Final save
-    session_mgr.save_chat(agent.get_history())
+    _save_now()
     session_mgr.new_session()
     cli.print_exit()
 

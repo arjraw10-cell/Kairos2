@@ -4,7 +4,7 @@
 
 ## Overview
 
-Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 29 tools. All file operations use absolute paths — no workspace containment.
+Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 40 tools. All file operations use absolute paths — no workspace containment.
 
 ## Project Structure
 
@@ -28,7 +28,8 @@ Agent2/
     ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling
     ├── tokens.py           # TokenCounter using tiktoken
     ├── terminal_manager.py # Terminal lifecycle (background + blocking)
-    ├── browser_manager.py  # Playwright/CloakBrowser in dedicated worker thread
+    ├── browser_manager.py  # Playwright/CloakBrowser in dedicated worker thread + CDP cross-origin iframe support
+    ├── cdp_manager.py      # CDPManager — low-level Chrome DevTools Protocol access (a11y tree, frame detection)
     └── tools/
         ├── __init__.py     # Imports and re-exports all tools
         ├── base.py         # ToolResult(success, output, error?, image_url?)
@@ -39,7 +40,7 @@ Agent2/
         ├── git.py          # GitTool — status, diff, log, commit, branch
         ├── terminal.py     # 5 terminal tool wrappers
         ├── subagent.py     # SubAgentTool — spawn/track child agents
-        ├── browser.py      # 14 browser tool wrappers
+        ├── browser.py      # 26 browser tool wrappers (scroll, wait, send_keys, search, find, think, index-based, etc.)
         ├── skills.py       # SkillManager — list, load, write skills
         └── session.py      # SessionManager — save/load chats to chats/chats.json
 ```
@@ -102,7 +103,16 @@ Lazy-loads `.env` on first access via `python-dotenv`. Uses `@lru_cache(maxsize=
 3. Clipboard image auto-detection on empty input or alongside text
 4. `cli.start_thinking()` → `process_request()` → `cli.stop_thinking()`
 5. Response display (streaming panel handles it; `_skip_print_response` prevents double-print)
-6. Auto-save after each exchange
+6. Auto-save after each exchange (all saves go through `_save_now()` which holds `_auto_save_lock` to prevent race conditions with the auto-save thread)
+
+**Resume sanitization** (`_sanitize_history_for_resume(history)`):
+- Walks backward through saved history to find the last clean agent response (an `assistant` message *without* `tool_calls`)
+- Skips dirty messages: `tool` results, `assistant` messages with `tool_calls` (incomplete execution), and user screenshot injection messages (`[Screenshot captured ...]`)
+- Returns `(sanitized_history, last_agent_content)` on success, or `(None, "")` if no clean response exists
+- On resume, the last agent message is displayed in a green panel so the user can see where the conversation left off
+- If a chat was interrupted mid-execution (no clean agent response), a warning is shown and the chat is skipped
+
+**Helper**: `_is_screenshot_injection(msg)` — detects user messages that are agent-injected screenshots (content array starting with `[Screenshot captured ...`) vs real user messages.
 
 **Wiring** (in `main()`): The agent's callbacks are wired to CLI methods:
 ```python
@@ -172,7 +182,7 @@ This means the AGENTS.md content is injected directly into every API call's syst
 
 #### Tool Schema (`_get_tool_schema()`)
 
-Returns a list of 29 OpenAI function tool definitions. If `self._is_subagent` is True, removes browser tools (14) and sub-agent tools (2), leaving 13 tools (includes skill tools).
+Returns a list of 40 OpenAI function tool definitions. If `self._is_subagent` is True, removes browser tools (19) and sub-agent tools (2), leaving 13 tools (includes skill tools).
 
 #### Tool Execution (`_execute_tool(name, args)`)
 
@@ -296,7 +306,7 @@ Called before every API request in `step()`. Handles two structural problems tha
 - `_paste_handler(event)` — Ctrl+V key binding: text paste only (reads clipboard, inserts text token)
 - `_alt_v_handler(event)` — Alt+V key binding: image paste only (reads clipboard image, inserts image token; shows `[no image on clipboard]` if none)
 - `_backspace_handler(event)` — deletes entire paste token if cursor is inside one
-- `_on_text_changed(b)` — detects Windows Terminal paste using `GetClipboardSequenceNumber()` (a single ctypes call) to detect clipboard changes cheaply, then reads clipboard content via `_ctypes_read_clipboard()` only when a paste is actually detected. Uses a **pending state** mechanism: if the clipboard changes but the new text isn't found in the buffer yet (e.g. user copied text but hasn't pasted it), stores it in `_pending_paste` with a `_last_clip_seq` baseline. On subsequent keystrokes, checks `_last_clip_seq` against the current sequence number — if the clipboard changed again, updates `_pending_paste` to the new content before trying to match. Times out after 100 events (~5 seconds) if the pending paste never completes.
+- `_on_text_changed(b)` — detects clipboard paste using `GetClipboardSequenceNumber()` (a single ctypes call on Windows, returns 0 on other platforms). Captures a baseline sequence number before each prompt starts. On each buffer change, if the sequence number hasn't changed since the baseline, the change is treated as normal typing and left alone. Only when the clipboard sequence number has advanced (indicating a real Ctrl+V or clipboard paste) does it extract the inserted text via `_diff_inserted_text()` and replace it with a `(Pasted Text #N)` token. This prevents false positives where every keystroke was being misdetected as a paste.
 - Image pasting is explicit via Alt+V — no background polling or auto-detection
 
 **Clipboard helpers** (cross-platform):
@@ -305,7 +315,7 @@ Called before every API request in `step()`. Handles two structural problems tha
 - `_detect_mime(data)` — detects PNG/JPEG/GIF/WEBP/BMP/TIFF from magic bytes
 - `_image_data_to_url(data)` — converts to base64 data URL
 - `_get_clipboard_sequence_number()` — Windows: single ctypes call to `GetClipboardSequenceNumber()` (microseconds), returns 0 on other platforms
-- `_ctypes_read_clipboard()` — Windows: reads clipboard text via direct Win32 API calls (OpenClipboard/GetClipboardData/GlobalLock), sub-millisecond. Falls back to `_read_system_clipboard()` on non-Windows
+- `_get_clipboard_sequence_number()` — Windows: single ctypes call to `GetClipboardSequenceNumber()` (microseconds), returns 0 on other platforms
 
 **Escape key listener**:
 - `start_escape_listener(on_escape)` — spawns thread listening for raw Escape key
@@ -354,6 +364,34 @@ Called before every API request in `step()`. Handles two structural problems tha
 
 All shared state is protected by `threading.Lock`.
 
+### `kairos/cdp_manager.py` — CDPManager (NEW)
+
+**Class**: `CDPManager`
+
+Low-level Chrome DevTools Protocol access via Playwright's CDP session API.
+
+**Key attributes**:
+- `self._sessions` — `Dict[int, Any]` mapping `id(page)` → CDP session
+
+**Methods**:
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `get_session(page)` | `CDPSession` | Get/create CDP session for a page |
+| `invalidate_session(page)` | `None` | Remove cached session |
+| `invalidate_all()` | `None` | Clear all cached sessions |
+| `get_frame_tree(page)` | `Dict` | Get frame hierarchy via `Page.getFrameTree` |
+| `get_all_frame_ids(page)` | `List[Dict]` | Collect all frame IDs, URLs, names |
+| `get_ax_tree(page, frame_id?)` | `List[Dict]` | Get accessibility tree (optionally per-frame) |
+| `get_all_ax_trees(page)` | `Dict[str, List]` | A11y trees for all frames |
+| `capture_dom_snapshot(page, computed_styles?)` | `Dict` | Full layout snapshot via `DOMSnapshot.captureSnapshot` |
+| `get_layout_metrics(page)` | `Dict` | Viewport size and DPR |
+| `get_viewport_size(page)` | `(float, float)` | CSS viewport width/height |
+| `get_device_pixel_ratio(page)` | `float` | DPR value |
+| `get_cross_origin_iframe_content(page, main_url?)` | `List[Dict]` | A11y content for cross-origin iframes |
+| `evaluate_js(page, expression, frame_id?)` | `Any` | JS evaluation via CDP `Runtime.evaluate` |
+
+**CDP session management**: Sessions are cached per-page and reused across operations. A session is tied to the page target, not the URL — navigation does not invalidate it.
+
 ### `kairos/browser_manager.py` — BrowserManager
 
 **Class**: `BrowserManager`
@@ -362,7 +400,7 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 
 **Worker Thread** (`_WorkerThread`):
 - `start()` — spawns thread, initializes Playwright, signals `_started` event when ready
-- `dispatch(fn, timeout)` — queues callable, blocks until result; raises `TimeoutError` if task never completes (no silent `None` returns)
+- `dispatch(fn, timeout)` — queues callable, blocks using `threading.Event` for zero-latency notification; raises `TimeoutError` if task never completes
 - `stop()` — sends sentinel, joins thread
 
 **Launch modes**:
@@ -374,23 +412,43 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 **CloakBrowser integration**: When `pip install cloakbrowser` is available, uses its stealth Chromium binary and `build_args()` for fingerprint patches. Falls back to standard Playwright Chromium.
 
 **Key operations** (all dispatched to worker thread):
-- `navigate(url)` — `page.goto(url, wait_until="domcontentloaded")`, clears active frame; reports specific error types (DNS, connection, timeout) on failure
-- `click(selector)` — tries CSS selector, visible text, label/aria-labelledby click for hidden elements, then JS `getElementById` force-click. Uses `_target()` for iframe support. `_click_label` has a `loc.count() == 0` guard. **Verifies post-click**: snapshots URL/title before click, checks for URL/title changes, modal/dropdown appearance, and radio/checkbox state changes.
+- `navigate(url)` — `page.goto(url, wait_until="domcontentloaded")`, clears active frame; reports specific error types (DNS, connection, timeout) on failure. Auto-screenshots after navigate.
+- `go_back()` / `go_forward()` / `reload()` — navigation history, clear active frame
+- `scroll(direction?, pages?)` — scroll page using `page.mouse.wheel()` by viewport heights. `direction="down"|"up"`, `pages=1.0` (full viewport)
+- `wait(seconds?)` — sleep for up to 30 seconds to let animations/AJAX complete
+- `wait_for(selector?, text?, timeout?)` — wait for a specific element to become visible or text to appear (uses Playwright's built-in wait mechanisms, much more efficient than blind waiting)
+- `send_keys(keys)` — send keyboard shortcut via `page.keyboard.press()` (e.g. "Enter", "Tab", "Control+a")
+- `hover(selector)` — hover over an element to trigger hover states (dropdown menus, tooltips, hover cards). Uses Playwright's `locator.hover()` with text fallback.
+- `hover_by_index(index)` — hover by snapshot index (PREFERRED)
+- `click(selector)` — tries CSS selector, visible text, label/aria-labelledby click for hidden elements, then JS `getElementById` force-click. Auto-screenshots. Detects new tabs and auto-switches.
+- `click_by_index(index)` — click element by its snapshot index `[0]`, `[1]`, etc. PREFERRED over `click(selector)` for reliability.
 - `click_xy(x, y)` — `page.mouse.click(x, y)` for coordinate-based clicking (vision fallback)
-- `switch_frame(frame_selector?)` — sets `_active_frame` to an iframe's Frame object; pass None to reset to top-level. All subsequent `click`, `type_text`, `select_option`, `evaluate`, and `snapshot` operations route through `_target()`.
-- `type_text(selector, text, press_enter?)` — tries `fill()` first (fast, fires events), falls back to `click + type()` (keystroke simulation), then placeholder fallback. **Verifies after each attempt**: reads back `input_value()` and compares to expected text. Uses `_target()`.
-- `select_option(selector, value)` — tries by HTML `value` attribute, then visible `label` text, then numeric index, then JS fallback via `getElementById` + `dispatchEvent('change')`. **Verifies after selection**. Uses `_target()`.
-- `snapshot()` — executes `_SNAPSHOT_JS` (inline JS that extracts accessibility tree), formats into compact text. Uses `_target()` for iframe support. Question context lines (`↳ Q:`) are shown below radio/checkbox/select elements when available.
+- `drag(selector_from, selector_to)` — drag-and-drop between elements via bounding box calculation with smooth 10-step mouse movement
+- `drag_xy(x1, y1, x2, y2)` — coordinate-based drag
+- `type_text(selector, text, press_enter?)` — tries `fill()` first (fast, fires events), falls back to `click + type()` (keystroke simulation), then placeholder fallback. Verifies value after each attempt.
+- `type_by_index(index, text, press_enter?)` — type into element by snapshot index. PREFERRED over `type_text`.
+- `select_option(selector, value)` — tries by HTML `value` attribute, then visible `label` text, then numeric index, then JS fallback
+- `select_option_by_index(index, value)` — select by snapshot index (PREFERRED). Validates that target is a `<select>`.
+- `snapshot()` — executes `_SNAPSHOT_JS` (inline JS that extracts accessibility tree), formats into compact text. Caches elements in `_last_snapshot_elements` for index-based interactions. Appends cross-origin iframe a11y data via CDP. Question context lines (`↳ Q:`) shown below radio/checkbox/select elements.
 - `screenshot(full_page?)` — saves PNG to `~/.kairos/screenshots/screenshot_<timestamp>.png`, returns file path + base64 data URL for vision injection
-- Tab management: `open_new_tab()`, `switch_tab()`, `list_tabs()`, `close_tab()`
-- `evaluate(expression)` — tries expression directly first, wraps in arrow function on `SyntaxError` fallback; returns JSON-stringified result. Uses `_target()`.
+- `search_page(pattern, regex?, case_sensitive?, max_results?)` — in-page text search via `document.createTreeWalker` + regex. Returns matches with context. Zero LLM cost.
+- `find_elements(selector, max_results?)` — CSS selector query returning matching elements with index, tag, text, attributes. Zero LLM cost.
+- Tab management: `open_new_tab()`, `switch_tab()`, `list_tabs()`, `close_tab()` (invalidates CDP session on close)
+- `evaluate(expression)` — tries expression directly first, wraps in arrow function on `SyntaxError` fallback; returns JSON-stringified result
+- Frame management: `switch_frame(frame_selector?)` — uses CDP `get_all_frame_ids()` as fallback for cross-origin iframes, stores CDP frame info in `_active_frame_type="cdp"`
 
 **Internal**:
-- `_target()` — returns `_active_frame` if set, otherwise `current_page`. Used by click, type_text, select_option, evaluate, snapshot to support iframe routing.
-- Frame references are cleared on `navigate()`, `go_back()`, `go_forward()`, and `reload()` since page loads invalidate frame objects.
+- `_target()` — returns `_active_frame` if set and is a Playwright Frame; if `_active_frame_type == "cdp"`, falls back to `current_page` (cross-origin content handled by `_get_cross_origin_snapshot_section()`). Returns `current_page` if no frame active.
+- Frame references are cleared on `navigate()`, `go_back()`, `go_forward()`, and `reload()` (both `_active_frame` and `_active_frame_type`).
+- `_post_action(result, pre_fingerprint?, is_navigation?)` — common post-action hook; optionally takes screenshot+snapshot after any interaction.
+- `_detect_new_tab(tabs_before_count)` — compares `len(self._pages)` before/after an action.
+- Snapshot elements are cached in `_last_snapshot_elements` after each `snapshot()` call.
+- CDP support via `self._cdp` (CDPManager instance): used in `snapshot()` for cross-origin iframe a11y content, in `switch_frame()` for cross-origin frame detection, and in `close_tab()` to invalidate stale sessions.
 
 **Snapshot JS** (`_SNAPSHOT_JS`): Extracts:
 - **Shadow DOM piercing**: Uses `queryShadow()` to recursively walk into `.shadowRoot` on every element, making web components inside Shadow DOM visible
+- **Ancestor visibility checking**: `isVisible()` now walks up ALL ancestors (not just the element itself) — detects CSS-hidden parents, `display:none`, `visibility:hidden`, `opacity:0` at any level. Prevents selecting elements that are invisible due to hidden parent containers.
+- **Off-viewport detection**: `isInViewport()` checks if the element intersects the viewport (with 1000px margin below for scroll-reachable elements). Elements flagged with `_offscreen: true` to help the model distinguish "hidden because scrolled past" vs "hidden because off-screen".
 - Interactive elements with computed CSS selectors (id > name > data-testid > class path)
 - Hidden radio/checkbox inputs (always included, even when CSS-hidden — commonly used in quiz forms)
 - Associated `<label>` text for radio/checkbox inputs (via `label[for]` and wrapping `<label>`)
@@ -508,7 +566,7 @@ class SubAgentTool:
 
 **Sub-agent restrictions** (enforced in `Agent._get_tool_schema()`):
 - No `spawn_subagent` / `get_subagent_result`
-- No browser tools (14 tools removed)
+- No browser tools (19 tools removed)
 - Has: read, write, edit, search, git, all 5 terminal tools, and 3 skill tools (13 total)
 
 ### `kairos/tools/skills.py` — SkillManager
@@ -533,15 +591,27 @@ Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill n
 
 ### `kairos/tools/browser.py` — Browser Tools
 
-14 callable wrapper classes, each takes a `BrowserManager` instance:
+30 callable wrapper classes, each takes a `BrowserManager` instance:
 
 | Class | Method Called |
 |-------|-------------|
 | `BrowserLaunchTool` | `bm.launch(profile, headless, proxy, humanize, chrome_profile, connect_cdp)` |
 | `BrowserNavigateTool` | `bm.navigate(url)` |
+| `BrowserGoBackTool` | `bm.go_back()` |
+| `BrowserGoForwardTool` | `bm.go_forward()` |
+| `BrowserReloadTool` | `bm.reload()` |
 | `BrowserClickTool` | `bm.click(selector)` |
+| `BrowserClickIndexTool` | `bm.click_by_index(index)` |
 | `BrowserTypeTool` | `bm.type_text(selector, text, press_enter)` |
+| `BrowserTypeIndexTool` | `bm.type_by_index(index, text, press_enter)` |
 | `BrowserSelectTool` | `bm.select_option(selector, value)` |
+| `BrowserSelectIndexTool` | `bm.select_option_by_index(index, value)` — PREFERRED |
+| `BrowserScrollTool` | `bm.scroll(direction, pages)` |
+| `BrowserWaitTool` | `bm.wait(seconds)` |
+| `BrowserWaitForTool` | `bm.wait_for(selector?, text?, timeout?)` — wait for element/text condition |
+| `BrowserSendKeysTool` | `bm.send_keys(keys)` |
+| `BrowserSearchPageTool` | `bm.search_page(pattern, regex, case_sensitive, max_results)` |
+| `BrowserFindElementsTool` | `bm.find_elements(selector, max_results)` |
 | `BrowserSnapshotTool` | `bm.snapshot()` |
 | `BrowserScreenshotTool` | `bm.screenshot(full_page)` |
 | `BrowserTabListTool` | `bm.list_tabs()` |
@@ -550,6 +620,10 @@ Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill n
 | `BrowserEvaluateTool` | `bm.evaluate(expression)` |
 | `BrowserCloseTool` | `bm.close()` |
 | `BrowserClickXYTool` | `bm.click_xy(x, y)` — coordinate-based click for vision fallback |
+| `BrowserHoverTool` | `bm.hover(selector)` — hover for dropdowns/tooltips |
+| `BrowserHoverIndexTool` | `bm.hover_by_index(index)` — PREFERRED |
+| `BrowserDragTool` | `bm.drag(selector_from, selector_to)` — drag-and-drop |
+| `BrowserDragXYTool` | `bm.drag_xy(x1, y1, x2, y2)` — coordinate-based drag |
 | `BrowserSwitchFrameTool` | `bm.switch_frame(frame_selector)` — switch into/out of iframes |
 
 Each returns `ToolResult`. `BrowserLaunchTool` catches `ImportError` specifically to give installation instructions.
@@ -576,7 +650,7 @@ class SessionManager:
 - Returns `{}` if completely unrecoverable
 
 **`_save_all()`** — atomic writer:
-- Writes to a temp file in the same directory, then `fsync()`s, then atomically replaces the target via `shutil.move()`
+- Writes to a temp file in the same directory, then `fsync()`s, then atomically replaces the target via `os.replace()` with a 3-attempt retry loop (handles transient PermissionError from antivirus/indexers on Windows)
 - Prevents file corruption from interrupted writes (Ctrl+C, crash, power loss) — the target file is only replaced after the full write succeeds
 - Cleans up the temp file on failure
 
