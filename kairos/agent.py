@@ -119,7 +119,7 @@ class Agent:
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
             "You have 29 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
-            "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, you should look for the AGENTS.md file in that directory.\n\n"
+            "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, it will not automatically be injected, so you will have to look for the AGENTS.md file in that directory. Note that the AGENTS.md does not always exist.\n\n"
             "## Browser Tools\n"
             "You can browse the web using browser tools. The workflow is:\n"
             "1. `browser_launch` \u2014 start the browser (optionally with a named profile for persistent sessions)\n"
@@ -160,12 +160,8 @@ class Agent:
             base += (
                 "\n\n## AGENTS.md (Architecture Documentation)\n"
                 "Below is the AGENTS.md file from your workspace root. This is your complete reference for "
-                "the codebase you are working on. It contains the full project structure, file-by-file "
-                "descriptions, class signatures, method details, and design patterns. "
-                "Use this as your primary knowledge source \u2014 it is injected into your system prompt so you "
-                "always have full context of the codebase without needing to read every file.\n\n"
-                "Follow any instructions or conventions described in it. "
-                "If you make code changes, remember to also update this AGENTS.md and README.md.\n\n"
+                "the codebase you are working on. It contains the instructions for any agents working in that directory, including you. "
+                "It may contain instructions (which should be followed) information about the project, and conventions for the project. "
                 f"{agents_md}"
             )
 
