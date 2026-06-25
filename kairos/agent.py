@@ -26,7 +26,7 @@ from .tools import (
 from .tools.skills import SkillManager
 
 class Agent:
-    MAX_HISTORY_MESSAGES = 100
+    MAX_HISTORY_MESSAGES = 10000000
 
     def __init__(self, workspace: str):
         self.client = OpenAI(

@@ -25,7 +25,7 @@ class TokenCounter:
         self.turn_output = 0
 
         # Estimated max context (conservative default)
-        self.context_window = 999_000
+        self.context_window = 262_000
 
     @staticmethod
     def _extract_text(content) -> str:

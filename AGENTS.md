@@ -219,7 +219,7 @@ Returns `(response_text | None, tool_calls_made: List[Dict])`.
 5. Builds assistant message (with `tool_calls` if present)
 6. Calls `on_stream_end()` — this is where the CLI finalizes the display panel
 7. If no tool calls: calls `tokens.finish_turn()`, returns response
-8. If tool calls: when using tiktoken fallback, counts tool call argument tokens via `add_output_tokens()` (API counts already include these); executes each via `_execute_tool()`, appends tool results to history, truncates history if >100 messages, calls `tokens.finish_turn()`
+8. If tool calls: when using tiktoken fallback, counts tool call argument tokens via `add_output_tokens()` (API counts already include these); executes each via `_execute_tool()`, appends tool results to history, truncates history if >10,000,000 messages (effectively disabled), calls `tokens.finish_turn()`
 
 **Important**: Tool results have `image_url` stripped before appending to history. Screenshot images are re-injected as a user vision message (with `[Screenshot captured]` prefix) so the model can actually see them, since tool messages can't carry images on most providers. Tool results are NOT counted as output tokens — they become input tokens in the next turn via `start_turn()`.
 
@@ -272,7 +272,7 @@ Rebuilds system prompt, resets token counter, closes browser if open.
 
 #### History Truncation (`_truncate_history_if_needed()`)
 
-Keeps `system + last MAX_HISTORY_MESSAGES (100)`. After truncation, verifies at least one `role: "user"` message survives — if not, expands the window backward to include the most recent user message. This prevents the "No user query found in messages" 400 error that occurs during long tool-call chains.
+Keeps `system + last MAX_HISTORY_MESSAGES (10,000,000)`. After truncation, verifies at least one `role: "user"` message survives — if not, expands the window backward to include the most recent user message. This prevents the "No user query found in messages" 400 error that occurs during long tool-call chains. The limit is effectively disabled (set to 10 million) so that history is never truncated by message count — context management is handled entirely by token-based compaction.
 
 #### History Validation (`_validate_history_before_api()`)
 
