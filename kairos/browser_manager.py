@@ -880,6 +880,9 @@ class BrowserManager:
         target = self._target()
         if not target:
             return "No active page."
+        page = self.current_page
+        if not page:
+            return "No active page."
         fp = self._capture_fingerprint()
         try:
             def _do():

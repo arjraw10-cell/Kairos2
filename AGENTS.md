@@ -423,7 +423,7 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 - `click(selector)` — tries CSS selector, visible text, label/aria-labelledby click for hidden elements, then JS `getElementById` force-click. Auto-screenshots. Detects new tabs and auto-switches.
 - `click_by_index(index)` — click element by its snapshot index `[0]`, `[1]`, etc. PREFERRED over `click(selector)` for reliability.
 - `click_xy(x, y)` — `page.mouse.click(x, y)` for coordinate-based clicking (vision fallback)
-- `drag(selector_from, selector_to)` — drag-and-drop between elements via bounding box calculation with smooth 10-step mouse movement
+- `drag(selector_from, selector_to)` — drag-and-drop between elements via bounding box calculation with smooth 10-step mouse movement (uses `current_page` for mouse operations)
 - `drag_xy(x1, y1, x2, y2)` — coordinate-based drag
 - `type_text(selector, text, press_enter?)` — tries `fill()` first (fast, fires events), falls back to `click + type()` (keystroke simulation), then placeholder fallback. Verifies value after each attempt.
 - `type_by_index(index, text, press_enter?)` — type into element by snapshot index. PREFERRED over `type_text`.
