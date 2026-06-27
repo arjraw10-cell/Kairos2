@@ -137,7 +137,7 @@ class BrowserManager:
         self._pages: List = []
         self._current_idx = 0
         self._profile_name: Optional[str] = None
-        self._headless: bool = True
+        self._headless: bool = False
         self._lock = threading.Lock()
         self._worker = _WorkerThread()
         self._active_frame = None
@@ -324,7 +324,7 @@ class BrowserManager:
         profile=None,
         headless=False,
         proxy=None,
-        humanize=False,
+        humanize=True,
         viewport_width=1280,
         viewport_height=720,
         extra_args=None,
