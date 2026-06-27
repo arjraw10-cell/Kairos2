@@ -46,6 +46,7 @@ try:
     import cloakbrowser
     from cloakbrowser import ensure_binary, build_args
     from cloakbrowser.browser import IGNORE_DEFAULT_ARGS as _CLOAK_IGNORE_DEFAULT_ARGS
+
     _cloakbinary_path = ensure_binary()
     _cloak_ignore_args = _CLOAK_IGNORE_DEFAULT_ARGS
     _CLOAKBROWSER_AVAILABLE = True
@@ -68,12 +69,15 @@ class _WorkerThread:
         if self._thread and self._thread.is_alive():
             return
         self._started.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="playwright-worker")
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="playwright-worker"
+        )
         self._thread.start()
         self._started.wait(timeout=10)
 
     def _run(self):
         from playwright.sync_api import sync_playwright
+
         self._pw = sync_playwright().start()
         self._started.set()
         while True:
@@ -168,7 +172,9 @@ class BrowserManager:
         if not target:
             return {}
         try:
-            return self._worker.dispatch(lambda: target.evaluate(self._FINGERPRINT_JS), timeout=5)
+            return self._worker.dispatch(
+                lambda: target.evaluate(self._FINGERPRINT_JS), timeout=5
+            )
         except Exception:
             return {}
 
@@ -178,32 +184,32 @@ class BrowserManager:
         if not before or not after:
             return True  # Missing data → be safe and snapshot
         # URL changed → navigation
-        if before.get('url') != after.get('url'):
+        if before.get("url") != after.get("url"):
             return True
         # Title changed → usually a new page/view
-        if before.get('title') != after.get('title'):
+        if before.get("title") != after.get("title"):
             return True
         # Modal/popup appeared
-        if after.get('hasOverlay') and not before.get('hasOverlay'):
+        if after.get("hasOverlay") and not before.get("hasOverlay"):
             return True
-        if after.get('overlayCount', 0) > before.get('overlayCount', 0):
+        if after.get("overlayCount", 0) > before.get("overlayCount", 0):
             return True
         # Alert appeared (error messages, success toasts)
-        if after.get('alertCount', 0) > before.get('alertCount', 0):
+        if after.get("alertCount", 0) > before.get("alertCount", 0):
             return True
         # New iframe loaded
-        if after.get('iframeCount', 0) > before.get('iframeCount', 0):
+        if after.get("iframeCount", 0) > before.get("iframeCount", 0):
             return True
         # Big DOM change (>20% element count shift)
-        before_e = before.get('elementCount', 0)
+        before_e = before.get("elementCount", 0)
         if before_e > 0:
-            delta = abs(after.get('elementCount', 0) - before_e) / before_e
+            delta = abs(after.get("elementCount", 0) - before_e) / before_e
             if delta > 0.20:
                 return True
         # Big text content change (>50% body text length shift)
-        before_t = before.get('bodyTextLength', 0)
+        before_t = before.get("bodyTextLength", 0)
         if before_t > 0:
-            delta = abs(after.get('bodyTextLength', 0) - before_t) / before_t
+            delta = abs(after.get("bodyTextLength", 0) - before_t) / before_t
             if delta > 0.50:
                 return True
         return False
@@ -255,7 +261,9 @@ class BrowserManager:
     # ------------------------------------------------------------------
 
     def _post_action(
-        self, action_result: str, pre_fingerprint: Optional[Dict[str, Any]] = None,
+        self,
+        action_result: str,
+        pre_fingerprint: Optional[Dict[str, Any]] = None,
         is_navigation: bool = False,
     ) -> str:
         """Smart auto-screenshot and auto-snapshot based on page state changes.
@@ -272,7 +280,9 @@ class BrowserManager:
             should_snapshot = True
         elif pre_fingerprint is not None:
             post_fingerprint = self._capture_fingerprint()
-            should_snapshot = self._has_significant_change(pre_fingerprint, post_fingerprint)
+            should_snapshot = self._has_significant_change(
+                pre_fingerprint, post_fingerprint
+            )
 
         if should_snapshot:
             try:
@@ -294,8 +304,10 @@ class BrowserManager:
         if len(self._pages) > tabs_before_count:
             new_idx = len(self._pages) - 1
             self._current_idx = new_idx
+
             def _get_title():
                 return self.current_page.title() or "(no title)"
+
             try:
                 title = self._worker.dispatch(_get_title, timeout=5)
             except Exception:
@@ -308,9 +320,16 @@ class BrowserManager:
     # ------------------------------------------------------------------
 
     def launch(
-        self, profile=None, headless=True, proxy=None, humanize=False,
-        viewport_width=1280, viewport_height=720, extra_args=None,
-        chrome_profile=None, connect_cdp=None,
+        self,
+        profile=None,
+        headless=False,
+        proxy=None,
+        humanize=False,
+        viewport_width=1280,
+        viewport_height=720,
+        extra_args=None,
+        chrome_profile=None,
+        connect_cdp=None,
     ) -> str:
         with self._lock:
             if self._browser or self._context:
@@ -320,13 +339,27 @@ class BrowserManager:
             return self._launch_cdp(connect_cdp)
         if chrome_profile:
             return self._launch_chrome_profile(
-                chrome_profile, headless, proxy, humanize, viewport_width, viewport_height, extra_args,
+                chrome_profile,
+                headless,
+                proxy,
+                humanize,
+                viewport_width,
+                viewport_height,
+                extra_args,
             )
         self._worker.start()
         self._profile_name = profile
         launch_args = list(extra_args or [])
         return self._worker.dispatch(
-            lambda: self._do_launch(profile, headless, proxy, humanize, viewport_width, viewport_height, launch_args),
+            lambda: self._do_launch(
+                profile,
+                headless,
+                proxy,
+                humanize,
+                viewport_width,
+                viewport_height,
+                launch_args,
+            ),
             timeout=60,
         )
 
@@ -337,7 +370,9 @@ class BrowserManager:
         chrome_args = list(launch_args)
         if _CLOAKBROWSER_AVAILABLE and _cloakbinary_path:
             executable_path = _cloakbinary_path
-            chrome_args = build_args(stealth_args=True, extra_args=launch_args, headless=headless)
+            chrome_args = build_args(
+                stealth_args=True, extra_args=launch_args, headless=headless
+            )
             if _cloak_ignore_args:
                 ignore_default_args = list(_cloak_ignore_args)
         launch_kwargs = {}
@@ -350,7 +385,11 @@ class BrowserManager:
         if profile:
             profile_dir = str(self.DEFAULT_PROFILES_DIR / profile)
             self._context = pw.chromium.launch_persistent_context(
-                profile_dir, headless=headless, viewport={"width": vw, "height": vh}, args=chrome_args, **launch_kwargs,
+                profile_dir,
+                headless=headless,
+                viewport={"width": vw, "height": vh},
+                args=chrome_args,
+                **launch_kwargs,
             )
             self._browser = None
             self._pages = list(self._context.pages)
@@ -358,9 +397,13 @@ class BrowserManager:
                 self._pages.append(self._context.new_page())
             self._current_idx = 0
             engine = "CloakBrowser" if _CLOAKBROWSER_AVAILABLE else "Playwright"
-            return f"Launched {engine} browser with profile '{profile}' at {profile_dir}"
+            return (
+                f"Launched {engine} browser with profile '{profile}' at {profile_dir}"
+            )
         else:
-            self._browser = pw.chromium.launch(headless=headless, args=chrome_args, **launch_kwargs)
+            self._browser = pw.chromium.launch(
+                headless=headless, args=chrome_args, **launch_kwargs
+            )
             ctx_kwargs = {"viewport": {"width": vw, "height": vh}}
             if proxy:
                 ctx_kwargs["proxy"] = {"server": proxy}
@@ -391,8 +434,11 @@ class BrowserManager:
         self._current_idx = 0
         return f"Connected via CDP at {cdp_url}\nFound {len(self._pages)} tab(s). Active: {self._pages[0].url if self._pages else 'none'}"
 
-    def _launch_chrome_profile(self, chrome_profile, headless, proxy, humanize, vw, vh, extra_args) -> str:
+    def _launch_chrome_profile(
+        self, chrome_profile, headless, proxy, humanize, vw, vh, extra_args
+    ) -> str:
         from shutil import copytree, rmtree
+
         src = Path(chrome_profile).expanduser().resolve()
         if not src.exists():
             return f"Chrome profile not found at: {src}"
@@ -409,7 +455,10 @@ class BrowserManager:
         self._profile_name = f"chrome:{src.name}"
         self._worker.start()
         result = self._worker.dispatch(
-            lambda: self._do_persistent_launch(str(copy_dir), headless, list(extra_args or []), proxy, vw, vh), timeout=60,
+            lambda: self._do_persistent_launch(
+                str(copy_dir), headless, list(extra_args or []), proxy, vw, vh
+            ),
+            timeout=60,
         )
         return f"Copied Chrome profile '{src.name}' to {copy_dir}\n{result}"
 
@@ -420,10 +469,16 @@ class BrowserManager:
         chrome_args = list(launch_args)
         if _CLOAKBROWSER_AVAILABLE and _cloakbinary_path:
             executable_path = _cloakbinary_path
-            chrome_args = build_args(stealth_args=True, extra_args=launch_args, headless=headless)
+            chrome_args = build_args(
+                stealth_args=True, extra_args=launch_args, headless=headless
+            )
             if _cloak_ignore_args:
                 ignore_default_args = list(_cloak_ignore_args)
-        ctx_kwargs = {"headless": headless, "viewport": {"width": vw, "height": vh}, "args": chrome_args}
+        ctx_kwargs = {
+            "headless": headless,
+            "viewport": {"width": vw, "height": vh},
+            "args": chrome_args,
+        }
         if executable_path:
             ctx_kwargs["executable_path"] = executable_path
         if ignore_default_args:
@@ -458,6 +513,7 @@ class BrowserManager:
                 if copy_dir.exists():
                     try:
                         from shutil import rmtree
+
                         rmtree(copy_dir, ignore_errors=True)
                     except Exception:
                         pass
@@ -493,11 +549,13 @@ class BrowserManager:
             return "No active page. Launch the browser first."
         self._active_frame = None
         self._active_frame_type = None
+
         def _do():
             resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
             status = resp.status if resp else "unknown"
             title = page.title() or "(no title)"
             return status, title
+
         try:
             status, title = self._worker.dispatch(_do, timeout=35)
             result = f"Navigated to {url}\nStatus: {status}\nTitle: {title}"
@@ -520,7 +578,10 @@ class BrowserManager:
         self._active_frame = None
         self._active_frame_type = None
         try:
-            url = self._worker.dispatch(lambda: (page.go_back(wait_until="domcontentloaded"), page.url)[1], timeout=15)
+            url = self._worker.dispatch(
+                lambda: (page.go_back(wait_until="domcontentloaded"), page.url)[1],
+                timeout=15,
+            )
             result = f"Went back. Now on: {url}"
         except Exception as e:
             result = f"Go back failed: {e}"
@@ -533,7 +594,10 @@ class BrowserManager:
         self._active_frame = None
         self._active_frame_type = None
         try:
-            url = self._worker.dispatch(lambda: (page.go_forward(wait_until="domcontentloaded"), page.url)[1], timeout=15)
+            url = self._worker.dispatch(
+                lambda: (page.go_forward(wait_until="domcontentloaded"), page.url)[1],
+                timeout=15,
+            )
             result = f"Went forward. Now on: {url}"
         except Exception as e:
             result = f"Go forward failed: {e}"
@@ -545,7 +609,10 @@ class BrowserManager:
             return "No active page."
         self._active_frame = None
         try:
-            url = self._worker.dispatch(lambda: (page.reload(wait_until="domcontentloaded"), page.url)[1], timeout=15)
+            url = self._worker.dispatch(
+                lambda: (page.reload(wait_until="domcontentloaded"), page.url)[1],
+                timeout=15,
+            )
             result = f"Page reloaded: {url}"
         except Exception as e:
             result = f"Reload failed: {e}"
@@ -561,6 +628,7 @@ class BrowserManager:
             return "No active page."
         fp = self._capture_fingerprint()
         try:
+
             def _do():
                 vp = page.viewport_size
                 vh = vp["height"] if vp else 720
@@ -571,10 +639,13 @@ class BrowserManager:
                 page.mouse.move(vw // 2, vh // 2)
                 page.mouse.wheel(0, scroll_px)
                 return direction, abs(int(scroll_px)), vh
+
             d, px, vh = self._worker.dispatch(_do, timeout=10)
             # Small delay to let scroll complete
             _time.sleep(0.15)
-            result = f"Scrolled {d} {px}px (~{pages} viewport{'s' if pages != 1 else ''})"
+            result = (
+                f"Scrolled {d} {px}px (~{pages} viewport{'s' if pages != 1 else ''})"
+            )
         except Exception as e:
             result = f"Scroll failed: {e}"
         return self._post_action(result, pre_fingerprint=fp)
@@ -608,22 +679,32 @@ class BrowserManager:
         timeout_ms = min(max(timeout, 1), 30) * 1000
         try:
             if selector:
+
                 def _do_wait():
-                    target.wait_for_selector(selector, state="visible", timeout=timeout_ms)
+                    target.wait_for_selector(
+                        selector, state="visible", timeout=timeout_ms
+                    )
+
                 self._worker.dispatch(_do_wait, timeout=timeout // 1 + 10)
                 result = f"Element '{selector}' appeared on page"
             else:
+
                 def _do_wait_text():
                     found = target.evaluate(
                         "text => document.body.innerText.includes(text)", text
                     )
                     if not found:
                         raise Exception(f"Text '{text}' not found")
+
                 self._worker.dispatch(_do_wait_text, timeout=timeout // 1 + 10)
                 result = f"Text '{text}' found on page"
         except Exception as e:
             err_str = str(e)
-            if "Timeout" in err_str or "timeout" in err_str or "not found" in err_str.lower():
+            if (
+                "Timeout" in err_str
+                or "timeout" in err_str
+                or "not found" in err_str.lower()
+            ):
                 target_desc = selector or text
                 result = f"Timed out waiting ({timeout}s) for: {target_desc}"
             else:
@@ -640,9 +721,11 @@ class BrowserManager:
             return "No active page."
         fp = self._capture_fingerprint()
         try:
+
             def _do():
                 page.keyboard.press(keys)
                 return True
+
             self._worker.dispatch(_do, timeout=5)
             result = f"Sent keys: {keys}"
         except Exception as e:
@@ -663,35 +746,61 @@ class BrowserManager:
 
         # Pre-click state
         try:
-            pre_state = self._worker.dispatch(lambda: {"url": target.url, "title": target.title() or ""}, timeout=5)
+            pre_state = self._worker.dispatch(
+                lambda: {"url": target.url, "title": target.title() or ""}, timeout=5
+            )
         except Exception:
             pre_state = {}
 
         # Fallback chain: CSS -> text -> label -> JS
         clicked_method = None
         try:
-            self._worker.dispatch(lambda: target.locator(selector).click(timeout=10000), timeout=15)
+            self._worker.dispatch(
+                lambda: target.locator(selector).click(timeout=10000), timeout=15
+            )
             clicked_method = "CSS selector"
         except Exception:
             pass
         if not clicked_method:
             try:
-                self._worker.dispatch(lambda: target.get_by_text(selector, exact=False).first.click(timeout=5000), timeout=10)
+                self._worker.dispatch(
+                    lambda: target.get_by_text(selector, exact=False).first.click(
+                        timeout=5000
+                    ),
+                    timeout=10,
+                )
                 clicked_method = "visible text"
             except Exception:
                 pass
         if not clicked_method:
-            clicked_method = self._worker.dispatch(lambda: self._click_label_fallback(target, selector), timeout=10)
+            clicked_method = self._worker.dispatch(
+                lambda: self._click_label_fallback(target, selector), timeout=10
+            )
         if not clicked_method:
-            return self._post_action(f"Click failed for '{selector}': no matching element", pre_fingerprint=fp)
+            return self._post_action(
+                f"Click failed for '{selector}': no matching element",
+                pre_fingerprint=fp,
+            )
 
         # Post-click verification
         try:
-            post_state = self._worker.dispatch(lambda: {
-                "url": target.url, "title": target.title() or "",
-                "modal_visible": bool(target.locator(".modal.show, [role='dialog']:not([hidden])").count()),
-                "dropdown_visible": bool(target.locator(".dropdown-menu.show, [role='listbox']:not([hidden])").count()),
-            }, timeout=5)
+            post_state = self._worker.dispatch(
+                lambda: {
+                    "url": target.url,
+                    "title": target.title() or "",
+                    "modal_visible": bool(
+                        target.locator(
+                            ".modal.show, [role='dialog']:not([hidden])"
+                        ).count()
+                    ),
+                    "dropdown_visible": bool(
+                        target.locator(
+                            ".dropdown-menu.show, [role='listbox']:not([hidden])"
+                        ).count()
+                    ),
+                },
+                timeout=5,
+            )
         except Exception:
             post_state = {}
 
@@ -706,12 +815,16 @@ class BrowserManager:
             changes.append("dropdown appeared")
 
         try:
+
             def _check():
                 loc = target.locator(selector)
                 tag = loc.evaluate("el => el.tagName.toLowerCase()")
                 if tag == "input":
-                    return loc.evaluate("el => el.type"), loc.evaluate("el => el.checked")
+                    return loc.evaluate("el => el.type"), loc.evaluate(
+                        "el => el.checked"
+                    )
                 return None, None
+
             input_type, checked = self._worker.dispatch(_check, timeout=5)
             if input_type in ("radio", "checkbox"):
                 changes.append(f"{input_type} checked={checked}")
@@ -752,12 +865,15 @@ class BrowserManager:
             wrapping.click(timeout=3000)
             return "wrapping label"
         try:
-            result = target.evaluate("""(sel) => {
+            result = target.evaluate(
+                """(sel) => {
                 const idMatch = sel.match(/^\\[id="(.+)"\\]$/);
                 let el = idMatch ? document.getElementById(idMatch[1]) : document.querySelector(sel);
                 if (el) { el.click(); return true; }
                 return false;
-            }""", selector)
+            }""",
+                selector,
+            )
             if result:
                 return "JS force-click"
         except Exception:
@@ -777,13 +893,15 @@ class BrowserManager:
                 pass
         if index < 0 or index >= len(self._last_snapshot_elements):
             return self._post_action(
-                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements)-1}",
+                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements) - 1}",
             )
         el = self._last_snapshot_elements[index]
         selector = el.get("selector", "")
         text = el.get("text", el.get("name", ""))
         if not selector:
-            return self._post_action(f"Element [{index}] has no clickable selector ({text})")
+            return self._post_action(
+                f"Element [{index}] has no clickable selector ({text})"
+            )
         return self.click(selector)
 
     # ------------------------------------------------------------------
@@ -816,26 +934,49 @@ class BrowserManager:
         fp = self._capture_fingerprint()
         # Pre-hover state
         try:
-            pre_state = self._worker.dispatch(lambda: {"url": target.url, "title": target.title() or ""}, timeout=5)
+            pre_state = self._worker.dispatch(
+                lambda: {"url": target.url, "title": target.title() or ""}, timeout=5
+            )
         except Exception:
             pre_state = {}
         try:
-            self._worker.dispatch(lambda: target.locator(selector).hover(timeout=10000), timeout=15)
+            self._worker.dispatch(
+                lambda: target.locator(selector).hover(timeout=10000), timeout=15
+            )
             result = f"Hovered over: {selector}"
         except Exception:
             # Fallback: try visible text
             try:
-                self._worker.dispatch(lambda: target.get_by_text(selector, exact=False).first.hover(timeout=5000), timeout=10)
+                self._worker.dispatch(
+                    lambda: target.get_by_text(selector, exact=False).first.hover(
+                        timeout=5000
+                    ),
+                    timeout=10,
+                )
                 result = f"Hovered over: {selector} (via text)"
             except Exception as e:
-                return self._post_action(f"Hover failed for '{selector}': {e}", pre_fingerprint=fp)
+                return self._post_action(
+                    f"Hover failed for '{selector}': {e}", pre_fingerprint=fp
+                )
         # Post-hover verification
         try:
-            post_state = self._worker.dispatch(lambda: {
-                "url": target.url, "title": target.title() or "",
-                "dropdown_visible": bool(target.locator(".dropdown-menu.show, [role='listbox']:not([hidden])").count()),
-                "tooltip_visible": bool(target.locator(".tooltip.show, .popover.show, [role='tooltip']:not([hidden])").count()),
-            }, timeout=5)
+            post_state = self._worker.dispatch(
+                lambda: {
+                    "url": target.url,
+                    "title": target.title() or "",
+                    "dropdown_visible": bool(
+                        target.locator(
+                            ".dropdown-menu.show, [role='listbox']:not([hidden])"
+                        ).count()
+                    ),
+                    "tooltip_visible": bool(
+                        target.locator(
+                            ".tooltip.show, .popover.show, [role='tooltip']:not([hidden])"
+                        ).count()
+                    ),
+                },
+                timeout=5,
+            )
         except Exception:
             post_state = {}
         changes = []
@@ -862,13 +1003,15 @@ class BrowserManager:
                 pass
         if index < 0 or index >= len(self._last_snapshot_elements):
             return self._post_action(
-                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements)-1}",
+                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements) - 1}",
             )
         el = self._last_snapshot_elements[index]
         selector = el.get("selector", "")
         text = el.get("text", el.get("name", ""))
         if not selector:
-            return self._post_action(f"Element [{index}] has no clickable selector ({text})")
+            return self._post_action(
+                f"Element [{index}] has no clickable selector ({text})"
+            )
         return self.hover(selector)
 
     # ------------------------------------------------------------------
@@ -885,6 +1028,7 @@ class BrowserManager:
             return "No active page."
         fp = self._capture_fingerprint()
         try:
+
             def _do():
                 source = target.locator(selector_from).first
                 dest = target.locator(selector_to).first
@@ -908,6 +1052,7 @@ class BrowserManager:
                     page.mouse.move(cx, cy)
                 page.mouse.up()
                 return True, None
+
             success, err = self._worker.dispatch(_do, timeout=15)
             if not success:
                 result = f"Drag failed: {err}"
@@ -928,6 +1073,7 @@ class BrowserManager:
             return "No active page."
         fp = self._capture_fingerprint()
         try:
+
             def _do():
                 page.mouse.move(x1, y1)
                 page.mouse.down()
@@ -938,6 +1084,7 @@ class BrowserManager:
                     page.mouse.move(cx, cy)
                 page.mouse.up()
                 return True
+
             self._worker.dispatch(_do, timeout=10)
             result = f"Dragged from ({x1}, {y1}) to ({x2}, {y2})"
         except Exception as e:
@@ -979,10 +1126,12 @@ class BrowserManager:
                 pass
         if actual != text:
             try:
+
                 def _do_ph():
                     loc = target.get_by_placeholder(selector, exact=False).first
                     loc.fill(text, timeout=5000)
                     return loc.input_value(timeout=3000)
+
                 actual = self._worker.dispatch(_do_ph, timeout=15)
             except Exception:
                 pass
@@ -998,7 +1147,9 @@ class BrowserManager:
 
         if press_enter:
             try:
-                self._worker.dispatch(lambda: target.locator(selector).press("Enter"), timeout=5)
+                self._worker.dispatch(
+                    lambda: target.locator(selector).press("Enter"), timeout=5
+                )
                 result += " + Enter"
             except Exception:
                 result += " + Enter (failed)"
@@ -1017,7 +1168,7 @@ class BrowserManager:
                 pass
         if index < 0 or index >= len(self._last_snapshot_elements):
             return self._post_action(
-                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements)-1}",
+                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements) - 1}",
             )
         el = self._last_snapshot_elements[index]
         selector = el.get("selector", "")
@@ -1052,7 +1203,10 @@ class BrowserManager:
 
         method, actual = self._worker.dispatch(_do_select, timeout=10)
         if not method:
-            return self._post_action(f"Select failed for '{selector}': '{value}' not found", pre_fingerprint=fp)
+            return self._post_action(
+                f"Select failed for '{selector}': '{value}' not found",
+                pre_fingerprint=fp,
+            )
 
         if actual and actual.strip() == value.strip():
             result = f"Selected '{value}' in {selector} (matched by {method}, verified)"
@@ -1075,12 +1229,14 @@ class BrowserManager:
                 pass
         if index < 0 or index >= len(self._last_snapshot_elements):
             return self._post_action(
-                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements)-1}",
+                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements) - 1}",
             )
         el = self._last_snapshot_elements[index]
         if el.get("tag") != "select":
             text = el.get("text", el.get("name", ""))
-            return self._post_action(f"Element [{index}] is not a <select> (it's a {el.get('tag', '?')}): {text}")
+            return self._post_action(
+                f"Element [{index}] is not a <select> (it's a {el.get('tag', '?')}): {text}"
+            )
         selector = el.get("selector", "")
         if not selector:
             return self._post_action(f"Element [{index}] has no selector")
@@ -1090,7 +1246,9 @@ class BrowserManager:
     #  Search Page (NEW)
     # ------------------------------------------------------------------
 
-    def search_page(self, pattern: str, regex=False, case_sensitive=False, max_results=20) -> str:
+    def search_page(
+        self, pattern: str, regex=False, case_sensitive=False, max_results=20
+    ) -> str:
         page = self.current_page
         if not page:
             return "No active page."
@@ -1108,12 +1266,12 @@ class BrowserManager:
                         fullText += text;
                     }}
                 }}
-                var flags = {'g' if case_sensitive else 'gi'};
+                var flags = {"g" if case_sensitive else "gi"};
                 var pattern = {json.dumps(pattern)};
                 var re;
                 try {{
-                    re = {json.dumps(pattern) if regex else 'null'};
-                    if ({'true' if regex else 'false'}) {{
+                    re = {json.dumps(pattern) if regex else "null"};
+                    if ({"true" if regex else "false"}) {{
                         re = new RegExp(pattern, flags);
                     }} else {{
                         re = new RegExp(pattern.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&'), flags);
@@ -1156,9 +1314,11 @@ class BrowserManager:
         if total == 0:
             return f'No matches found for "{pattern}" on page.'
 
-        lines = [f'Found {total} match{"es" if total != 1 else ""} for "{pattern}" on page:']
+        lines = [
+            f'Found {total} match{"es" if total != 1 else ""} for "{pattern}" on page:'
+        ]
         for i, m in enumerate(matches):
-            lines.append(f"[{i+1}] {m.get('context', '')}")
+            lines.append(f"[{i + 1}] {m.get('context', '')}")
         if has_more:
             lines.append(f"\n... showing {len(matches)} of {total} total matches.")
         return "\n".join(lines)
@@ -1176,7 +1336,11 @@ class BrowserManager:
             try:
                 elements = page.query_selector_all(selector)
             except Exception as e:
-                return {"error": f"Invalid CSS selector: {e}", "elements": [], "total": 0}
+                return {
+                    "error": f"Invalid CSS selector: {e}",
+                    "elements": [],
+                    "total": 0,
+                }
             total = len(elements)
             limit = min(total, max_results)
             results = []
@@ -1211,7 +1375,9 @@ class BrowserManager:
         if total == 0:
             return f'No elements found matching "{selector}".'
 
-        lines = [f'Found {total} element{"s" if total != 1 else ""} matching "{selector}":']
+        lines = [
+            f'Found {total} element{"s" if total != 1 else ""} matching "{selector}":'
+        ]
         for el in elements:
             idx = el.get("index", 0)
             tag = el.get("tag", "?")
@@ -1240,13 +1406,19 @@ class BrowserManager:
             return "No active page."
         try:
             try:
-                result = self._worker.dispatch(lambda: target.evaluate(expression), timeout=15)
+                result = self._worker.dispatch(
+                    lambda: target.evaluate(expression), timeout=15
+                )
             except SyntaxError:
-                result = self._worker.dispatch(lambda: target.evaluate(f'() => {{ {expression} }}'), timeout=15)
+                result = self._worker.dispatch(
+                    lambda: target.evaluate(f"() => {{ {expression} }}"), timeout=15
+                )
             if result is None:
                 return "JavaScript executed (returned null/undefined)"
             if isinstance(result, str):
-                return result if len(result) < 10000 else result[:10000] + "...[truncated]"
+                return (
+                    result if len(result) < 10000 else result[:10000] + "...[truncated]"
+                )
             return json.dumps(result, indent=2, default=str)
         except SyntaxError:
             return f"JavaScript syntax error in: {expression!r}\nUse 'return' with full function body."
@@ -1272,13 +1444,19 @@ class BrowserManager:
             for f in frames:
                 if f == page.main_frame:
                     continue
-                if sel_lower in (f.url or "").lower() or sel_lower in (f.name or "").lower():
+                if (
+                    sel_lower in (f.url or "").lower()
+                    or sel_lower in (f.name or "").lower()
+                ):
                     return f, "playwright"
             # 2. Try CDP frame tree for cross-origin frames
             try:
                 cdp_frames = self._cdp.get_all_frame_ids(page)
                 for cf in cdp_frames:
-                    if sel_lower in cf.get("url", "").lower() or sel_lower in cf.get("name", "").lower():
+                    if (
+                        sel_lower in cf.get("url", "").lower()
+                        or sel_lower in cf.get("name", "").lower()
+                    ):
                         # Found a cross-origin frame — mark it for a11y-based access
                         return cf, "cdp_cross_origin"
             except Exception:
@@ -1295,7 +1473,10 @@ class BrowserManager:
             for f in page.frames:
                 if f != page.main_frame:
                     avail.append(f"  - name={f.name!r} url={f.url}")
-            return f"No frame matching '{frame_selector}'.\nAvailable frames:\n" + "\n".join(avail)[:2000]
+            return (
+                f"No frame matching '{frame_selector}'.\nAvailable frames:\n"
+                + "\n".join(avail)[:2000]
+            )
 
         if frame_type == "cdp_cross_origin":
             # Store the CDP frame info for snapshot to use
@@ -1327,11 +1508,16 @@ class BrowserManager:
         def _do():
             png_bytes = page.screenshot(full_page=full_page, type="png")
             filepath.write_bytes(png_bytes)
-            data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+            data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode(
+                "ascii"
+            )
             return png_bytes, page.url, len(png_bytes), data_url
+
         try:
-            png_bytes, url, size_bytes, data_url = self._worker.dispatch(_do, timeout=30)
-            msg = f"Screenshot captured ({size_bytes/1024:.0f} KB) — {url}\nSaved to: {filepath}"
+            png_bytes, url, size_bytes, data_url = self._worker.dispatch(
+                _do, timeout=30
+            )
+            msg = f"Screenshot captured ({size_bytes / 1024:.0f} KB) — {url}\nSaved to: {filepath}"
             return png_bytes, msg, data_url
         except Exception as e:
             return None, f"Screenshot failed: {e}", None
@@ -1345,7 +1531,9 @@ class BrowserManager:
         if not target:
             return "No active page."
         try:
-            data = self._worker.dispatch(lambda: target.evaluate(_SNAPSHOT_JS), timeout=15)
+            data = self._worker.dispatch(
+                lambda: target.evaluate(_SNAPSHOT_JS), timeout=15
+            )
             # Cache elements for index-based interactions
             self._last_snapshot_elements = data.get("elements", [])
             result = self._format_snapshot(data)
@@ -1354,9 +1542,21 @@ class BrowserManager:
             return result
         except Exception as e:
             try:
-                title = self._worker.dispatch(lambda: target.title() if hasattr(target, 'title') else '', timeout=5)
-                url = self._worker.dispatch(lambda: target.url if hasattr(target, 'url') else '', timeout=5)
-                text = self._worker.dispatch(lambda: target.inner_text("body") if hasattr(target, 'inner_text') else '', timeout=10)
+                title = self._worker.dispatch(
+                    lambda: target.title() if hasattr(target, "title") else "",
+                    timeout=5,
+                )
+                url = self._worker.dispatch(
+                    lambda: target.url if hasattr(target, "url") else "", timeout=5
+                )
+                text = self._worker.dispatch(
+                    lambda: (
+                        target.inner_text("body")
+                        if hasattr(target, "inner_text")
+                        else ""
+                    ),
+                    timeout=10,
+                )
                 if len(text) > 3000:
                     text = text[:3000] + "\n...[truncated]"
                 return f"Page: {title}\nURL: {url}\n\n{text}"
@@ -1371,7 +1571,8 @@ class BrowserManager:
         try:
             main_url = self._worker.dispatch(lambda: page.url, timeout=5)
             cross_origin_data = self._worker.dispatch(
-                lambda: self._cdp.get_cross_origin_iframe_content(page, main_url), timeout=15,
+                lambda: self._cdp.get_cross_origin_iframe_content(page, main_url),
+                timeout=15,
             )
         except Exception:
             return ""
@@ -1392,7 +1593,7 @@ class BrowserManager:
                 desc = el.get("description", "")
                 is_interactive = el.get("is_interactive", False)
                 prefix = "  →" if is_interactive else "    "
-                desc_str = f' ({desc})' if desc else ""
+                desc_str = f" ({desc})" if desc else ""
                 lines.append(f"{prefix} [{role}] {name_text}{desc_str}")
         return "\n".join(lines)
 
@@ -1406,6 +1607,7 @@ class BrowserManager:
         lines.append("")
 
         if len(self._pages) > 1:
+
             def _get_tab_titles():
                 result = []
                 for i, p in enumerate(self._pages):
@@ -1413,12 +1615,18 @@ class BrowserManager:
                         t = p.title() or p.url[:30]
                     except Exception:
                         t = "(error)"
-                    result.append(f"{'*' if i == self._current_idx else ' '} Tab {i}: {t}")
+                    result.append(
+                        f"{'*' if i == self._current_idx else ' '} Tab {i}: {t}"
+                    )
                 return result
+
             try:
                 tab_titles = self._worker.dispatch(_get_tab_titles, timeout=10)
             except Exception:
-                tab_titles = [f"{'*' if i == self._current_idx else ' '} Tab {i}: (error)" for i in range(len(self._pages))]
+                tab_titles = [
+                    f"{'*' if i == self._current_idx else ' '} Tab {i}: (error)"
+                    for i in range(len(self._pages))
+                ]
             lines.append(f"[Tabs] {' | '.join(tab_titles)}")
             lines.append("")
 
@@ -1453,7 +1661,9 @@ class BrowserManager:
                         checked = "✓" if el.get("checked") else "✗"
                         label_sel = el.get("label_selector", "")
                         if label_sel:
-                            parts.append(f'{itype}: "{display}" {checked} (label: {label_sel})')
+                            parts.append(
+                                f'{itype}: "{display}" {checked} (label: {label_sel})'
+                            )
                         else:
                             parts.append(f'{itype}: "{display}" {checked}')
                     else:
@@ -1470,7 +1680,9 @@ class BrowserManager:
                             f'"{o.get("text", "")}" (val="{o.get("value", "")}"){" *" if o.get("selected") else ""}'
                             for o in opts
                         ]
-                        parts.append(f'Select: "{text}" selected="{selected}" options=[{", ".join(opt_strs)}]')
+                        parts.append(
+                            f'Select: "{text}" selected="{selected}" options=[{", ".join(opt_strs)}]'
+                        )
                     else:
                         parts.append(f'Select: "{text}" selected="{selected}"')
                 else:
@@ -1496,7 +1708,9 @@ class BrowserManager:
                 lines.append(f"  {t}")
             lines.append("")
 
-        inputs = [e for e in elements if e.get("tag") in ("input", "textarea", "select")]
+        inputs = [
+            e for e in elements if e.get("tag") in ("input", "textarea", "select")
+        ]
         if inputs:
             lines.append("[Form State]")
             for inp in inputs:
@@ -1523,18 +1737,22 @@ class BrowserManager:
     def open_new_tab(self, url=None) -> str:
         if not self._context:
             return "No browser context. Launch the browser first."
+
         def _do():
             page = self._context.new_page()
             if url:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
             return page
+
         try:
             page = self._worker.dispatch(_do, timeout=35)
             self._pages.append(page)
             self._current_idx = len(self._pages) - 1
             if url:
                 try:
-                    title = self._worker.dispatch(lambda: page.title() or "(no title)", timeout=5)
+                    title = self._worker.dispatch(
+                        lambda: page.title() or "(no title)", timeout=5
+                    )
                 except Exception:
                     title = "(no title)"
                 return f"Opened new tab ({len(self._pages)} tabs) — {title} — {url}"
@@ -1545,11 +1763,15 @@ class BrowserManager:
     def switch_tab(self, index=None, url_pattern=None) -> str:
         if not self._pages:
             return "No tabs open."
+
         def _get_tab_title(page):
             try:
-                return self._worker.dispatch(lambda: page.title() or "(no title)", timeout=5)
+                return self._worker.dispatch(
+                    lambda: page.title() or "(no title)", timeout=5
+                )
             except Exception:
                 return "(error)"
+
         if url_pattern:
             for i, page in enumerate(self._pages):
                 try:
@@ -1563,13 +1785,14 @@ class BrowserManager:
         if index is None:
             return "Specify tab index or url_pattern."
         if index < 0 or index >= len(self._pages):
-            return f"Invalid tab index {index}. Valid: 0-{len(self._pages)-1}"
+            return f"Invalid tab index {index}. Valid: 0-{len(self._pages) - 1}"
         self._current_idx = index
         return f"Switched to tab {index}: {_get_tab_title(self._pages[index])} — {self._pages[index].url}"
 
     def list_tabs(self) -> str:
         if not self._pages:
             return "No tabs open."
+
         def _get_all_tab_info():
             result = []
             for i, p in enumerate(self._pages):
@@ -1583,11 +1806,15 @@ class BrowserManager:
                     u = "(error)"
                 result.append((i, t, u))
             return result
+
         try:
             tab_data = self._worker.dispatch(_get_all_tab_info, timeout=10)
         except Exception:
             return "Failed to get tab info."
-        lines = [f"  Tab {i}{'*' if i == self._current_idx else ' '}  {t}  —  {u}" for i, t, u in tab_data]
+        lines = [
+            f"  Tab {i}{'*' if i == self._current_idx else ' '}  {t}  —  {u}"
+            for i, t, u in tab_data
+        ]
         return f"Open tabs ({len(self._pages)}):\n" + "\n".join(lines)
 
     def close_tab(self, index=None) -> str:
@@ -1615,7 +1842,9 @@ class BrowserManager:
         if not page:
             return "No active page."
         try:
-            title, url = self._worker.dispatch(lambda: (page.title() or "(no title)", page.url), timeout=5)
+            title, url = self._worker.dispatch(
+                lambda: (page.title() or "(no title)", page.url), timeout=5
+            )
             return f"Title: {title}\nURL: {url}\nTab: {self._current_idx} of {len(self._pages)}\nProfile: {self._profile_name or '(ephemeral)'}"
         except Exception as e:
             return f"Error: {e}"
