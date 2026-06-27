@@ -20,6 +20,9 @@ Agent2/
 ├── kairos.bat              # Windows shortcut (py main.py)
 ├── chats/                  # Saved chat sessions (gitignored)
 │   └── chats.json          # All chat history in one file
+├── skills/                 # Skills directory (gitignored, stays local)
+│   └── moodle-quiz/        # Example: Moodle quiz skill
+│       └── SKILL.md
 └── kairos/
     ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, SkillManager, TerminalManager, BrowserManager
     ├── main.py             # CLI REPL loop, signal handlers, auto-save, paste resolution
@@ -452,7 +455,7 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 - Interactive elements with computed CSS selectors (id > name > data-testid > class path)
 - Hidden radio/checkbox inputs (always included, even when CSS-hidden — commonly used in quiz forms)
 - Associated `<label>` text for radio/checkbox inputs (via `label[for]` and wrapping `<label>`)
-- **Question context** for radio/checkbox/select elements: walks up the DOM via `findQuestionContext()` to find the nearest question text (Moodle `.qtext`, `.formulation`, headings, "Question N" patterns). Included as `context` field on element entries.
+- **Question context** for radio/checkbox/select elements: walks up the DOM via `findQuestionContext()` to find the nearest question text (Moodle `.qtext`, `.formulation`, headings, "Question N" patterns). Included as `context` field on element entries. For matching questions (Moodle dropdown tables), also extracts the left-side label text (e.g. "el fósforo") and appends it to the context as `"label → question text"`.
 - Headings (h1-h4)
 - Text blocks (p, label, li, dt, dd) — up to 40 blocks (increased from 20)
 - Form state (input values, textarea content, select options with visible text and value attributes)
@@ -626,7 +629,7 @@ Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill n
 | `BrowserDragXYTool` | `bm.drag_xy(x1, y1, x2, y2)` — coordinate-based drag |
 | `BrowserSwitchFrameTool` | `bm.switch_frame(frame_selector)` — switch into/out of iframes |
 
-Each returns `ToolResult`. `BrowserLaunchTool` catches `ImportError` specifically to give installation instructions.
+Each returns `ToolResult`. `BrowserLaunchTool` catches `ImportError` specifically to give installation instructions. The `headless` parameter is exposed in the tool schema (default: `False`). `humanize` defaults to `True`. Skills directory (`skills/`) is gitignored — skills stay local and are never pushed to GitHub.
 
 ### `kairos/tools/session.py` — SessionManager
 
