@@ -14,7 +14,7 @@ class BrowserLaunchTool:
         self.bm = browser_manager
 
     def __call__(
-        self, profile=None, headless=True, proxy=None, humanize=False,
+        self, profile=None, headless=False, proxy=None, humanize=True,
         chrome_profile=None, connect_cdp=None,
     ) -> ToolResult:
         try:
