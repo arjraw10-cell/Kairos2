@@ -1940,22 +1940,40 @@ _SNAPSHOT_JS = """() => {
             'fieldset', 'legend', '[role="group"]', '[role="radiogroup"]'
         ];
         let current = el;
+        let questionText = '';
         for (let i = 0; i < 10 && current && current !== document.body; i++) {
             current = current.parentElement;
             if (!current) break;
             for (const sel of questionSelectors) {
                 if (current.matches && current.matches(sel)) {
                     const qtextEl = current.querySelector('.qtext') || current;
-                    let text = getText(qtextEl, 200);
-                    if (text && text.length > 3) return text;
+                    let text = getText(qtextEl, 300);
+                    if (text && text.length > 3) { questionText = text; break; }
                 }
             }
+            if (questionText) break;
             if (/^H[1-4]$/.test(current.tagName)) {
                 const text = getText(current, 150);
-                if (text && text.length > 3) return text;
+                if (text && text.length > 3) { questionText = text; break; }
             }
         }
-        return '';
+        // For matching questions: find the left-side label text (e.g. "el fósforo")
+        // Walk up from the element to find a row/container with a text-only sibling
+        let row = el;
+        for (let i = 0; i < 8 && row && row !== document.body; i++) {
+            row = row.parentElement;
+            if (!row) break;
+            const siblings = Array.from(row.children);
+            for (const sib of siblings) {
+                if (sib === el || sib.contains(el) || el.contains(sib)) continue;
+                if (sib.querySelector('select, input, button, textarea')) continue;
+                const t = getText(sib, 100);
+                if (t && t.length > 1 && !/^\s*Answer \d/.test(t)) {
+                    return t + (questionText ? ' → ' + questionText : '');
+                }
+            }
+        }
+        return questionText;
     }
 
     const interactiveSelectors = 'a, button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="radio"], [role="checkbox"], [role="option"], [role="listbox"], [role="combobox"], [role="menuitemcheckbox"], [role="menuitemradio"], [onclick]';
