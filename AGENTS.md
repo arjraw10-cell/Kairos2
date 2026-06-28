@@ -242,15 +242,17 @@ The main agent loop:
 
 **Constants**:
 - `COMPACT_RESERVE_TOKENS = 16384` — tokens for summary prompt + output
-- `COMPACT_KEEP_RECENT = 20000` — tokens of recent context to preserve
+- `COMPACT_KEEP_RECENT_PCT = 0.20` — keeps 20% of the model's context window as recent context
 - `COMPACT_THRESHOLD_PCT = 80.0` — auto-compact threshold
 
 **`compact()`**:
-1. `_find_compact_boundary()` — walks backward from end, accumulates tokens, finds cut point keeping ~20k tokens
+1. `_find_compact_boundary()` — walks backward from end, accumulates tokens, finds cut point keeping 20% of context window
 2. Serializes old messages into readable text (`_serialize_messages_for_summary()`)
 3. `_generate_summary()` — non-streaming API call with structured prompt
 4. If existing compaction summary exists, passes it as `<previous-summary>` for incremental update
 5. Rebuilds history: `[system_prompt, compaction_summary, recent_messages]`
+   - Compaction message is `role: "user"` so it flows naturally in conversation ordering
+   - Existing compaction summaries are detected by content prefix `"[Conversation compacted"`
 6. Re-counts tokens
 
 **Summary format** (structured checkpoint):

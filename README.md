@@ -208,7 +208,7 @@ Tokens are streamed in real-time. During the agent's reasoning phase, a grey pan
 
 ### Compaction
 
-When the conversation context exceeds 80% of the context window, old messages are automatically summarized into a structured checkpoint (Goal, Progress, Key Decisions, Next Steps) and replaced. Recent context (~20k tokens) is preserved. You can also trigger this manually with `/compact`.
+When the conversation context exceeds 80% of the context window, old messages are automatically summarized into a structured checkpoint (Goal, Progress, Key Decisions, Next Steps) and replaced. Recent context (20% of context window) is preserved. You can also trigger this manually with `/compact`.
 
 ### Skills
 

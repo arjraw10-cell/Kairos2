@@ -1029,7 +1029,7 @@ class Agent:
         return None
 
     COMPACT_RESERVE_TOKENS = 16384
-    COMPACT_KEEP_RECENT = 20000
+    COMPACT_KEEP_RECENT_PCT = 0.20  # 20% of context window
     COMPACT_THRESHOLD_PCT = 80.0
 
     COMPACT_SYSTEM_PROMPT = (
@@ -1111,7 +1111,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         return self.tokens.context_pct >= self.COMPACT_THRESHOLD_PCT
 
     def _find_compact_boundary(self) -> int:
-        keep_tokens = self.COMPACT_KEEP_RECENT
+        keep_tokens = max(int(self.tokens.context_window * self.COMPACT_KEEP_RECENT_PCT), 1000)
         accumulated = 0
         for i in range(len(self.conversation_history) - 1, 0, -1):
             msg = self.conversation_history[i]
@@ -1190,15 +1190,15 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         existing_summary = None
         if (
             len(history) > 1
-            and history[1].get("role") == "system"
-            and history[1].get("name") == "compaction"
+            and history[1].get("role") == "user"
+            and isinstance(history[1].get("content"), str)
+            and history[1]["content"].startswith("[Conversation compacted")
         ):
             existing_summary = history[1].get("content")
         summary = self._generate_summary(to_summarize, existing_summary)
         compaction_msg = {
-            "role": "system",
-            "name": "compaction",
-            "content": f"[Conversation compacted \u2014 summary of prior history]\n\n{summary}",
+            "role": "user",
+            "content": f"[Conversation compacted — summary of prior history]\n\n{summary}",
         }
         recent = history[boundary:]
         self.conversation_history = [system_msg, compaction_msg] + recent
