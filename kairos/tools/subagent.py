@@ -21,10 +21,12 @@ class SubAgentTool:
         workspace: str,
         client: Any,
         model: str,
+        interrupt_event: Any = None,
     ):
         self.workspace = workspace
         self.client = client
         self.model = model
+        self._interrupt_event = interrupt_event
 
         # Registry: subagent_id -> {"status", "result", "thread"}
         self._subagents: Dict[str, Dict[str, Any]] = {}
@@ -109,6 +111,10 @@ class SubAgentTool:
         # Subagents cannot spawn further subagents
         agent._is_subagent = True
         agent.subagent_tool = None  # prevent recursive spawning
+        # Share parent's interrupt event so user can stop subagents too
+        if self._interrupt_event:
+            agent._interrupt_event = self._interrupt_event
+            agent.terminal_manager._interrupt_event = self._interrupt_event
 
         # Wire tool-call logging so the user can see what the subagent is doing
         if self._tool_printer:

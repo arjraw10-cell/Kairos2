@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect } from "react";
 import { useGateway } from "./hooks/useGateway";
 import { Sidebar } from "./components/Sidebar";
 import { ChatArea } from "./components/ChatArea";
@@ -7,6 +7,18 @@ import { StatusBar } from "./components/StatusBar";
 
 export function App() {
   const gw = useGateway();
+
+  // Global Escape key handler — interrupt streaming / stop agent
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && gw.streaming) {
+        e.preventDefault();
+        gw.interrupt();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [gw.streaming, gw.interrupt]);
 
   return (
     <div style={styles.app}>

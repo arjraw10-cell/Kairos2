@@ -35,6 +35,7 @@ class Agent:
         )
         self.model = Config.OPENAI_MODEL()
         self.terminal_manager = TerminalManager()
+        self.terminal_manager._interrupt_event = self._interrupt_event
         self._interrupt_event = threading.Event()
         self._stop_requested = False
 
@@ -63,6 +64,7 @@ class Agent:
             workspace=str(self.cwd),
             client=self.client,
             model=self.model,
+            interrupt_event=self._interrupt_event,
         )
 
         # Browser tools
@@ -836,6 +838,10 @@ class Agent:
 
     def _execute_tool(self, name: str, args: Dict[str, Any]) -> str:
         """Execute a tool and return the result as a JSON string."""
+        # Hard interrupt: abort before dispatching any tool
+        if self._interrupt_event.is_set():
+            self._interrupt_event.clear()
+            raise InterruptedError("Interrupted by user")
         dispatch = {
             "read": lambda a: self.read_tool(a["path"]).to_dict(),
             "write": lambda a: self.write_tool(a["path"], a["content"]).to_dict(),
@@ -1426,6 +1432,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             if self.on_tool_call:
                 self.on_tool_call(func_name, func_args)
             result_json = self._execute_tool(func_name, func_args)
+            # Check interrupt immediately after tool — don't send stale results
+            self._check_interrupt()
             result_dict = json.loads(result_json)
             image_data_url = result_dict.pop("image_url", None)
             if image_data_url:

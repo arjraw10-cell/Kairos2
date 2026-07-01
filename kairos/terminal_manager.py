@@ -2,7 +2,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import queue
 
@@ -19,6 +19,7 @@ class TerminalManager:
         self.terminals: Dict[int, Terminal] = {}
         self.next_id = 1
         self._lock = threading.Lock()
+        self._interrupt_event: Optional[threading.Event] = None
 
     def create_terminal(self, background: bool) -> int:
         with self._lock:
@@ -89,21 +90,33 @@ class TerminalManager:
                     return False, f"Failed to send command: {str(e)}"
             return False, "Background terminal process not available"
         else:
-            # Blocking execution
+            # Interruptible blocking execution using Popen + poll loop
             try:
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     command,
                     shell=True,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=timeout
                 )
-                output = result.stdout + result.stderr
+                deadline = time.time() + timeout if timeout else None
+                while True:
+                    ret = proc.poll()
+                    if ret is not None:
+                        break
+                    if self._interrupt_event and self._interrupt_event.is_set():
+                        proc.kill()
+                        proc.wait(timeout=2)
+                        return False, "[Interrupted]"
+                    if deadline and time.time() > deadline:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                        return False, f"Command timed out after {timeout} seconds"
+                    time.sleep(0.05)
+                output = proc.stdout.read() if proc.stdout else ""
                 return True, output if output else "Command executed successfully (no output)"
-            except subprocess.TimeoutExpired:
-                return False, f"Command timed out after {timeout} seconds"
             except Exception as e:
                 return False, f"Command execution failed: {str(e)}"
 
