@@ -437,6 +437,7 @@ class CLI:
             self._live.stop()
             self._live = None
         self._stream_text = ""
+        self._skip_print_response = True
 
     # ------------------------------------------------------------------ #
     #  Tool call summary                                                   #

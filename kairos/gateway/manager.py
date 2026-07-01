@@ -76,7 +76,9 @@ class GatewayManager:
         resolved = self._resolve_workspace(workspace)
 
         session = ManagedSession(session_id, resolved)
-        session.agent.conversation_history = history
+        # Repair any broken tool chains from interrupted execution
+        sanitized, last_response = Agent._sanitize_history_for_resume(history)
+        session.agent.conversation_history = sanitized
         try:
             session.agent.tokens.start_turn(history)
             session.agent.tokens.finish_turn()

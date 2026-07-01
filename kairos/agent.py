@@ -1469,6 +1469,103 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             return False
         return any(c.isalnum() for c in text)
 
+    @staticmethod
+    def _sanitize_history_for_resume(history: list) -> tuple:
+        """Repair conversation history that was saved mid-execution.
+
+        When an agent is interrupted while calling tools, the saved
+        history may contain:
+          - An assistant message with tool_calls but no tool results
+          - Orphaned tool messages without a preceding assistant
+
+        This walks backwards and finds the last fully valid state,
+        returning (cleaned_history, last_agent_response).
+
+        If the history is already clean, it's returned unchanged.
+        """
+        if not history or len(history) <= 1:
+            return history, ""
+
+        # Start from the end and walk backwards looking for the
+        # last complete assistant response (no tool_calls).
+        last_clean_assistant = None
+        last_clean_index = None
+
+        i = len(history) - 1
+        while i > 0:
+            msg = history[i]
+            role = msg.get("role", "")
+
+            if role == "assistant" and not msg.get("tool_calls"):
+                # Clean assistant response — this is a valid endpoint
+                last_clean_assistant = msg.get("content") or ""
+                last_clean_index = i
+                break
+
+            if role == "assistant" and msg.get("tool_calls"):
+                # Assistant requested tools — find how many tool_calls
+                expected_ids = set()
+                for tc in msg.get("tool_calls", []):
+                    tc_id = tc.get("id") or tc.get("function", {}).get("name")
+                    if tc_id:
+                        expected_ids.add(tc_id)
+
+                # Collect tool results that follow
+                found_ids = set()
+                j = i + 1
+                while j < len(history):
+                    next_msg = history[j]
+                    if next_msg.get("role") == "tool":
+                        found_ids.add(next_msg.get("tool_call_id", ""))
+                        j += 1
+                    elif next_msg.get("role") == "user":
+                        # Screenshot injection messages are ok
+                        content = next_msg.get("content", "")
+                        is_injection = isinstance(content, list) and \
+                            content and isinstance(content[0], dict) and \
+                            content[0].get("type") == "text" and \
+                            content[0].get("text", "").startswith("[Screenshot captured")
+                        if is_injection:
+                            j += 1
+                            continue
+                        break
+                    else:
+                        break
+
+                if expected_ids == found_ids:
+                    # Complete tool chain — valid, but find the
+                    # assistant response before this
+                    i -= 1
+                    continue
+                else:
+                    # Incomplete tool chain — trim the assistant + tools
+                    last_clean_index = i - 1
+                    break
+
+            i -= 1
+
+        if last_clean_index is not None:
+            # Walk from last_clean_index back to find the assistant msg
+            cleaned = history[:last_clean_index + 1]
+            # Find last assistant message in cleaned history
+            for msg in reversed(cleaned):
+                if msg.get("role") == "assistant" and not msg.get("tool_calls"):
+                    last_clean_assistant = msg.get("content") or ""
+                    break
+            return cleaned, last_clean_assistant or ""
+
+        # Couldn't find any clean state — keep system + last user msg
+        system = history[0]
+        last_user = None
+        for msg in reversed(history):
+            if msg.get("role") == "user":
+                last_user = msg
+                break
+        if last_user:
+            return [system, last_user], ""
+
+        return history, ""
+
     def run(self, user_message: str, image_url: Optional[str] = None) -> Optional[str]:
         self._interrupt_event.clear()
         current = user_message
