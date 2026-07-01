@@ -1450,12 +1450,23 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             self.on_token_update(self.tokens)
         return None, assembled_tool_calls
 
+    @staticmethod
+    def _has_words(text: Optional[str]) -> bool:
+        """Check if a response contains at least one actual word.
+
+        API responses like ``" "``, ``"."``, or ``"\\n"`` are not
+        meaningful — this catches those edge cases.
+        """
+        if not text:
+            return False
+        return any(c.isalnum() for c in text)
+
     def run(self, user_message: str, image_url: Optional[str] = None) -> Optional[str]:
         self._interrupt_event.clear()
         current = user_message
         _first_image = image_url
-        max_empty_retries = 2
-        empty_retry_count = 0
+        max_retries = 3
+        retry_count = 0
         try:
             while True:
                 if self._should_stop():
@@ -1467,17 +1478,38 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 response, tool_calls = self.step(current, image_url=_first_image)
                 _first_image = None
                 current = None
-                if response:
-                    return response
-                if not tool_calls:
+                # Final response with no tool calls — check it's substantive
+                if response and not tool_calls:
+                    if self._has_words(response):
+                        return response
+                    # Response exists but has no real words — treat as empty
                     if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
                         self.conversation_history.pop()
-                    if empty_retry_count < max_empty_retries:
-                        empty_retry_count += 1
+                    if retry_count < max_retries:
+                        retry_count += 1
                         if self.on_compact:
-                            self.on_compact(f"No response from API \u2014 retrying ({empty_retry_count}/{max_empty_retries})...")
+                            self.on_compact(
+                                f"API returned a near-empty response \u2014 retrying "
+                                f"({retry_count}/{max_retries})..."
+                            )
                         continue
-                    return "Agent returned without a response."
+                    # Fall through and return whatever we got after retries exhausted
+                    return response or "Agent returned without a response."
+                # Response with tool calls — continue the loop (step handled tools)
+                if tool_calls:
+                    continue
+                # No response, no tool calls — completely empty API return
+                if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
+                    self.conversation_history.pop()
+                if retry_count < max_retries:
+                    retry_count += 1
+                    if self.on_compact:
+                        self.on_compact(
+                            f"No response from API \u2014 retrying "
+                            f"({retry_count}/{max_retries})..."
+                        )
+                    continue
+                return "Agent returned without a response."
         except InterruptedError:
             return "[Interrupted]"
 
