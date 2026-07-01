@@ -47,6 +47,24 @@ class Config:
         return model
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_DEFAULT_WORKSPACE(cls) -> str:
+        _ensure_dotenv()
+        return os.getenv("KAIROS_DEFAULT_WORKSPACE", os.getcwd())
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_GATEWAY_PORT(cls) -> int:
+        _ensure_dotenv()
+        return int(os.getenv("KAIROS_GATEWAY_PORT", "8765"))
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_GATEWAY_HOST(cls) -> str:
+        _ensure_dotenv()
+        return os.getenv("KAIROS_GATEWAY_HOST", "127.0.0.1")
+
+    @classmethod
     def validate(cls):
         _ensure_dotenv()
         if not cls.OPENAI_API_KEY():
@@ -61,3 +79,6 @@ class Config:
         cls.OPENAI_API_KEY.cache_clear()
         cls.OPENAI_BASE_URL.cache_clear()
         cls.OPENAI_MODEL.cache_clear()
+        cls.KAIROS_DEFAULT_WORKSPACE.cache_clear()
+        cls.KAIROS_GATEWAY_PORT.cache_clear()
+        cls.KAIROS_GATEWAY_HOST.cache_clear()

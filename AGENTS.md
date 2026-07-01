@@ -25,14 +25,20 @@ Agent2/
 │       └── SKILL.md
 └── kairos/
     ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, SkillManager, TerminalManager, BrowserManager
-    ├── main.py             # CLI REPL loop, signal handlers, auto-save, paste resolution
-    ├── config.py           # Lazy .env loading via lru_cache
+    ├── main.py             # CLI REPL — thin WebSocket client connected to the gateway
+    ├── main_gateway.py     # Gateway entry point (kairos serve)
+    ├── config.py           # Lazy .env loading via lru_cache + gateway config
     ├── agent.py            # Core agent: streaming, tool dispatch, compaction, error handling
     ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling
     ├── tokens.py           # TokenCounter using tiktoken
     ├── terminal_manager.py # Terminal lifecycle (background + blocking)
     ├── browser_manager.py  # Playwright/CloakBrowser in dedicated worker thread + CDP cross-origin iframe support
     ├── cdp_manager.py      # CDPManager — low-level Chrome DevTools Protocol access (a11y tree, frame detection)
+    ├── gateway/
+    │   ├── __init__.py     # Exports: GatewayManager, ManagedSession, create_app, ClientMsg, ServerMsg
+    │   ├── protocol.py     # Message type constants (ClientMsg, ServerMsg)
+    │   ├── manager.py      # GatewayManager + ManagedSession — owns conversations, routes to Agents
+    │   └── server.py       # FastAPI app — WebSocket + REST routes, thread-safe streaming
     └── tools/
         ├── __init__.py     # Imports and re-exports all tools
         ├── base.py         # ToolResult(success, output, error?, image_url?)
@@ -45,7 +51,7 @@ Agent2/
         ├── subagent.py     # SubAgentTool — spawn/track child agents
         ├── browser.py      # 26 browser tool wrappers (scroll, wait, send_keys, search, find, think, index-based, etc.)
         ├── skills.py       # SkillManager — list, load, write skills
-        └── session.py      # SessionManager — save/load chats to chats/chats.json
+        └── session.py      # SessionManager — save/load chats to chats/chats.json (with workspace support)
 ```
 
 ---
@@ -674,6 +680,116 @@ No fuzzy/prefix matching — each session is tracked by its ID. This prevents di
     "messages": [...]
   }
 }
+```
+
+---
+
+## Gateway Architecture
+
+### Overview
+
+The gateway is a stateful WebSocket server that owns Agent instances. CLI and future UI clients (Electron) are thin WebSocket clients that connect to it. A single gateway process can serve multiple conversations across multiple workspaces simultaneously.
+
+```
+Gateway Process (port 8765)
+│
+├── Conversation A  →  workspace: /path/to/project-x  →  Agent(workspace=...)
+├── Conversation B  →  workspace: /path/to/project-y  →  Agent(workspace=...)
+└── (empty)         ← new conversations created on demand
+```
+
+### Files
+
+```
+kairos/gateway/
+├── __init__.py     # Exports: GatewayManager, ManagedSession, create_app, ClientMsg, ServerMsg
+├── protocol.py     # Message type constants (ClientMsg, ServerMsg)
+├── manager.py      # GatewayManager + ManagedSession — owns conversations, routes to Agents
+└── server.py       # FastAPI app — WebSocket + REST routes, thread-safe streaming
+```
+
+### `kairos/gateway/protocol.py`
+
+Message type constants. Every WebSocket message is JSON with a `type` field.
+
+**Client → Server:** `connect`, `new_session`, `load_session`, `unload`, `list_sessions`, `message`, `interrupt`, `stop`, `compact`, `ping`
+
+**Server → Client:** `connected`, `new_session_created`, `sessions_list`, `stream_start`, `stream_token`, `tool_call`, `stream_end`, `done`, `token_update`, `compacted`, `unloaded`, `error`, `pong`, `exit`
+
+### `kairos/gateway/manager.py` — GatewayManager
+
+**`ManagedSession`**: One conversation = one workspace + one Agent instance + one `is_running` flag.
+
+**`GatewayManager`**:
+- `create_session(workspace?)` — create new conversation (defaults to `default_workspace`)
+- `load_session(session_id)` — pull full history from disk, create Agent
+- `unload_session(session_id)` — save to disk, destroy Agent, release memory
+- `send_message(session_id, content, callbacks)` — run `agent.run()` in thread, pipe events via callbacks
+- `compact(session_id)` — compact + save
+- `interrupt(session_id)` / `stop(session_id)` — hard/graceful stop
+- `list_sessions()` — list all sessions from `chats.json`
+- `cleanup_idle()` — background task: auto-unload sessions idle > 30 min
+
+**Key design**: The gateway owns zero workspace state. Each `ManagedSession` carries its own workspace and creates its own `Agent(workspace)` instance.
+
+### `kairos/gateway/server.py` — FastAPI
+
+Routes:
+- `GET /health` — gateway status
+- `GET /api/sessions` — list all sessions (REST)
+- `WS /ws` — main WebSocket endpoint
+
+**Thread safety**: Agent callbacks fire from background threads. Uses `asyncio.run_coroutine_threadsafe()` to safely schedule WebSocket sends on the event loop.
+
+### WebSocket Protocol
+
+**Sending a message flow:**
+1. Client sends `{"type": "message", "content": "..."}` (optionally with `"image_url"`)
+2. Server sends `stream_start` → multiple `stream_token` → `stream_end` → `token_update` → `done`
+3. Tool calls emit `tool_call` events between `stream_start` and `done`
+
+**Session lifecycle:**
+- `new_session` → creates Agent in given/default workspace
+- `load_session` → loads from `chats.json`, creates Agent, sends history
+- `unload` → saves to disk, destroys Agent
+- Idle 30 min → auto-unload
+
+### `kairos/main.py` — CLI as Thin Client
+
+The CLI is now a WebSocket client. It connects to the gateway, sends messages, and renders the streaming events using the existing `CLI` class from `cli.py`. No agent logic lives in the CLI.
+
+### `kairos/main_gateway.py` — Gateway Entry Point
+
+Starts the FastAPI server with uvicorn. Takes an optional workspace argument (falls back to `KAIROS_DEFAULT_WORKSPACE` env var or cwd).
+
+### `kairos/config.py` — New Gateway Settings
+
+| Method | Default |
+|--------|---------|
+| `Config.KAIROS_DEFAULT_WORKSPACE()` | `os.getcwd()` |
+| `Config.KAIROS_GATEWAY_PORT()` | `8765` |
+| `Config.KAIROS_GATEWAY_HOST()` | `127.0.0.1` |
+
+### `kairos/tools/session.py` — Workspace Support
+
+`save_chat()` now accepts optional `workspace` and `session_id` parameters. The gateway passes both so that sessions are saved with the correct workspace and a deterministic ID.
+
+### Running the Gateway
+
+```bash
+# Start gateway (for Electron, or for multiple CLI sessions)
+python -m kairos.main_gateway [default_workspace]
+
+# Start CLI connected to gateway
+python -m kairos.main [workspace]
+```
+
+### New Dependencies
+
+```
+fastapi>=0.115
+uvicorn[standard]>=0.34
+websockets>=14.0
 ```
 
 ---

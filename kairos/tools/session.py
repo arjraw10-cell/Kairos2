@@ -114,37 +114,47 @@ class SessionManager:
                     return content[:20]
         return ""
 
-    def save_chat(self, conversation_history: List[Dict[str, Any]]):
+    def save_chat(self, conversation_history: List[Dict[str, Any]], workspace: str = None, session_id: str = None):
         """Save (or update) the current chat session.
 
         Strategy:
-        1. If _current_session_id is set and still on disk → update it.
-        2. Otherwise → create a brand-new entry.
+        1. If session_id is provided (by gateway), always use it as the key.
+        2. If _current_session_id is set and still on disk → update it.
+        3. Otherwise → create a brand-new entry.
+
+        Args:
+            conversation_history: Full conversation history.
+            workspace: Absolute path to the workspace for this session (optional).
+            session_id: Explicit session ID to use as the key (gateway passes this).
         """
         if len(conversation_history) <= 1:
             return  # Don't save empty sessions (only system prompt)
 
         data = self._load_all()
         preview = self._extract_preview(conversation_history)
-        session_id = None
+        sid = None
 
-        # 1. Try the tracked in-memory ID first
-        if self._current_session_id and self._current_session_id in data:
-            session_id = self._current_session_id
+        # 1. Explicit session_id takes priority — use it as-is (new or existing)
+        if session_id:
+            sid = session_id
 
-        # 2. Create brand-new entry if no tracked session
-        if not session_id:
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            session_id = f"chat_{timestamp}"
+        # 2. Try the tracked in-memory ID (backward compat for old CLI usage)
+        if not sid and self._current_session_id and self._current_session_id in data:
+            sid = self._current_session_id
+
+        # 3. Create brand-new entry
+        if not sid:
+            sid = f"chat_{time.strftime('%Y-%m-%d %H:%M:%S')}"
 
         # Preserve the original timestamp for existing sessions
-        timestamp = data.get(session_id, {}).get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S"))
+        timestamp = data.get(sid, {}).get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S"))
 
-        # Track for next call
-        self._current_session_id = session_id
+        # Track for next call (backward compat for old CLI usage)
+        self._current_session_id = sid
 
-        data[session_id] = {
+        data[sid] = {
             "timestamp": timestamp,
+            "workspace": workspace,
             "preview": preview,
             "messages": conversation_history,
         }
@@ -159,8 +169,13 @@ class SessionManager:
         """Set the current session ID (used when resuming an existing session)."""
         self._current_session_id = session_id
 
+    def get_workspace(self, session_id: str) -> Optional[str]:
+        """Return the stored workspace for a session, or None."""
+        data = self._load_all()
+        return data.get(session_id, {}).get("workspace")
+
     def list_sessions(self) -> List[Dict[str, str]]:
-        """List all sessions with their IDs, timestamps, and previews."""
+        """List all sessions with their IDs, timestamps, workspaces, and previews."""
         data = self._load_all()
         sessions = []
         for sid in sorted(data.keys(), reverse=True):
@@ -169,6 +184,7 @@ class SessionManager:
                 {
                     "id": sid,
                     "timestamp": session.get("timestamp", "unknown"),
+                    "workspace": session.get("workspace", ""),
                     "preview": session.get("preview", ""),
                 }
             )

@@ -25,6 +25,7 @@ stealth = [
 
 [project.scripts]
 kairos = "kairos.main:main"
+kairos-serve = "kairos.main_gateway:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
