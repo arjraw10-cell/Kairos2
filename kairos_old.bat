@@ -1,2 +1,2 @@
 @echo off
-py C:\Users\arjra\Documents\Agent2\Kairos\main.py
+py -m kairos.main
