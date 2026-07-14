@@ -11,6 +11,7 @@ Kairos is a minimal coding agent written in Python. It uses the OpenAI chat comp
 ```
 Agent2/
 ├── main.py                 # Root entry point (imports from kairos.main)
+├── temp.py                 # Headless agent runner — run_agent(prompt) with no CLI
 ├── .env                    # Environment configuration (API keys)
 ├── .env.example            # Template for .env file
 ├── requirements.txt        # Python dependencies
@@ -28,7 +29,7 @@ Agent2/
     ├── main.py             # CLI REPL loop, signal handlers, auto-save, paste resolution
     ├── config.py           # Lazy .env loading via lru_cache
     ├── agent.py            # Core agent: streaming, tool dispatch, compaction, error handling
-    ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling
+    ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling, KairosMarkdown for enhanced table rendering
     ├── tokens.py           # TokenCounter using tiktoken
     ├── terminal_manager.py # Terminal lifecycle (background + blocking)
     ├── browser_manager.py  # Playwright/CloakBrowser in dedicated worker thread + CDP cross-origin iframe support
@@ -64,6 +65,27 @@ if __name__ == "__main__":
 ### `kairos/__init__.py`
 
 Exports: `Config`, `Agent`, `ToolResult`, `SessionManager`, `SkillManager`, `TerminalManager`, `BrowserManager`.
+
+### `temp.py` — Headless Agent Runner
+
+Run one or many agents without the CLI. Supports single runs and concurrent execution via `ThreadPoolExecutor`:
+
+```python
+from temp import run_agent, run_agents
+
+# Single agent
+response = run_agent("read and summarize /path/to/file.py")
+
+# Multiple agents running concurrently
+prompts = ["task 1", "task 2", "task 3"]
+responses = run_agents(prompts, max_workers=5)  # returns list in same order
+```
+
+**Functions**:
+- `run_agent(prompt, workspace=r"C:\Users\arjra") -> str` — single agent, blocks until done
+- `run_agents(prompts, max_workers=5) -> list[str]` — runs all prompts in parallel threads, returns responses in input order
+
+Each agent gets its own `Agent` instance (separate conversation history, terminal, browser). Can also be run directly: `python temp.py "your prompt"` or `python temp.py` to run the built-in template loop.
 
 ### `kairos/config.py` — Config
 
@@ -109,11 +131,15 @@ Lazy-loads `.env` on first access via `python-dotenv`. Uses `@lru_cache(maxsize=
 6. Auto-save after each exchange (all saves go through `_save_now()` which holds `_auto_save_lock` to prevent race conditions with the auto-save thread)
 
 **Resume sanitization** (`_sanitize_history_for_resume(history)`):
-- Walks backward through saved history to find the last clean agent response (an `assistant` message *without* `tool_calls`)
-- Skips dirty messages: `tool` results, `assistant` messages with `tool_calls` (incomplete execution), and user screenshot injection messages (`[Screenshot captured ...]`)
-- Returns `(sanitized_history, last_agent_content)` on success, or `(None, "")` if no clean response exists
-- On resume, the last agent message is displayed in a green panel so the user can see where the conversation left off
-- If a chat was interrupted mid-execution (no clean agent response), a warning is shown and the chat is skipped
+- Walks backward through saved history to find the last resumable point — either a clean agent response or a mid-execution state
+- Pass 1 (normal resume): finds the last clean `assistant` message *without* `tool_calls`, skipping `tool` results, dirty `assistant` messages, and screenshot injection messages
+- Pass 2 (mid-execution resume): if no clean response exists, cleans up incomplete tool chains:
+  - If history ends with `assistant(tool_calls)` with no results: adds synthetic `"execution interrupted"` tool results so the API sees valid message ordering
+  - If history ends with partial tool results: adds synthetic results for missing `tool_call_id`s to complete the chain
+  - Handles orphaned tool results by stripping them
+- Returns `(sanitized_history, last_agent_content, is_mid_execution)` — `(None, "", False)` if no resumable state exists
+- On normal resume, the last agent message is displayed in a green panel
+- On mid-execution resume, the agent is auto-continued with "Continue where you left off. Pick up the next step." — the agent sees its own incomplete work with synthetic error results and picks up naturally
 
 **Helper**: `_is_screenshot_injection(msg)` — detects user messages that are agent-injected screenshots (content array starting with `[Screenshot captured ...`) vs real user messages.
 
@@ -125,6 +151,7 @@ agent.on_stream_token = cli.on_stream_token
 agent.on_stream_end = _on_stream_end  # Finalizes as green response or grey thinking trace
 agent.on_token_update = lambda tc: cli.print_token_status(tc)
 agent.on_compact = lambda msg: cli.print_info(msg)
+agent.on_background_notification = cli.print_background_notification
 # Sub-agent visibility:
 agent.subagent_tool._tool_printer = lambda summary: cli.console.print(f"  ↓ subagent: {summary}")
 agent.subagent_tool._stream_start = lambda: cli.start_stream()
@@ -134,12 +161,14 @@ agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream
 
 ### `kairos/agent.py` — Agent (Core)
 
+**Background terminal notifications**: `Agent` retains completed background-terminal events in the manager queue. While `Agent.run()` is processing, completions display immediately through `on_background_notification`; while idle they stay quiet and are shown when the next request drains them. They are inserted as a separate user message after the next real user message (or before the next API step if the agent is still working). Notification output is capped by the terminal manager.
+
 **Class**: `Agent`
 
 **Constructor**: `Agent(workspace: str)`
 - Creates `OpenAI` client from config
 - Sets `self.cwd = Path(workspace).resolve()`
-- Initializes all 29 tool instances
+- Initializes all 40 tool instances
 - Calls `_setup_system_prompt()` which builds the system prompt and initializes `conversation_history`
 
 **Key attributes**:
@@ -150,19 +179,21 @@ agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream
 - `self.conversation_history` — `List[Dict]` (starts with system prompt)
 - `self._interrupt_event` — `threading.Event` for Ctrl+C
 - `self._stop_requested` — `bool` for Escape
+- `self._is_processing` — guarded request-state flag used to decide whether background completions are displayed immediately
 - `self._is_subagent` — `bool` (True = no browser/subagent tools)
 - `self.terminal_manager` — `TerminalManager` instance
 - `self.browser_manager` — `BrowserManager` instance
 - `self.subagent_tool` — `SubAgentTool` instance (None if sub-agent)
 - `self.skill_manager` — `SkillManager` instance
 
-**Callbacks** (set by `main.py`):
+**Callbacks** (set by `main.py`; the background notification callback is optional):
 - `on_tool_call(name: str, args: dict) -> None`
 - `on_stream_start() -> None`
 - `on_stream_token(token: str) -> None`
 - `on_stream_end(content: str, has_tool_calls: bool) -> None`
 - `on_token_update(counter: TokenCounter) -> None`
 - `on_compact(status_msg: str) -> None`
+- `on_background_notification(message: str) -> None` — visible completion notice while processing; idle notices remain queued until the next request
 
 #### System Prompt (`_setup_system_prompt`)
 
@@ -234,8 +265,8 @@ The main agent loop:
    - Checks `_should_stop()` (Escape) between steps
    - Auto-compacts if context > 80%
    - Calls `step()`
-   - **Empty response retry**: If `step()` returns no content and no tool calls (API returned nothing), removes the empty assistant message from history (to prevent consecutive assistant messages), then retries the same call up to 2 times with a status message before giving up. This handles transient API issues where the model returns an empty response.
-   - Returns when: final response received, no tool calls (after retries exhausted), interrupt, or graceful stop (Escape)
+   - **Empty response retry**: If `step()` returns no content AND no tool calls, removes the assistant message from history and retries up to 2 times. This handles transient API issues where the model returns empty responses.
+   - Returns when: final response received (3+ words or tool calls), no tool calls (after retries exhausted), interrupt, or graceful stop (Escape)
 3. Returns `"[Interrupted]"` on `InterruptedError`
 
 #### Compaction
@@ -287,6 +318,14 @@ Called before every API request in `step()`. Handles two structural problems tha
 
 ### `kairos/cli.py` — CLI (Terminal UI)
 
+**Classes**: `CLI`, `KairosMarkdown`, `_EnhancedTableElement`
+
+**`KairosMarkdown`** (subclass of `rich.markdown.Markdown`):
+Replaces the default Rich markdown table rendering with an enhanced version. Uses a custom `_EnhancedTableElement` registered via `elements` dict override to swap in `box.ROUNDED` borders, bold white headers on a subtle dark background (`grey15`), alternating row shading (`dim` on even rows), and cyan border styling. All other markdown elements (headings, code blocks, lists, etc.) fall through to Rich's default renderer unchanged.
+
+**`_EnhancedTableElement`** (module-level, replaces `TableElement` for `"table_open"` tokens):
+A `MarkdownElement` subclass that yields a `rich.table.Table` with `box.ROUNDED`, `border_style="cyan"`, `header_style="bold bright_white on grey15"`, `row_styles=["", "dim"]`, and `show_edge=True`. Implements the full `MarkdownElement` protocol (`create`, `on_child_close`, `on_enter`, `on_leave`, `__rich_console__`) so it integrates cleanly with Rich 15's `markdown-it-py` based parser.
+
 **Class**: `CLI`
 
 **Constructor**: Creates `Console` (from rich), `PromptSession` (from prompt_toolkit), initializes thinking/stream state.
@@ -302,7 +341,7 @@ Called before every API request in `step()`. Handles two structural problems tha
 - `start_stream()` — stops thinking, creates `Live` panel with grey border and italic dim text
 - `on_stream_token(token)` — appends to `_stream_text`, updates live panel
 - `finish_stream()` — stops live panel, returns text
-- `finalize_stream_as_response()` — upgrades live panel to green border with Markdown rendering, sets `_skip_print_response = True`
+- `finalize_stream_as_response()` — upgrades live panel to green border with `KairosMarkdown` rendering, sets `_skip_print_response = True`
 
 **Paste system** (module-level):
 - `_paste_registry: Dict[str, dict]` — maps token strings to `{type: "text"|"image", ...}`
@@ -354,18 +393,26 @@ Called before every API request in `step()`. Handles two structural problems tha
 **Class**: `TerminalManager`
 
 **`create_terminal(background: bool) -> int`**:
-- Background: spawns persistent shell (`cmd /k` on Windows, `bash --login` on Unix), starts reader thread
-- Blocking: no process created (uses `subprocess.run` per command)
-- Returns terminal ID (auto-incrementing int)
+- Background: persistent shell (`cmd /Q /k` on Windows, `bash --login` on Unix), reader thread, shell state preserved; command echo is suppressed while each wrapped command runs and its exit code is captured before wrapper commands alter it
+- Blocking: no persistent process; each command gets its own subprocess
+- Returns an auto-incrementing terminal ID
 
-**`execute_command(terminal_id, command, timeout?, is_background?)`**:
-- Background: writes command to process stdin, returns "Command sent to background terminal"
-- Blocking: `subprocess.run(command, shell=True, timeout=timeout)`, returns stdout+stderr
-- Validates `is_background` matches terminal type
+**`execute_command(terminal_id, command, timeout?, is_background?)`** (schema requires `timeout` whenever `is_background` is false):
+- Background: submits immediately with an internal completion marker; timeout is ignored
+- Blocking: requires a finite positive timeout, caps it at 20 seconds, rejects invalid values before spawning, captures output, and kills the process tree on timeout
+- Timeout errors report the effective capped value; process-tree cleanup prevents child processes from keeping pipes open after a timeout
+- Non-zero blocking exit codes are failures
+- Validates `is_background` matches the terminal type
 
-**`read_logs(terminal_id, start_line, end_line?)`**: Returns lines from background terminal's output buffer (1-indexed).
+**Background completion notifications**:
+- Completion events stay in a thread-safe FIFO queue via `drain_completed_background_commands()` for the next agent API turn, including when no UI callback is configured
+- `set_completion_callback()` can notify the CLI immediately without consuming the queue
+- Notifications include terminal ID, command, exit status, duration, and output capped at 12,000 characters; `read_logs()` retains complete output
+- The persistent terminal stays open after command completion
 
-**`close_terminal(terminal_id)`**: Terminates process (terminate → wait 5s → kill → wait 2s), removes from dict.
+**`read_logs(terminal_id, start_line, end_line?)`**: Returns background output by 1-indexed line range.
+
+**`close_terminal(terminal_id)`**: Terminates the background process tree, marks pending commands failed, and removes the terminal.
 
 All shared state is protected by `threading.Lock`.
 
@@ -421,7 +468,7 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 - `go_back()` / `go_forward()` / `reload()` — navigation history, clear active frame
 - `scroll(direction?, pages?)` — scroll page using `page.mouse.wheel()` by viewport heights. `direction="down"|"up"`, `pages=1.0` (full viewport)
 - `wait(seconds?)` — sleep for up to 30 seconds to let animations/AJAX complete
-- `wait_for(selector?, text?, timeout?)` — wait for a specific element to become visible or text to appear (uses Playwright's built-in wait mechanisms, much more efficient than blind waiting)
+- `wait_for(selector?, text?, timeout?)` — wait for a specific element to become visible or text to appear (uses Playwright's built-in wait mechanisms for selectors; for text, polls every 0.5s until timeout). Much more efficient than blind waiting.
 - `send_keys(keys)` — send keyboard shortcut via `page.keyboard.press()` (e.g. "Enter", "Tab", "Control+a")
 - `hover(selector)` — hover over an element to trigger hover states (dropdown menus, tooltips, hover cards). Uses Playwright's `locator.hover()` with text fallback.
 - `hover_by_index(index)` — hover by snapshot index (PREFERRED)
@@ -447,7 +494,7 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 - Frame references are cleared on `navigate()`, `go_back()`, `go_forward()`, and `reload()` (both `_active_frame` and `_active_frame_type`).
 - `_post_action(result, pre_fingerprint?, is_navigation?)` — common post-action hook; optionally takes screenshot+snapshot after any interaction.
 - `_detect_new_tab(tabs_before_count)` — compares `len(self._pages)` before/after an action.
-- Snapshot elements are cached in `_last_snapshot_elements` after each `snapshot()` call.
+- Snapshot elements are cached in `_last_snapshot_elements` after each `snapshot()` call. Cache is invalidated on `navigate()`, `go_back()`, `go_forward()`, `reload()`, and `switch_tab()` to prevent stale element references across page changes.
 - CDP support via `self._cdp` (CDPManager instance): used in `snapshot()` for cross-origin iframe a11y content, in `switch_frame()` for cross-origin frame detection, and in `close_tab()` to invalidate stale sessions.
 
 **Snapshot JS** (`_SNAPSHOT_JS`): Extracts:
@@ -518,7 +565,7 @@ class EditTool:
 ```python
 class SearchTool:
     SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox",
-                 ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs", "*.egg-info"}
+                 ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs"}
     
     def __call__(self, pattern: str, path: Optional[str] = None,
                  include: Optional[str] = None, max_results: int = 50) -> ToolResult:
@@ -655,9 +702,9 @@ class SessionManager:
 - Returns `{}` if completely unrecoverable
 
 **`_save_all()`** — atomic writer:
-- Writes to a temp file in the same directory, then `fsync()`s, then atomically replaces the target via `os.replace()` with a 3-attempt retry loop (handles transient PermissionError from antivirus/indexers on Windows)
-- Prevents file corruption from interrupted writes (Ctrl+C, crash, power loss) — the target file is only replaced after the full write succeeds
-- Cleans up the temp file on failure
+- Writes to a temp file in the same directory, then `fsync()`s, then atomically replaces the target via `os.replace()` with a 5-attempt retry loop (handles transient PermissionError from antivirus/indexers/OneDrive on Windows, with 100–500ms exponential backoff)
+- If all atomic replace attempts fail, falls back to direct file write (non-atomic) to avoid crashing — the temp file with full data remains available for manual recovery
+- Prevents file corruption from interrupted writes (Ctrl+C, crash, power loss) in the common case
 
 **`save_chat()`** deduplication strategy:
 1. If `_current_session_id` set and exists on disk → update it

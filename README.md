@@ -14,13 +14,14 @@ A minimal personal coding agent in Python.
 - **Skills**: Self-extensible skill system — agent can create/load skills stored as `SKILL.md` files in `skills/` directory
 - **Paste System**: Text pastes are detected automatically via bracketed paste (modern terminals wrap pasted text in escape sequences, making it arrive as one atomic chunk). Alt+V pastes images from the clipboard. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content.
 - **Chat Persistence**: All sessions saved to `chats/chats.json` with auto-save every 60 seconds and on window close. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions. **Atomic writes** via temp-file + rename prevent corruption from interrupted saves. **Corruption recovery** auto-heals damaged files by parsing up to the last valid JSON boundary.
-- **`/resume`**: Load previous chats via numbered picker — only resumes from completed agent responses (mid-execution chats with incomplete tool calls are rejected with a warning)
+- **`/resume`**: Load previous chats via numbered picker — resumes from completed agent responses normally, OR automatically resumes mid-execution chats (incomplete tool calls are completed with synthetic error results, then the agent is auto-continued with "Continue where you left off")
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
 - **Streaming Display**: Real-time tokens in a live-updating panel (grey for thinking, green for final response)
 - **Tool Summaries**: One-line display when tools are called (e.g., `read file: /path`)
 - **Dual Interrupt**: Ctrl+C hard-interrupts mid-step; Escape gracefully stops after the current step finishes
+- **Responsive Terminals**: Blocking commands require a finite positive timeout capped at 20 seconds; background commands return immediately, preserve shell state, stay alive after completion, and notify the CLI/agent asynchronously with capped output
 - **OpenAI Compatible**: Works with any OpenAI-compatible API (OpenRouter, local models, etc.)
-- **Clean CLI**: Terminal UI with `rich` and `prompt_toolkit`
+- **Clean CLI**: Terminal UI with `rich` and `prompt_toolkit`, including enhanced table rendering with rounded boxes, bold headers, and alternating row shading
 
 ## Installation
 
@@ -56,7 +57,25 @@ Any OpenAI-compatible endpoint works — just change `OPENAI_BASE_URL`.
 ```bash
 python main.py                   # cwd as workspace
 python main.py /path/to/project  # specific workspace
+python temp.py "read and summarize /path/to/file.py"  # headless, no CLI
 ```
+
+### Headless Usage (temp.py)
+
+For scripting or running agent tasks without the interactive REPL:
+
+```python
+from temp import run_agent, run_agents
+
+# Single agent
+response = run_agent("list all Python files in C:/Users/arjra/myproject")
+
+# Multiple agents running concurrently
+prompts = ["task 1", "task 2", "task 3"]
+responses = run_agents(prompts, max_workers=5)  # all run at once, returns in order
+```
+
+Workspace defaults to `C:\Users\arjra`. Edit the `tasks` list in `main()` and run `python temp.py` to execute the template loop, or pass a single prompt from CLI: `python temp.py "your prompt"`.
 
 ### REPL Commands
 
@@ -95,10 +114,12 @@ python main.py /path/to/project  # specific workspace
 | Tool | Description |
 |------|-------------|
 | `new_terminal(background)` | Create a terminal — `true` for persistent shell, `false` for one-shot |
-| `execute_command(terminal_id, command, timeout?, is_background?)` | Run a command in a terminal |
+| `execute_command(terminal_id, command, timeout?, is_background?)` | Run a command in a terminal. The schema requires `timeout` when `is_background` is false; blocking timeouts are finite positive values capped at 20 seconds, while background terminals return immediately, ignore timeout, and report completion asynchronously. |
 | `read_logs(terminal_id, start_line, end_line?)` | Read output from a background terminal by line numbers |
 | `close_terminal(terminal_id)` | Close a terminal and release resources |
 | `get_terminal_info(terminal_id)` | Get terminal status (ID, type, closed status, line count) |
+
+Blocking terminal commands are capped at a 20-second timeout and terminate their process tree on timeout; a missing, non-positive, non-finite, or invalid timeout is rejected immediately, before spawning the command process. Background terminal commands are submitted asynchronously to a persistent shell, preserving shell state between commands, suppressing wrapper command echo, and preserving each command's exit status. When a background command finishes while Kairos is processing, it shows a visible notification immediately and queues the capped output for the next API turn. The completion queue is retained even when no CLI callback is configured, so headless agents still receive notifications in their next API turn. If Kairos is idle, the completion is held quietly and shown after the next user message. The terminal remains open, and full output is still available through `read_logs`.
 
 ### Sub-Agent Tools
 
@@ -177,11 +198,12 @@ Browser features:
 
 ```
 main.py                     # Entry point
+temp.py                     # Headless agent runner — run_agent(prompt) with no CLI
 kairos/
 ├── main.py                 # CLI REPL loop, signal handlers, auto-save
 ├── config.py               # Lazy .env loading (OPENAI_API_KEY, BASE_URL, MODEL)
 ├── agent.py                # Core agent loop, streaming, compaction, tool dispatch
-├── cli.py                  # Terminal UI (streaming panels, thinking dots, paste handling)
+├── cli.py                  # Terminal UI (streaming panels, thinking dots, paste handling, enhanced table rendering)
 ├── tokens.py               # Token counting with tiktoken (session/context/turn)
 ├── terminal_manager.py     # Terminal lifecycle (background shells, blocking subprocesses)
 ├── browser_manager.py      # Playwright/CloakBrowser lifecycle in a dedicated worker thread + CDP cross-origin iframe support + smart auto-snapshot
@@ -204,7 +226,7 @@ kairos/
 
 ### Streaming
 
-Tokens are streamed in real-time. During the agent's reasoning phase, a grey panel updates live. When a final response is reached, it transitions to a green panel rendered as Markdown. Tool call thinking stays as a grey trace.
+Tokens are streamed in real-time. During the agent's reasoning phase, a grey panel updates live. When a final response is reached, it transitions to a green panel rendered as Markdown with enhanced table styling (rounded boxes, bold headers, alternating rows). Tool call thinking stays as a grey trace.
 
 ### Compaction
 

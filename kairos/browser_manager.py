@@ -549,6 +549,7 @@ class BrowserManager:
             return "No active page. Launch the browser first."
         self._active_frame = None
         self._active_frame_type = None
+        self._last_snapshot_elements = []
 
         def _do():
             resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -577,6 +578,7 @@ class BrowserManager:
             return "No active page."
         self._active_frame = None
         self._active_frame_type = None
+        self._last_snapshot_elements = []
         try:
             url = self._worker.dispatch(
                 lambda: (page.go_back(wait_until="domcontentloaded"), page.url)[1],
@@ -593,6 +595,7 @@ class BrowserManager:
             return "No active page."
         self._active_frame = None
         self._active_frame_type = None
+        self._last_snapshot_elements = []
         try:
             url = self._worker.dispatch(
                 lambda: (page.go_forward(wait_until="domcontentloaded"), page.url)[1],
@@ -608,6 +611,7 @@ class BrowserManager:
         if not page:
             return "No active page."
         self._active_frame = None
+        self._last_snapshot_elements = []
         try:
             url = self._worker.dispatch(
                 lambda: (page.reload(wait_until="domcontentloaded"), page.url)[1],
@@ -676,7 +680,8 @@ class BrowserManager:
         if not selector and not text:
             return "Must provide either selector or text to wait for."
         fp = self._capture_fingerprint()
-        timeout_ms = min(max(timeout, 1), 30) * 1000
+        timeout_s = min(max(timeout, 1), 30)
+        timeout_ms = timeout_s * 1000
         try:
             if selector:
 
@@ -685,19 +690,33 @@ class BrowserManager:
                         selector, state="visible", timeout=timeout_ms
                     )
 
-                self._worker.dispatch(_do_wait, timeout=timeout // 1 + 10)
+                self._worker.dispatch(_do_wait, timeout=timeout_s + 10)
                 result = f"Element '{selector}' appeared on page"
             else:
+                # Poll in a loop with short sleeps so we detect text
+                # as soon as it appears instead of checking once and failing.
+                poll_interval = 0.5  # seconds between checks
+                elapsed = 0.0
 
-                def _do_wait_text():
-                    found = target.evaluate(
+                def _check_text():
+                    return target.evaluate(
                         "text => document.body.innerText.includes(text)", text
                     )
-                    if not found:
-                        raise Exception(f"Text '{text}' not found")
 
-                self._worker.dispatch(_do_wait_text, timeout=timeout // 1 + 10)
-                result = f"Text '{text}' found on page"
+                while elapsed < timeout_s:
+                    try:
+                        found = self._worker.dispatch(_check_text, timeout=5)
+                    except Exception:
+                        found = False
+                    if found:
+                        break
+                    _time.sleep(min(poll_interval, timeout_s - elapsed))
+                    elapsed += poll_interval
+
+                if elapsed < timeout_s:
+                    result = f"Text '{text}' found on page"
+                else:
+                    result = f"Timed out waiting ({timeout_s}s) for text: {text}"
         except Exception as e:
             err_str = str(e)
             if (
@@ -706,7 +725,7 @@ class BrowserManager:
                 or "not found" in err_str.lower()
             ):
                 target_desc = selector or text
-                result = f"Timed out waiting ({timeout}s) for: {target_desc}"
+                result = f"Timed out waiting ({timeout_s}s) for: {target_desc}"
             else:
                 result = f"wait_for failed: {e}"
         return self._post_action(result, pre_fingerprint=fp)
@@ -1763,6 +1782,7 @@ class BrowserManager:
     def switch_tab(self, index=None, url_pattern=None) -> str:
         if not self._pages:
             return "No tabs open."
+        self._last_snapshot_elements = []
 
         def _get_tab_title(page):
             try:

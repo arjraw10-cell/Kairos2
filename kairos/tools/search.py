@@ -13,7 +13,7 @@ class SearchTool:
     SKIP_DIRS = {
         ".git", "__pycache__", "node_modules", ".venv", "venv",
         ".tox", ".mypy_cache", ".pytest_cache", "dist", "build",
-        ".eggs", "*.egg-info",
+        ".eggs",
     }
 
     def __call__(

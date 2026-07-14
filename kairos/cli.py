@@ -9,12 +9,82 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from rich.console import Console
+from rich.console import Console, ConsoleOptions, RenderResult
 from rich.panel import Panel
-from rich.markdown import Markdown
+from rich.markdown import Markdown, MarkdownElement, MarkdownContext, TableElement as _BaseTableElement
 from rich.syntax import Syntax
 from rich.text import Text
 from rich.live import Live
+from rich.table import Table
+from rich import box
+
+
+class _EnhancedTableElement(MarkdownElement):
+    """TableElement replacement that renders markdown tables with rounded boxes,
+    bold headers on a subtle background, and alternating row shading."""
+
+    def __init__(self) -> None:
+        self.header = None
+        self.body = None
+
+    @classmethod
+    def create(cls, markdown, token):
+        return cls()
+
+    def on_child_close(self, context: MarkdownContext, child: MarkdownElement) -> bool:
+        from rich.markdown import TableHeaderElement, TableBodyElement
+        if isinstance(child, TableHeaderElement):
+            self.header = child
+        elif isinstance(child, TableBodyElement):
+            self.body = child
+        else:
+            raise RuntimeError("Couldn't process markdown table.")
+        return False
+
+    def on_enter(self, context: MarkdownContext) -> None:
+        pass
+
+    def on_leave(self, context: MarkdownContext) -> None:
+        pass
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        table = Table(
+            box=box.ROUNDED,
+            pad_edge=False,
+            border_style="cyan",
+            show_edge=True,
+            collapse_padding=True,
+            header_style="bold bright_white on grey15",
+            row_styles=["", "dim"],
+            title_style="bold cyan",
+        )
+
+        if self.header is not None and self.header.row is not None:
+            for column in self.header.row.cells:
+                heading = column.content.copy()
+                heading.stylize("markdown.table.header")
+                table.add_column(heading)
+
+        if self.body is not None:
+            for row in self.body.rows:
+                row_content = [element.content for element in row.cells]
+                table.add_row(*row_content)
+
+        yield table
+
+
+class KairosMarkdown(Markdown):
+    """Enhanced Markdown renderer with polished table rendering.
+
+    Replaces the default ``TableElement`` with a version that uses rounded
+    boxes, bold headers on a subtle dark background, and alternating row
+    shading for better readability.
+    """
+
+    elements = dict(Markdown.elements)
+    elements["table_open"] = _EnhancedTableElement
 from prompt_toolkit import PromptSession
 from prompt_toolkit.styles import Style
 from prompt_toolkit.formatted_text import HTML
@@ -349,6 +419,17 @@ class CLI:
     def print_info(self, message: str):
         self.console.print(f"[cyan]Info:[/cyan] {message}")
 
+    def print_background_notification(self, message: str):
+        """Show a completed background command without hiding its details."""
+        self.console.print(
+            Panel(
+                message,
+                border_style="yellow",
+                title="Background terminal",
+                padding=(0, 1),
+            )
+        )
+
     def print_error(self, message: str):
         if "\n" in message:
             self.console.print(
@@ -430,7 +511,7 @@ class CLI:
         text = self._stream_text
         if self._live:
             try:
-                display = Markdown(text) if text else Text("")
+                display = KairosMarkdown(text) if text else Text("")
             except Exception:
                 display = text or ""
             self._live.update(Panel(display, border_style="green", padding=(1, 2)))
@@ -469,7 +550,7 @@ class CLI:
 
     def print_response(self, content: str):
         try:
-            md = Markdown(content)
+            md = KairosMarkdown(content)
             self.console.print(Panel(md, border_style="green", padding=(1, 2)))
         except Exception:
             self.console.print(Panel(content, border_style="green", padding=(1, 2)))

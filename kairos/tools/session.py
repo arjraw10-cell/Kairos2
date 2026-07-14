@@ -78,17 +78,25 @@ class SessionManager:
                 tmp_f.flush()
                 os.fsync(tmp_f.fileno())
             # Atomic replace via os.replace() — works on both Windows and Unix
-            # without requiring exclusive file access. Retry briefly on
-            # PermissionError (transient locks from antivirus / indexer).
-            for attempt in range(3):
+            # without requiring exclusive file access. Retry on
+            # PermissionError (transient locks from antivirus / indexer / OneDrive).
+            for attempt in range(5):
                 try:
                     os.replace(tmp_path, str(path))
                     break
                 except PermissionError:
-                    if attempt < 2:
-                        time.sleep(0.05 * (attempt + 1))  # 50ms, 100ms backoff
+                    if attempt < 4:
+                        time.sleep(0.1 * (attempt + 1))  # 100ms, 200ms, 300ms, 400ms, 500ms
                     else:
-                        raise
+                        # Fallback: write directly to target file (not atomic, but
+                        # better than crashing — temp file with full data is still
+                        # available for manual recovery).
+                        with open(tmp_path, "r", encoding="utf-8") as src:
+                            content = src.read()
+                        with open(str(path), "w", encoding="utf-8") as dst:
+                            dst.write(content)
+                            dst.flush()
+                            os.fsync(dst.fileno())
         except BaseException:
             # Clean up temp file on failure
             try:

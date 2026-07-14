@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kairos — Let's Build</title>
+  <style>
+    /* ===== RESET & BASE ===== */
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg-app: #0d0d0d;
+      --bg-sidebar: #141414;
+      --bg-main: #111111;
+      --bg-input: #1a1a1a;
+      --bg-input-border: #2a2a2a;
+      --bg-hover: #1e1e1e;
+      --bg-thread-active: #1c1c1c;
+      --text-primary: #e8e8e8;
+      --text-secondary: #888888;
+      --text-muted: #555555;
+      --text-dim: #666666;
+      --accent-blue: #4a9eff;
+      --accent-green: #34d399;
+      --border-subtle: #1e1e1e;
+      --sidebar-width: 280px;
+      --titlebar-height: 38px;
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto, sans-serif;
+      --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    }
+
+    html, body {
+      height: 100%;
+      font-family: var(--font-sans);
+      background: var(--bg-app);
+      color: var(--text-primary);
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* ===== LAYOUT ===== */
+    .app {
+      display: flex;
+      height: 100vh;
+      width: 100vw;
+    }
+
+    /* ===== TITLE BAR (macOS style) ===== */
+    .titlebar {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: var(--titlebar-height);
+      background: var(--bg-sidebar);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      z-index: 100;
+      -webkit-app-region: drag;
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .traffic-lights {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      -webkit-app-region: no-drag;
+    }
+
+    .traffic-light {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .traffic-light:hover { opacity: 0.8; }
+    .tl-close { background: #ff5f57; }
+    .tl-minimize { background: #febc2e; }
+    .tl-maximize { background: #28c840; }
+
+    /* ===== SIDEBAR ===== */
+    .sidebar {
+      width: var(--sidebar-width);
+      min-width: var(--sidebar-width);
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      padding-top: var(--titlebar-height);
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+
+    .sidebar::-webkit-scrollbar { width: 4px; }
+    .sidebar::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+    .sidebar::-webkit-scrollbar-track { background: transparent; }
+
+    .sidebar-top {
+      padding: 12px 12px 8px 12px;
+    }
+
+    .sidebar-btn {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      color: var(--text-primary);
+      font-size: 13.5px;
+      font-weight: 400;
+      transition: background 0.12s;
+      border: none;
+      background: none;
+      width: 100%;
+      text-align: left;
+    }
+    .sidebar-btn:hover { background: var(--bg-hover); }
+
+    .sidebar-btn .icon {
+      width: 18px; height: 18px;
+      display: flex; align-items: center; justify-content: center;
+      opacity: 0.7;
+    }
+
+    .sidebar-btn .icon svg {
+      width: 16px; height: 16px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    /* Threads section */
+    .threads-header {
+      padding: 16px 16px 6px 16px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+
+    .thread-group {
+      padding: 0 8px;
+    }
+
+    .thread-group-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      cursor: pointer;
+      border-radius: 6px;
+      transition: background 0.12s;
+    }
+    .thread-group-header:hover { background: var(--bg-hover); }
+
+    .thread-group-header .folder-icon {
+      width: 16px; height: 16px;
+      opacity: 0.5;
+    }
+
+    .thread-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 12px 5px 36px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      border-radius: 6px;
+      transition: background 0.12s;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .thread-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+    .thread-item .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--accent-blue);
+      flex-shrink: 0;
+    }
+    .thread-item .no-dot { width: 7px; flex-shrink: 0; }
+
+    /* ===== MAIN CONTENT ===== */
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      padding-top: var(--titlebar-height);
+      background: var(--bg-main);
+      position: relative;
+    }
+
+    .main-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 20px;
+      border-bottom: 1px solid var(--border-subtle);
+      min-height: 44px;
+    }
+
+    .main-header-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+
+    .main-header-actions {
+      display: flex;
+      gap: 4px;
+    }
+
+    .header-icon-btn {
+      width: 32px; height: 32px;
+      display: flex; align-items: center; justify-content: center;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.12s;
+      border: none;
+      background: none;
+      color: var(--text-secondary);
+    }
+    .header-icon-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+    .header-icon-btn svg {
+      width: 18px; height: 18px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    /* ===== WELCOME CENTER ===== */
+    .welcome {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      padding-bottom: 80px;
+    }
+
+    .welcome-logo {
+      width: 64px; height: 64px;
+      border-radius: 50%;
+      border: 2px solid #333;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+    }
+
+    .welcome-logo svg {
+      width: 36px; height: 36px;
+      stroke: var(--text-primary);
+      fill: none;
+      stroke-width: 1.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .welcome-text {
+      font-size: 28px;
+      font-weight: 600;
+      color: var(--text-primary);
+      letter-spacing: -0.3px;
+    }
+
+    .project-selector {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      background: #1e1e1e;
+      border: 1px solid #2a2a2a;
+      border-radius: 20px;
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--text-secondary);
+      transition: background 0.12s, border-color 0.12s;
+      margin-top: 4px;
+    }
+    .project-selector:hover {
+      background: #252525;
+      border-color: #3a3a3a;
+    }
+
+    .project-selector .folder-icon {
+      width: 14px; height: 14px;
+      opacity: 0.6;
+    }
+
+    .project-selector .chevron {
+      width: 12px; height: 12px;
+      opacity: 0.5;
+      margin-left: 2px;
+    }
+
+    /* ===== INPUT AREA ===== */
+    .input-area {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      padding: 0 24px 18px 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .input-container {
+      width: 100%;
+      max-width: 720px;
+      background: var(--bg-input);
+      border: 1px solid var(--bg-input-border);
+      border-radius: 16px;
+      padding: 14px 16px 10px 16px;
+      transition: border-color 0.2s;
+    }
+    .input-container:focus-within {
+      border-color: #3a3a3a;
+    }
+
+    .input-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+    }
+
+    .input-field {
+      flex: 1;
+      background: none;
+      border: none;
+      outline: none;
+      color: var(--text-primary);
+      font-size: 15px;
+      font-family: var(--font-sans);
+      resize: none;
+      min-height: 24px;
+      max-height: 160px;
+      line-height: 1.5;
+      padding: 2px 0;
+    }
+    .input-field::placeholder { color: var(--text-muted); }
+
+    .input-btn {
+      width: 32px; height: 32px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      border: none;
+      transition: background 0.12s, transform 0.1s;
+      flex-shrink: 0;
+    }
+    .input-btn:active { transform: scale(0.94); }
+
+    .btn-plus {
+      background: none;
+      color: var(--text-secondary);
+    }
+    .btn-plus:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+    .btn-send {
+      background: #e8e8e8;
+      color: #111;
+    }
+    .btn-send:hover { background: #ffffff; }
+
+    .btn-plus svg, .btn-send svg {
+      width: 18px; height: 18px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .input-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      max-width: 720px;
+      padding: 8px 4px 0 4px;
+    }
+
+    .env-tabs {
+      display: flex;
+      gap: 12px;
+    }
+
+    .env-tab {
+      font-size: 12px;
+      color: var(--text-dim);
+      cursor: pointer;
+      transition: color 0.12s;
+      padding: 2px 0;
+      border: none;
+      background: none;
+      font-family: var(--font-sans);
+    }
+    .env-tab:hover { color: var(--text-secondary); }
+    .env-tab.active { color: var(--text-primary); }
+
+    .footer-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .settings-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-dim);
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: none;
+      background: none;
+      font-family: var(--font-sans);
+      transition: color 0.12s, background 0.12s;
+    }
+    .settings-btn:hover { color: var(--text-secondary); background: var(--bg-hover); }
+
+    .settings-btn svg {
+      width: 14px; height: 14px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    /* ===== RESPONSIVE ===== */
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .input-area { padding: 0 12px 12px 12px; }
+    }
+  </style>
+</head>
+<body>
+  <!-- TITLE BAR -->
+  <div class="titlebar">
+    <div class="traffic-lights">
+      <div class="traffic-light tl-close"></div>
+      <div class="traffic-light tl-minimize"></div>
+      <div class="traffic-light tl-maximize"></div>
+    </div>
+  </div>
+
+  <div class="app">
+    <!-- SIDEBAR -->
+    <div class="sidebar">
+      <div class="sidebar-top">
+        <button class="sidebar-btn" id="newThreadBtn">
+          <span class="icon">
+            <svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+          </span>
+          New thread
+        </button>
+        <button class="sidebar-btn">
+          <span class="icon">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </span>
+          Automations
+        </button>
+        <button class="sidebar-btn">
+          <span class="icon">
+            <svg viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          </span>
+          Skills
+        </button>
+      </div>
+
+      <div class="threads-header">Threads</div>
+
+      <!-- Codex group -->
+      <div class="thread-group">
+        <div class="thread-group-header">
+          <svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          </svg>
+          Codex
+        </div>
+        <div class="thread-item" style="font-weight: 500; color: var(--text-primary);">
+          <span class="dot"></span>
+          Update home page
+        </div>
+        <div class="thread-item">
+          <span class="no-dot"></span>
+          Scan for security vulnerabilities
+        </div>
+        <div class="thread-item">
+          <span class="no-dot"></span>
+          Implement skills page from design
+        </div>
+      </div>
+
+      <!-- ChatGPT group -->
+      <div class="thread-group">
+        <div class="thread-group-header">
+          <svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          </svg>
+          ChatGPT
+        </div>
+        <div class="thread-item">
+          <span class="no-dot"></span>
+          Add timestamps for each message to u...
+        </div>
+        <div class="thread-item">
+          <span class="no-dot"></span>
+          Add a new football style to Images
+        </div>
+      </div>
+
+      <!-- OpenAI Web group -->
+      <div class="thread-group">
+        <div class="thread-group-header">
+          <svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          </svg>
+          OpenAI Web
+        </div>
+        <div class="thread-item">
+          <span class="no-dot"></span>
+          Add Codex Mini to OpenAI Web
+        </div>
+      </div>
+    </div>
+
+    <!-- MAIN -->
+    <div class="main">
+      <div class="main-header">
+        <div class="main-header-title">New thread</div>
+        <div class="main-header-actions">
+          <button class="header-icon-btn" title="Code view">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+          </button>
+          <button class="header-icon-btn" title="Split view">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- WELCOME -->
+      <div class="welcome">
+        <div class="welcome-logo">
+          <!-- Kairos logo: stylized clock/timer -->
+          <svg viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 8 14"/>
+            <path d="M16.5 17.5l1.5 1.5" opacity="0.5"/>
+          </svg>
+        </div>
+        <div class="welcome-text">Let's build</div>
+        <div class="project-selector">
+          <svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          </svg>
+          Kairos
+          <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </div>
+      </div>
+
+      <!-- INPUT -->
+      <div class="input-area">
+        <div class="input-container">
+          <div class="input-row">
+            <textarea class="input-field" rows="1" placeholder="Ask anything" id="inputField"></textarea>
+            <button class="input-btn btn-plus" title="Attach file">
+              <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            </button>
+            <button class="input-btn btn-send" title="Send" id="sendBtn">
+              <svg viewBox="0 0 24 24"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="input-footer">
+          <div class="env-tabs">
+            <button class="env-tab active">Local</button>
+            <button class="env-tab">Worktree</button>
+            <button class="env-tab">Cloud</button>
+          </div>
+          <div class="footer-right">
+            <button class="settings-btn">
+              <svg viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+              kairos/agi
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Auto-resize textarea
+    const field = document.getElementById('inputField');
+    field.addEventListener('input', () => {
+      field.style.height = 'auto';
+      field.style.height = Math.min(field.scrollHeight, 160) + 'px';
+    });
+
+    // Env tab switching
+    document.querySelectorAll('.env-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.env-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+      });
+    });
+
+    // Thread item hover highlight
+    document.querySelectorAll('.thread-item').forEach(item => {
+      item.addEventListener('click', () => {
+        document.querySelectorAll('.thread-item').forEach(i => {
+          i.style.fontWeight = '';
+          i.style.color = '';
+        });
+        item.style.fontWeight = '500';
+        item.style.color = 'var(--text-primary)';
+        document.querySelector('.main-header-title').textContent = item.textContent.trim();
+      });
+    });
+
+    // Send button visual feedback
+    const sendBtn = document.getElementById('sendBtn');
+    sendBtn.addEventListener('click', () => {
+      const val = field.value.trim();
+      if (val) {
+        sendBtn.style.transform = 'scale(0.9)';
+        setTimeout(() => { sendBtn.style.transform = ''; }, 120);
+      }
+    });
+
+    // New thread button
+    document.getElementById('newThreadBtn').addEventListener('click', () => {
+      document.querySelector('.main-header-title').textContent = 'New thread';
+      field.value = '';
+      field.style.height = 'auto';
+    });
+  </script>
+</body>
+</html>

@@ -37,6 +37,10 @@ class Agent:
         self.terminal_manager = TerminalManager()
         self._interrupt_event = threading.Event()
         self._stop_requested = False
+        self._processing_lock = threading.Lock()
+        self._is_processing = False
+        self._background_ui_lock = threading.Lock()
+        self._background_ui_notified_ids = set()
 
         # Token counter
         self.tokens = TokenCounter(self.model)
@@ -109,17 +113,64 @@ class Agent:
         self.on_stream_end: Optional[Callable[[str, bool], None]] = None
         self.on_token_update: Optional[Callable[[TokenCounter], None]] = None
         self.on_compact: Optional[Callable[[str], None]] = None
+        self.on_background_notification: Optional[Callable[[str], None]] = None
+
+        # Keep this callback installed for the lifetime of the agent. It only
+        # prints a visible notification; completed events are retained until
+        # the next API turn drains them into the conversation.
+        self.terminal_manager.set_completion_callback(self._on_background_completion)
 
         self.conversation_history: List[Dict[str, Any]] = []
         self._setup_system_prompt()
+
+    def _on_background_completion(self, event: dict) -> None:
+        """Show active completions; leave idle completions queued for next input."""
+        if not self.is_processing or not self.on_background_notification:
+            return
+
+        completion_id = event.get("completion_id")
+        with self._background_ui_lock:
+            if completion_id and completion_id in self._background_ui_notified_ids:
+                return
+            if completion_id:
+                self._background_ui_notified_ids.add(completion_id)
+        notification = self.terminal_manager.format_background_completion(event)
+        if self.on_background_notification:
+            self.on_background_notification(notification)
+
+    def _set_processing(self, value: bool) -> None:
+        """Track whether a user request is actively running."""
+        with self._processing_lock:
+            self._is_processing = value
+
+    @property
+    def is_processing(self) -> bool:
+        with self._processing_lock:
+            return self._is_processing
+
+    def _drain_background_notifications(self) -> Optional[str]:
+        """Format completed background commands for insertion into the API turn."""
+        completions = self.terminal_manager.drain_completed_background_commands()
+        if not completions:
+            return None
+        # An idle completion was intentionally not displayed by the callback;
+        # display it now when the next request drains the queue.
+        for event in completions:
+            self._on_background_completion(event)
+        return "\n\n".join(
+            self.terminal_manager.format_background_completion(event)
+            for event in completions
+        )
 
     def _setup_system_prompt(self):
         base = (
             "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, inspect version control, and browse the web.\n\n"
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
-            "You have 29 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
+            "You have 40 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
             "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, it will not automatically be injected, so you will have to look for the AGENTS.md file in that directory. Note that the AGENTS.md does not always exist.\n\n"
+            "## Terminal Tools\n"
+            "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call requires a finite positive timeout; values above 20 seconds are capped at 20 seconds. Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately, the persistent shell stays alive, and a completion notification containing capped output is delivered while the agent is active or queued for the next user message when the agent is idle. The full output remains available through read_logs.\n\n"
             "## Browser Tools\n"
             "You can browse the web using browser tools. The workflow is:\n"
             "1. `browser_launch` \u2014 start the browser (optionally with a named profile for persistent sessions)\n"
@@ -289,10 +340,19 @@ class Agent:
                         "properties": {
                             "terminal_id": {"type": "integer", "description": "Terminal ID from new_terminal"},
                             "command": {"type": "string", "description": "Shell command to execute"},
-                            "timeout": {"type": "integer", "description": "Seconds before kill (required for blocking)"},
+                            "timeout": {"type": "number", "description": "Required finite positive timeout for blocking terminals; values above 20 seconds are capped at 20. Ignored for background terminals."},
                             "is_background": {"type": "boolean", "description": "Must match terminal type"},
                         },
                         "required": ["terminal_id", "command", "is_background"],
+                        "oneOf": [
+                            {
+                                "properties": {"is_background": {"const": True}},
+                            },
+                            {
+                                "properties": {"is_background": {"const": False}},
+                                "required": ["timeout"],
+                            },
+                        ],
                     },
                 },
             },
@@ -1019,6 +1079,11 @@ class Agent:
         has_user = any(m.get("role") == "user" for m in history)
         if not has_user:
             return self.compact()
+        # Only inspect a trailing tool chain. A normal user message (including
+        # the synthetic background-notification user message) is a valid end
+        # of history and must not be mistaken for an orphaned tool result.
+        if history[-1].get("role") != "tool":
+            return None
         i = len(history) - 1
         while i > 0 and history[i].get("role") == "tool":
             i -= 1
@@ -1375,6 +1440,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
     def step(self, user_message: Optional[str] = None, image_url: Optional[str] = None) -> Tuple[Optional[str], List[Dict[str, Any]]]:
         self._check_interrupt()
+        background_notifications = self._drain_background_notifications()
         if user_message is not None:
             if image_url:
                 user_msg: Dict[str, Any] = {
@@ -1387,6 +1453,29 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             else:
                 user_msg = {"role": "user", "content": user_message}
             self.conversation_history.append(user_msg)
+            # Keep completions as a separate user message immediately after
+            # the real user message, preserving both the request and the
+            # asynchronous notification in their natural order.
+            if background_notifications:
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": (
+                        "Background terminal notifications arrived since the previous turn. "
+                        "Process them as context for the user's request:\n\n"
+                        f"{background_notifications}"
+                    ),
+                })
+        elif background_notifications:
+            # If the agent is still in a tool-call loop, deliver completions
+            # before the next API request as a synthetic user event.
+            self.conversation_history.append({
+                "role": "user",
+                "content": (
+                    "Background terminal notifications arrived while you were working. "
+                    "Process them before taking your next step:\n\n"
+                    f"{background_notifications}"
+                ),
+            })
         recovery = self._validate_history_before_api()
         if recovery and self.on_compact:
             self.on_compact(recovery)
@@ -1451,6 +1540,9 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         return None, assembled_tool_calls
 
     def run(self, user_message: str, image_url: Optional[str] = None) -> Optional[str]:
+        self._set_processing(True)
+        # A request may start after background commands completed while idle.
+        # Mark it processing before draining so those queued notices are shown.
         self._interrupt_event.clear()
         current = user_message
         _first_image = image_url
@@ -1467,19 +1559,24 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 response, tool_calls = self.step(current, image_url=_first_image)
                 _first_image = None
                 current = None
-                if response:
-                    return response
-                if not tool_calls:
+                word_count = len(response.split()) if response else 0
+                if not tool_calls and word_count == 0:
+                    # Response is empty or too short (≤2 words) with no tool calls — retry
                     if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
                         self.conversation_history.pop()
                     if empty_retry_count < max_empty_retries:
                         empty_retry_count += 1
+                        reason = "No response from API" if not response else f"Response too short ({word_count} word{'s' if word_count != 1 else ''})"
                         if self.on_compact:
-                            self.on_compact(f"No response from API \u2014 retrying ({empty_retry_count}/{max_empty_retries})...")
+                            self.on_compact(f"{reason} \u2014 retrying ({empty_retry_count}/{max_empty_retries})...")
                         continue
-                    return "Agent returned without a response."
+                    return response if response else "Agent returned without a response."
+                if response:
+                    return response
         except InterruptedError:
             return "[Interrupted]"
+        finally:
+            self._set_processing(False)
 
     def reset(self):
         self._setup_system_prompt()
