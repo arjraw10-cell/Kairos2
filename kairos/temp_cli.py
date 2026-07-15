@@ -21,6 +21,7 @@ from rich.text import Text
 
 from kairos.config import Config
 from kairos.agent import Agent
+from kairos.resume import sanitize_history_for_resume
 
 PASTE_TEXT_MASK = "(Pasted text)"
 PASTE_IMAGE_MASK = "(Pasted image)"
@@ -215,6 +216,7 @@ class TempCLI(App):
         self._awaiting_resume = False
         self._resume_sessions: list = []
         self._session_mgr = None  # Initialized on mount
+        self._session_save_lock = threading.Lock()
         # Token registry: maps token string -> content dict
         self._paste_registry: dict = {}
 
@@ -380,12 +382,38 @@ class TempCLI(App):
         selected_id = self._resume_sessions[idx - 1]
         history = self._session_mgr.load_session(selected_id)
         if history:
+            sanitized, last_msg, mid_exec = sanitize_history_for_resume(history)
+            if sanitized is None:
+                self._log_info(f"Chat '{selected_id}' has no resumable state.")
+                return
+
             self._session_mgr.save_chat(self.agent.get_history())
             self._session_mgr.new_session()
             self.agent.reset()
-            self.agent.conversation_history = history
+            self.agent.conversation_history = sanitized
             self._session_mgr.set_current_session(selected_id)
             self._log_info(f"Loaded chat: {selected_id}")
+
+            if last_msg:
+                self._log_info("Restored the last completed agent response.")
+            if mid_exec:
+                self._log_info("Resuming mid-execution — continuing where the previous run stopped...")
+                self._processing = True
+                self.query_one("#input", Input).disabled = True
+
+                def _continue():
+                    try:
+                        self.agent.run("Continue where you left off. Pick up the next step.")
+                    except Exception as e:
+                        self.call_from_thread(self._log_error, f"Resume error: {e}")
+                    finally:
+                        # Persist the continuation under the selected session,
+                        # then re-enable input on the Textual/UI thread.
+                        with self._session_save_lock:
+                            self._session_mgr.save_chat(self.agent.get_history())
+                        self.call_from_thread(self._finish_processing)
+
+                threading.Thread(target=_continue, daemon=True).start()
 
     def _finish_processing(self):
         self._processing = False

@@ -194,7 +194,7 @@ class Agent:
             "PREFER index-based tools (browser_click_index, browser_type_index, browser_select_index, browser_hover_index) over selector-based ones.\n"
             "All interaction tools automatically detect significant page changes (popups, navigation, big DOM shifts) and snapshot+screen when needed.\n"
             "You can still use browser_snapshot and browser_screenshot explicitly when you want to observe the page.\n"
-            "Use named profiles (e.g. profile=\"Arjun\") to keep logins and cookies across sessions.\n\n"
+            "Use named profiles (e.g. profile=\"Kairos\") to keep logins and cookies across sessions.\n\n"
             f"## Workspace\nYour current workspace is: {self.cwd}"
         )
 

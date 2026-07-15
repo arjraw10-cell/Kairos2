@@ -4,12 +4,16 @@ import signal
 import threading
 import time
 import traceback
-import json
 
 from kairos.config import Config
 from kairos.agent import Agent
 from kairos.cli import CLI, _paste_registry
 from kairos.tools.session import SessionManager
+from kairos.resume import sanitize_history_for_resume
+
+# Backwards-compatible private name for callers that imported the original
+# helper from kairos.main before the shared resume module was introduced.
+_sanitize_history_for_resume = sanitize_history_for_resume
 
 
 # ------------------------------------------------------------------ #
@@ -19,151 +23,6 @@ from kairos.tools.session import SessionManager
 _session_mgr: SessionManager | None = None
 _agent: Agent | None = None
 _auto_save_lock = threading.Lock()
-
-
-def _is_screenshot_injection(msg: dict) -> bool:
-    """Check if a user message is a screenshot injection from the agent
-    (e.g. '[Screenshot captured — ...]'), not a real user message."""
-    content = msg.get("content", "")
-    if isinstance(content, list) and len(content) > 0:
-        first_block = content[0]
-        if isinstance(first_block, dict) and first_block.get("type") == "text":
-            text = first_block.get("text", "")
-            if text.startswith("[Screenshot captured"):
-                return True
-    return False
-
-
-def _sanitize_history_for_resume(
-    history: list[dict],
-) -> tuple[list[dict] | None, str, bool]:
-    """Walk backward through conversation history to find the last resumable
-    point — either a clean agent response or a mid-execution state.
-
-    Returns (sanitized_history, last_agent_content, is_mid_execution):
-      - Normal resume: history ends at last clean assistant response,
-        is_mid_execution=False
-      - Mid-execution resume: history has incomplete work (tool calls in
-        progress), is_mid_execution=True. The incomplete chain is completed
-        with synthetic tool results so the API sees valid message ordering.
-      - No resumable state: (None, "", False)
-    """
-    if not history or len(history) <= 1:
-        return None, "", False
-
-    # --- Pass 1: try to find a clean assistant response (normal resume) ---
-    i = len(history) - 1
-    while i > 0:  # index 0 is always the system prompt — never skip it
-        msg = history[i]
-        role = msg.get("role", "")
-
-        # Tool messages → always dirty, skip
-        if role == "tool":
-            i -= 1
-            continue
-
-        # User message → screenshot injection is dirty, real user is a hard stop
-        if role == "user":
-            if _is_screenshot_injection(msg):
-                i -= 1
-                continue
-            # Real user message — no clean agent response exists above this
-            break
-
-        # Assistant message
-        if role == "assistant":
-            if msg.get("tool_calls"):
-                # Dirty: agent called tools but execution never completed
-                i -= 1
-                continue
-            # Clean: final response with no tool calls
-            sanitized = history[: i + 1]
-            content = msg.get("content") or ""
-            return sanitized, content, False
-
-    # --- Pass 2: no clean response — try mid-execution resume ---
-    result = list(history)  # work on a copy
-
-    # Strip trailing screenshot injection messages (dirty user messages)
-    while len(result) > 1 and _is_screenshot_injection(result[-1]):
-        result.pop()
-
-    if len(result) <= 1:
-        return None, "", False
-
-    last = result[-1]
-    last_role = last.get("role", "")
-
-    def _make_synthetic_result(tc_id: str, tc_name: str) -> dict:
-        """Create a synthetic tool result for an interrupted tool call."""
-        return {
-            "tool_call_id": tc_id,
-            "role": "tool",
-            "name": tc_name,
-            "content": json.dumps({
-                "success": False,
-                "output": "",
-                "error": "Tool was not executed — execution was interrupted.",
-            }),
-        }
-
-    def _extract_tc_info(tool_call: dict) -> tuple[str, str]:
-        """Extract (id, name) from a tool_call entry in conversation history."""
-        tc_id = tool_call.get("id", "")
-        func = tool_call.get("function", {})
-        if isinstance(func, dict):
-            tc_name = func.get("name", "unknown")
-        else:
-            tc_name = tool_call.get("name", "unknown")
-        return tc_id, tc_name
-
-    if last_role == "assistant" and last.get("tool_calls"):
-        # History ends with assistant that called tools but got NO results
-        # at all (interrupted right after streaming). Add synthetic results
-        # so the history is API-valid and the agent sees its own intent.
-        for tc in last["tool_calls"]:
-            tc_id, tc_name = _extract_tc_info(tc)
-            result.append(_make_synthetic_result(tc_id, tc_name))
-        return result, "", True
-
-    elif last_role == "tool":
-        # History ends with tool result(s). Walk backward to find the
-        # corresponding assistant message with tool_calls.
-        j = len(result) - 1
-        trailing_ids = []
-        while j > 0 and result[j].get("role") == "tool":
-            trailing_ids.append(result[j].get("tool_call_id", ""))
-            j -= 1
-
-        if j > 0 and result[j].get("role") == "assistant" and result[j].get("tool_calls"):
-            tc_map = {}
-            for tc in result[j]["tool_calls"]:
-                tc_id, tc_name = _extract_tc_info(tc)
-                tc_map[tc_id] = tc_name
-
-            present = set(trailing_ids)
-            expected = set(tc_map.keys())
-
-            if present == expected:
-                # Complete chain — all tool results present. Valid seam.
-                pass
-            elif present.issubset(expected):
-                # Partial results — add synthetic results for missing ones
-                for mid in sorted(expected - present):
-                    result.append(_make_synthetic_result(mid, tc_map[mid]))
-            else:
-                # Orphaned tool results with no matching assistant —
-                # strip everything after the assistant message
-                del result[j + 1:]
-                if len(result) <= 1:
-                    return None, "", False
-
-        return result, "", True
-
-    # For any other last role (user message, clean assistant), the history
-    # is already in a valid state. The "Continue" message will be appended
-    # by the caller.
-    return result, "", True
 
 
 def _save_now():
@@ -380,7 +239,7 @@ def main():
                 if selected_id:
                     history = session_mgr.load_session(selected_id)
                     if history:
-                        sanitized, last_msg, mid_exec = _sanitize_history_for_resume(history)
+                        sanitized, last_msg, mid_exec = sanitize_history_for_resume(history)
                         if sanitized is None:
                             cli.print_info(
                                 f"Chat '{selected_id}' has no resumable state."

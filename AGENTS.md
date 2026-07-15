@@ -27,6 +27,7 @@ Agent2/
 └── kairos/
     ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, SkillManager, TerminalManager, BrowserManager
     ├── main.py             # CLI REPL loop, signal handlers, auto-save, paste resolution
+    ├── resume.py           # Shared saved-history repair and mid-execution resume logic
     ├── config.py           # Lazy .env loading via lru_cache
     ├── agent.py            # Core agent: streaming, tool dispatch, compaction, error handling
     ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling, KairosMarkdown for enhanced table rendering
@@ -107,6 +108,8 @@ Lazy-loads `.env` on first access via `python-dotenv`. Uses `@lru_cache(maxsize=
 
 **Function**: `main()` — orchestrates the entire application lifecycle.
 
+**Resume flow**: `/resume` delegates to `kairos.resume.sanitize_history_for_resume()`. It anchors resume decisions at the latest real user request, repairs incomplete assistant/tool chains with synthetic failed results, and automatically sends `Continue where you left off. Pick up the next step.` for mid-execution sessions.
+
 **Global state**: `_session_mgr` and `_agent` are module-level globals shared with signal handlers.
 
 **Signal handlers** (installed at startup):
@@ -130,18 +133,16 @@ Lazy-loads `.env` on first access via `python-dotenv`. Uses `@lru_cache(maxsize=
 5. Response display (streaming panel handles it; `_skip_print_response` prevents double-print)
 6. Auto-save after each exchange (all saves go through `_save_now()` which holds `_auto_save_lock` to prevent race conditions with the auto-save thread)
 
-**Resume sanitization** (`_sanitize_history_for_resume(history)`):
-- Walks backward through saved history to find the last resumable point — either a clean agent response or a mid-execution state
-- Pass 1 (normal resume): finds the last clean `assistant` message *without* `tool_calls`, skipping `tool` results, dirty `assistant` messages, and screenshot injection messages
-- Pass 2 (mid-execution resume): if no clean response exists, cleans up incomplete tool chains:
-  - If history ends with `assistant(tool_calls)` with no results: adds synthetic `"execution interrupted"` tool results so the API sees valid message ordering
-  - If history ends with partial tool results: adds synthetic results for missing `tool_call_id`s to complete the chain
-  - Handles orphaned tool results by stripping them
+**Resume sanitization** (`kairos.resume.sanitize_history_for_resume(history)`):
+- Anchors the decision at the latest real user request, so an older clean response cannot hide a newer interrupted request
+- Ignores internally generated screenshot, compaction, and background-notification user messages when identifying the latest request
+- Repairs incomplete tool chains by preserving matching results in call order, adding synthetic failed results for missing calls, and removing orphaned results
 - Returns `(sanitized_history, last_agent_content, is_mid_execution)` — `(None, "", False)` if no resumable state exists
-- On normal resume, the last agent message is displayed in a green panel
-- On mid-execution resume, the agent is auto-continued with "Continue where you left off. Pick up the next step." — the agent sees its own incomplete work with synthetic error results and picks up naturally
+- The CLI displays the last clean response on normal resume and auto-continues mid-execution sessions with `Continue where you left off. Pick up the next step.`
 
-**Helper**: `_is_screenshot_injection(msg)` — detects user messages that are agent-injected screenshots (content array starting with `[Screenshot captured ...`) vs real user messages.
+The Textual frontend (`kairos/temp_cli.py`) uses the same shared sanitizer and continuation behavior.
+
+`kairos.main._sanitize_history_for_resume` remains a compatibility alias to the shared function for existing callers.
 
 **Wiring** (in `main()`): The agent's callbacks are wired to CLI methods:
 ```python
@@ -158,6 +159,10 @@ agent.subagent_tool._stream_start = lambda: cli.start_stream()
 agent.subagent_tool._stream_token = cli.on_stream_token
 agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream()
 ```
+
+### `kairos/resume.py` — Saved-history Repair
+
+`sanitize_history_for_resume(history)` is the shared repair helper used by both interactive frontends. It returns `(history_or_none, last_agent_content, is_mid_execution)`, recognizes agent-generated user messages, removes trailing screenshot injections from unfinished turns, makes incomplete tool-call chains valid before continuation, and the Textual frontend saves the resumed continuation back into the selected session.
 
 ### `kairos/agent.py` — Agent (Core)
 

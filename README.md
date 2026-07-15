@@ -14,7 +14,7 @@ A minimal personal coding agent in Python.
 - **Skills**: Self-extensible skill system — agent can create/load skills stored as `SKILL.md` files in `skills/` directory
 - **Paste System**: Text pastes are detected automatically via bracketed paste (modern terminals wrap pasted text in escape sequences, making it arrive as one atomic chunk). Alt+V pastes images from the clipboard. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content.
 - **Chat Persistence**: All sessions saved to `chats/chats.json` with auto-save every 60 seconds and on window close. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions. **Atomic writes** via temp-file + rename prevent corruption from interrupted saves. **Corruption recovery** auto-heals damaged files by parsing up to the last valid JSON boundary.
-- **`/resume`**: Load previous chats via numbered picker — resumes from completed agent responses normally, OR automatically resumes mid-execution chats (incomplete tool calls are completed with synthetic error results, then the agent is auto-continued with "Continue where you left off")
+- **`/resume`**: Load previous chats via numbered picker. Completed chats resume normally; interrupted chats resume mid-execution by identifying the latest request, repairing incomplete tool calls with synthetic failed results, and automatically continuing with "Continue where you left off". Both interactive frontends share this logic.
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
 - **Streaming Display**: Real-time tokens in a live-updating panel (grey for thinking, green for final response)
 - **Tool Summaries**: One-line display when tools are called (e.g., `read file: /path`)
@@ -91,6 +91,10 @@ Workspace defaults to `C:\Users\arjra`. Edit the `tasks` list in `main()` and ru
 | `clear` | Clear the screen |
 | `reset` | Save and reset conversation history |
 | `exit` / `quit` / `q` | Save and exit |
+
+### Resume behavior
+
+`kairos/resume.py` is shared by the standard and Textual frontends. It anchors the decision at the latest real user request, ignores/removes internally generated screenshot/compaction/background-notification messages, repairs partial or orphaned tool chains, automatically continues an interrupted turn, and saves the Textual continuation back to the selected session. The headless `temp.py` runner intentionally has no interactive `/resume` command.
 
 ## Tools
 
@@ -201,6 +205,7 @@ main.py                     # Entry point
 temp.py                     # Headless agent runner — run_agent(prompt) with no CLI
 kairos/
 ├── main.py                 # CLI REPL loop, signal handlers, auto-save
+├── resume.py               # Shared saved-history repair and mid-execution resume logic
 ├── config.py               # Lazy .env loading (OPENAI_API_KEY, BASE_URL, MODEL)
 ├── agent.py                # Core agent loop, streaming, compaction, tool dispatch
 ├── cli.py                  # Terminal UI (streaming panels, thinking dots, paste handling, enhanced table rendering)
