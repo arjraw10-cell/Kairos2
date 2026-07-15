@@ -10,14 +10,24 @@ CHATS_DIR = Path(os.path.dirname(os.path.dirname(__file__))).parent / "chats"
 
 
 class SessionManager:
-    """Manages saving and loading of chat sessions."""
+    """Manages saving and loading of chat sessions.
 
-    def __init__(self):
-        CHATS_DIR.mkdir(exist_ok=True)
+    When a workspace is supplied, its ``chats/chats.json`` is used. This keeps
+    legacy sessions separate when the PATH launcher runs the Agent2 source
+    against another project (for example, Agent2Gateway).
+    """
+
+    def __init__(self, workspace: str | os.PathLike[str] | None = None):
+        if workspace:
+            self._chats_dir = Path(workspace).expanduser().resolve() / "chats"
+        else:
+            # Preserve the historical default for direct library callers.
+            self._chats_dir = CHATS_DIR
+        self._chats_dir.mkdir(parents=True, exist_ok=True)
         self._current_session_id: Optional[str] = None
 
     def _chat_file(self) -> Path:
-        return CHATS_DIR / "chats.json"
+        return self._chats_dir / "chats.json"
 
     def _load_all(self) -> Dict[str, Any]:
         path = self._chat_file()

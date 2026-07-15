@@ -7,20 +7,22 @@ A minimal personal coding agent in Python.
 - **40 Tools**: File operations, terminal management, search, git, sub-agents, skills, and a comprehensive browser automation suite (30 browser tools including hover, drag, wait_for, select_index, scroll, wait, send_keys, search_page, find_elements, index-based click/type, go_back/go_forward/reload, and CDP cross-origin iframe support)
 - **Absolute Paths**: All file operations use absolute paths — no workspace restrictions
 - **Streaming First**: Tokens print as they arrive; no waiting for full responses
-- **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange. Uses ground-truth counts from the API when available (`stream_options={"include_usage": True}`), with tiktoken estimates as fallback
-- **Auto-Compaction**: Conversation history is automatically summarized when context usage exceeds 80%
+- **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange. Estimates include message metadata, tool-call arguments, and function-tool schemas; uses ground-truth counts from the API when available (`stream_options={"include_usage": True}`), with tiktoken estimates as fallback
+- **Auto-Compaction**: Conversation history is automatically summarized when the configured context budget exceeds 80%; estimates include tool schemas and tool-call metadata, and compaction input is bounded so large results cannot cause a second breach
 - **Sub-Agents**: Spawn autonomous child agents to work on tasks in parallel
 - **Browser Automation**: Full Playwright/CloakBrowser integration with stealth mode, persistent profiles, multi-tab, and CDP support
 - **Skills**: Self-extensible skill system — agent can create/load skills stored as `SKILL.md` files in `skills/` directory
-- **Paste System**: Text pastes are detected automatically via bracketed paste (modern terminals wrap pasted text in escape sequences, making it arrive as one atomic chunk). Alt+V pastes images from the clipboard. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content.
-- **Chat Persistence**: All sessions saved to `chats/chats.json` with auto-save every 60 seconds and on window close. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions. **Atomic writes** via temp-file + rename prevent corruption from interrupted saves. **Corruption recovery** auto-heals damaged files by parsing up to the last valid JSON boundary.
-- **`/resume`**: Load previous chats via numbered picker. Completed chats resume normally; interrupted chats resume mid-execution by identifying the latest request, repairing incomplete tool calls with synthetic failed results, and automatically continuing with "Continue where you left off". Both interactive frontends share this logic.
+- **Paste System**: Text pastes use explicit prompt-toolkit paste events: bracketed-paste events carry their own payload, and Ctrl+V reads the clipboard only when that key is pressed. Alt+V pastes images from the clipboard. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. Clipboard changes from copying are never mistaken for paste actions.
+- **Chat Persistence**: Standard and Textual CLI sessions are saved to `<workspace>/chats/chats.json` (with the historical Agent2 location retained for direct library callers), so using either frontend from another project does not mix that project's chats with Agent2's chats. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions. **Atomic writes** via temp-file + rename prevent corruption from interrupted saves. **Corruption recovery** auto-heals damaged files by parsing up to the last valid JSON boundary.
+- **`/resume`**: Load previous chats via numbered picker, either interactively (`/resume`, then `1`) or inline (`/resume 1`). The standard picker consumes buffered handoff input and keeps prompting after invalid choices. The Textual picker extracts the session ID correctly and keeps selection mode active until a chat loads. Completed chats resume normally; interrupted chats resume mid-execution by identifying the latest request, repairing incomplete tool calls with synthetic failed results, and automatically continuing with "Continue where you left off". Both interactive frontends share this logic and workspace-specific chat storage.
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
 - **Streaming Display**: Real-time tokens in a live-updating panel (grey for thinking, green for final response)
 - **Tool Summaries**: One-line display when tools are called (e.g., `read file: /path`)
-- **Dual Interrupt**: Ctrl+C hard-interrupts mid-step; Escape gracefully stops after the current step finishes
+- **Dual Interrupt**: Ctrl+C hard-interrupts mid-step; Escape gracefully stops after the current step finishes. Input typed while a response is handing back to the prompt is buffered, so commands such as `/exit` are not silently lost.
 - **Responsive Terminals**: Blocking commands require a finite positive timeout capped at 20 seconds; background commands return immediately, preserve shell state, stay alive after completion, and notify the CLI/agent asynchronously with capped output
+- **Bounded Tool Results**: Text returned by tools is capped before it enters history or the API (20,000 characters per result by default), preserving both the beginning and end with a truncation marker; image data is kept out of textual tool messages and re-injected as vision context with bounded token estimates; the limit can be configured with `KAIROS_MAX_TOOL_RESULT_CHARS`
 - **OpenAI Compatible**: Works with any OpenAI-compatible API (OpenRouter, local models, etc.)
+- **Gateway Retry & Clean Errors**: Transient API/gateway failures, including interrupted chunked streams, are retried twice with backoff; exhausted requests show concise API diagnostics without dumping a traceback
 - **Clean CLI**: Terminal UI with `rich` and `prompt_toolkit`, including enhanced table rendering with rounded boxes, bold headers, and alternating row shading
 
 ## Installation
@@ -48,9 +50,16 @@ playwright install chromium
 OPENAI_API_KEY=your_api_key_here
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o
+
+# Conservative prompt budget used by token display and auto-compaction
+# Set this to the actual context limit accepted by your gateway/model.
+KAIROS_CONTEXT_WINDOW=262000
+
+# Optional model-facing tool result cap (characters)
+KAIROS_MAX_TOOL_RESULT_CHARS=20000
 ```
 
-Any OpenAI-compatible endpoint works — just change `OPENAI_BASE_URL`.
+Any OpenAI-compatible endpoint works — just change `OPENAI_BASE_URL`. `KAIROS_CONTEXT_WINDOW` defaults to 262,000 and should be set to the actual prompt limit of the configured gateway/model. Tool-result cap settings are optional; invalid or non-positive values fall back to the defaults.
 
 ## Usage
 
@@ -59,6 +68,10 @@ python main.py                   # cwd as workspace
 python main.py /path/to/project  # specific workspace
 python temp.py "read and summarize /path/to/file.py"  # headless, no CLI
 ```
+
+`kairos_old.bat` is the PATH-safe legacy launcher. It invokes `main.py` from the batch file's own directory while preserving the current directory as the workspace, so running `cd Documents/Agent2Gateway; kairos_old` uses `Agent2Gateway` as workspace context but still executes the current Agent2 source.
+
+The standard CLI resolves paste placeholders before command dispatch, so pasted aliases such as `/exit` work like typed commands. Its Escape listener also buffers ordinary terminal input captured during the response-to-prompt handoff; this prevents a quickly typed command from being consumed and forcing a second `/exit`.
 
 ### Headless Usage (temp.py)
 
@@ -83,9 +96,9 @@ Workspace defaults to `C:\Users\arjra`. Edit the `tasks` list in `main()` and ru
 |---------|-------------|
 | `Escape` | Stop after current step (finish tool calls, then wait for input) |
 | `Ctrl+C` | Hard-interrupt (abort mid-step) |
-| `Ctrl+V` | Paste text from clipboard |
+| `Ctrl+V` | Explicitly paste text from clipboard when the terminal passes the key through; terminals that emit bracketed-paste events use that event automatically |
 | `Alt+V` | Paste image from clipboard |
-| `/resume` | Load a saved chat |
+| `/resume` / `/resume 1` | Load a saved chat with the numbered picker, or select chat 1 inline |
 | `/compact` | Manually compact conversation history |
 | `/paste` | Info about paste functionality |
 | `clear` | Clear the screen |
@@ -94,7 +107,9 @@ Workspace defaults to `C:\Users\arjra`. Edit the `tasks` list in `main()` and ru
 
 ### Resume behavior
 
-`kairos/resume.py` is shared by the standard and Textual frontends. It anchors the decision at the latest real user request, ignores/removes internally generated screenshot/compaction/background-notification messages, repairs partial or orphaned tool chains, automatically continues an interrupted turn, and saves the Textual continuation back to the selected session. The headless `temp.py` runner intentionally has no interactive `/resume` command.
+`kairos/resume.py` is shared by the standard and Textual frontends. It anchors the decision at the latest real user request, ignores/removes internally generated screenshot/compaction/background-notification messages, repairs partial or orphaned tool chains, automatically continues an interrupted turn, and saves the Textual continuation back to the selected session. Both frontends use `<workspace>/chats/chats.json`; the standard picker accepts `/resume` followed by a number or `/resume 1`, while the Textual picker keeps waiting on invalid selections and passes the selected metadata's string ID to the loader. The headless `temp.py` runner intentionally has no interactive `/resume` command.
+
+The standard CLI synchronizes input handoff with its Escape listener: complete lines captured while an agent is finishing are consumed by the next prompt and by the session picker, and partial lines are prefilled for editing instead of dropped.
 
 ## Tools
 
@@ -110,8 +125,10 @@ Workspace defaults to `C:\Users\arjra`. Edit the `tasks` list in `main()` and ru
 
 | Tool | Description |
 |------|-------------|
-| `search(pattern, path?, include?, max_results?)` | Regex file content search (like ripgrep) — skips binary files and non-source directories |
+| `search(pattern, path?, include?, max_results?, timeout?)` | Regex file content search (like ripgrep) — skips binary files and non-source directories; defaults to a 10-second timeout and returns partial matches if the deadline is reached |
 | `git(command, **kwargs)` | Git operations: `status`, `diff`, `log`, `commit`, `branch` |
+
+Tool results are capped centrally before they are stored in conversation history or sent to the API. The default is 20,000 characters per result. Oversized text preserves the beginning and end and includes its original character count. Inline image data is removed from textual tool messages and re-injected as a separate vision user message with bounded image-token estimates. Legacy saved sessions are normalized before their next API request, so old multi-megabyte results cannot bypass the cap; embedded images from old tool messages become a short omission marker because their original vision message cannot be safely reconstructed. Set `KAIROS_MAX_TOOL_RESULT_CHARS` in `.env` to override the default. Background terminals retain their complete output for `read_logs`.
 
 ### Terminal Tools
 
@@ -132,7 +149,7 @@ Blocking terminal commands are capped at a 20-second timeout and terminate their
 | `spawn_subagent(prompt, mode?)` | Spawn an autonomous child agent — `blocking` (waits) or `non-blocking` (returns ID) |
 | `get_subagent_result(subagent_id)` | Poll a non-blocking sub-agent for its result |
 
-Sub-agents have access to file, search, git, terminal, and skill tools but cannot spawn further sub-agents or use browser tools.
+Sub-agents have access to file, search, git, terminal, and skill tools but cannot spawn further sub-agents or use browser tools. Their token usage is tracked independently and displayed as `Subagent <id>: Session ... | Context ... | Turn ...` after each child turn in the interactive frontends.
 
 ### Skill Tools
 
@@ -203,16 +220,20 @@ Browser features:
 ```
 main.py                     # Entry point
 temp.py                     # Headless agent runner — run_agent(prompt) with no CLI
+run_temp_cli.py              # Textual frontend launcher
 kairos/
 ├── main.py                 # CLI REPL loop, signal handlers, auto-save
 ├── resume.py               # Shared saved-history repair and mid-execution resume logic
-├── config.py               # Lazy .env loading (OPENAI_API_KEY, BASE_URL, MODEL)
+├── config.py               # Lazy .env loading (API settings, result cap, context budget)
 ├── agent.py                # Core agent loop, streaming, compaction, tool dispatch
-├── cli.py                  # Terminal UI (streaming panels, thinking dots, paste handling, enhanced table rendering)
-├── tokens.py               # Token counting with tiktoken (session/context/turn)
+├── cli.py                  # Terminal UI (streaming panels, thinking dots, paste handling, numbered resume picker, enhanced table rendering)
+├── temp_cli.py             # Textual frontend with workspace-aware numbered resume picker
+├── tokens.py               # Token counting with tiktoken (metadata/tools/session/context/turn)
 ├── terminal_manager.py     # Terminal lifecycle (background shells, blocking subprocesses)
 ├── browser_manager.py      # Playwright/CloakBrowser lifecycle in a dedicated worker thread + CDP cross-origin iframe support + smart auto-snapshot
 ├── cdp_manager.py          # CDPManager — low-level Chrome DevTools Protocol access (a11y tree, frame detection)
+├── tests/
+│   └── test_compaction.py  # Context accounting and compaction regression tests
 └── tools/
     ├── base.py             # ToolResult class
     ├── read.py             # Read file (text + images)
@@ -233,9 +254,11 @@ kairos/
 
 Tokens are streamed in real-time. During the agent's reasoning phase, a grey panel updates live. When a final response is reached, it transitions to a green panel rendered as Markdown with enhanced table styling (rounded boxes, bold headers, alternating rows). Tool call thinking stays as a grey trace.
 
+API streaming requests retry transient gateway failures twice after the initial attempt. Retries also cover failures raised while iterating the response body, such as `RemoteProtocolError` / incomplete chunked reads. If all attempts fail, Kairos reports a concise `OpenAI API Error` with the exception message and configuration, without printing the Python traceback.
+
 ### Compaction
 
-When the conversation context exceeds 80% of the context window, old messages are automatically summarized into a structured checkpoint (Goal, Progress, Key Decisions, Next Steps) and replaced. Recent context (20% of context window) is preserved. You can also trigger this manually with `/compact`.
+When the conversation context exceeds 80% of the configured context budget, old messages are automatically summarized into a structured checkpoint (Goal, Progress, Key Decisions, Next Steps) and replaced. The checkpoint also includes chronological `User Messages` and `Agent-to-User Messages` subsections covering every applicable user message and substantive assistant response in the summarized history; tool-call-only messages and tool results are excluded from the latter. Incremental compaction preserves and extends both records. The check runs before every API step, including inside an ongoing tool-call loop, and recounts newly appended tool results, the function-tool schema, and the user message about to be sent. Token accounting includes assistant tool-call metadata/arguments and tool IDs/names, not just visible text. The separate compaction request is bounded to the configured budget minus its summary reserve and a 1,024-token framing margin, preventing a huge tool result from causing compaction itself to breach the window. Recent context (20% of context window) is preserved, with message boundaries kept valid for assistant/tool calls. You can also trigger this manually with `/compact`.
 
 ### Skills
 
@@ -258,9 +281,19 @@ Chat history is saved:
 2. **Absolute Paths** — No workspace containment, just use full paths
 3. **One Tool Per File** — Easy to add new tools
 4. **Interruptible** — Ctrl+C hard-interrupts; Escape gracefully stops between steps
-5. **Token Aware** — Session, context, and turn token counts displayed
+5. **Token Aware** — Session, context, and turn token counts displayed; estimates include message metadata, tool calls, schemas, and bounded vision estimates
 6. **Minimal Dependencies** — `openai`, `python-dotenv`, `rich`, `prompt_toolkit`, `tiktoken`, `playwright`
 7. **Loud by Default** — Tools always report what they did. Success includes specifics (e.g. "Wrote 42 lines to `main.py`"). Failure clearly states what went wrong. Nothing happens silently — overwrites, creations, and deletions are always announced.
+
+## Tests
+
+Run the focused compaction/accounting regression suite with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests cover tool-schema and metadata accounting, bounded vision estimates, pending-user preflight, safe tool-chain boundaries, compaction-prompt limits, and normalization of oversized legacy saved results.
 
 ## License
 

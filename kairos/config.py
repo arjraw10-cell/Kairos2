@@ -17,6 +17,10 @@ def _ensure_dotenv():
 class Config:
     """Lazy-loaded configuration. .env is loaded on first attribute access."""
 
+    DEFAULT_MAX_TOOL_RESULT_CHARS = 20_000
+    DEFAULT_CONTEXT_WINDOW = 262_000
+    DEFAULT_CONTEXT_RESERVE_TOKENS = 16_384
+
     @staticmethod
     def _get(key: str, default=None):
         _ensure_dotenv()
@@ -47,6 +51,40 @@ class Config:
         return model
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def MAX_TOOL_RESULT_CHARS(cls) -> int:
+        """Maximum text characters retained for one model-facing tool result."""
+        _ensure_dotenv()
+        raw_value = os.getenv(
+            "KAIROS_MAX_TOOL_RESULT_CHARS",
+            str(cls.DEFAULT_MAX_TOOL_RESULT_CHARS),
+        )
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return cls.DEFAULT_MAX_TOOL_RESULT_CHARS
+        if value < 1:
+            return cls.DEFAULT_MAX_TOOL_RESULT_CHARS
+        return value
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def CONTEXT_WINDOW(cls) -> int:
+        """Configured context budget used by compaction and token display."""
+        _ensure_dotenv()
+        raw_value = os.getenv(
+            "KAIROS_CONTEXT_WINDOW",
+            str(cls.DEFAULT_CONTEXT_WINDOW),
+        )
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return cls.DEFAULT_CONTEXT_WINDOW
+        if value < 1:
+            return cls.DEFAULT_CONTEXT_WINDOW
+        return value
+
+    @classmethod
     def validate(cls):
         _ensure_dotenv()
         if not cls.OPENAI_API_KEY():
@@ -61,3 +99,5 @@ class Config:
         cls.OPENAI_API_KEY.cache_clear()
         cls.OPENAI_BASE_URL.cache_clear()
         cls.OPENAI_MODEL.cache_clear()
+        cls.MAX_TOOL_RESULT_CHARS.cache_clear()
+        cls.CONTEXT_WINDOW.cache_clear()

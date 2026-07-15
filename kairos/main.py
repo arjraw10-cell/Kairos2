@@ -3,7 +3,6 @@ import sys
 import signal
 import threading
 import time
-import traceback
 
 from kairos.config import Config
 from kairos.agent import Agent
@@ -14,6 +13,33 @@ from kairos.resume import sanitize_history_for_resume
 # Backwards-compatible private name for callers that imported the original
 # helper from kairos.main before the shared resume module was introduced.
 _sanitize_history_for_resume = sanitize_history_for_resume
+
+_EXIT_COMMANDS = frozenset(("exit", "quit", "q", "/exit", "/quit"))
+
+
+def _resolve_paste_input(user_input: str) -> tuple[str, str | None]:
+    """Replace visible paste tokens before command dispatch.
+
+    Command aliases must be checked after paste resolution. Otherwise a
+    pasted ``/exit`` (or ``/resume``, ``/compact``, etc.) is mistaken for a
+    normal agent request because the prompt returns its placeholder token.
+    """
+    paste_image_data_url = None
+    for token, data in list(_paste_registry.items()):
+        if token not in user_input:
+            continue
+        if data["type"] == "text":
+            user_input = user_input.replace(token, data["text_stripped"])
+        elif data["type"] == "image":
+            paste_image_data_url = data["data_url"]
+            user_input = user_input.replace(token, "")
+    _paste_registry.clear()
+    return user_input, paste_image_data_url
+
+
+def _is_exit_command(user_input: str) -> bool:
+    """Return whether input is one of the CLI's exit aliases."""
+    return user_input.strip().casefold() in _EXIT_COMMANDS
 
 
 # ------------------------------------------------------------------ #
@@ -80,8 +106,9 @@ def process_request(
     Run the agent in a background thread so the main thread can catch
     KeyboardInterrupt cleanly.
 
-    The Escape key listener is active only during agent execution so it
-    doesn't conflict with prompt_toolkit while the user is typing.
+    The Escape key listener is active only during agent execution. Because it
+    shares stdin with prompt_toolkit, ordinary characters captured during the
+    handoff are buffered and replayed by the next prompt instead of discarded.
     """
     result = [None]
     exception_holder = [None]
@@ -92,7 +119,7 @@ def process_request(
         except Exception as e:
             exception_holder[0] = e
 
-    # Start Escape listener (raw terminal input) -- only while agent runs
+    # Start Escape listener -- only while agent runs
     cli.start_escape_listener(on_escape=agent.request_stop)
 
     t = threading.Thread(target=_run, daemon=True)
@@ -131,7 +158,10 @@ def main():
 
     cli = CLI()
     agent = Agent(workspace)
-    session_mgr = SessionManager()
+    # Persist sessions under the active workspace. The PATH launcher invokes
+    # this source tree while preserving the caller's CWD, so Agent2Gateway
+    # chats are not mixed with Agent2's own legacy chats.
+    session_mgr = SessionManager(workspace)
 
     # Share globals with signal handlers and auto-save
     _session_mgr = session_mgr
@@ -166,6 +196,10 @@ def main():
     )
     agent.subagent_tool._stream_start = lambda: cli.start_stream()
     agent.subagent_tool._stream_token = cli.on_stream_token
+    # Print child token accounting separately from the parent agent's status.
+    agent.subagent_tool._token_update = lambda subagent_id, tc: cli.print_subagent_token_status(
+        subagent_id, tc
+    )
     # For subagent stream end, always finish the stream panel (keep as thinking trace)
     agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream()
 
@@ -198,28 +232,36 @@ def main():
             if user_input is None:
                 break
 
-            if user_input.lower() in ("exit", "quit", "q", "/exit", "/quit"):
+            # Resolve paste placeholders before dispatching commands. A
+            # pasted command is returned as a token (for example,
+            # ``(Pasted Text #1)``), so checking aliases first would send the
+            # pasted command to the agent instead of handling it locally.
+            user_input, paste_image_data_url = _resolve_paste_input(user_input)
+
+            if _is_exit_command(user_input):
                 break
 
-            if user_input.lower() == "clear":
+            if user_input.strip().casefold() == "clear":
                 cli.clear_screen()
                 cli.print_banner()
                 continue
 
-            if user_input.lower() == "reset":
+            if user_input.strip().casefold() == "reset":
                 _save_now()
                 session_mgr.new_session()
                 agent.reset()
                 cli.print_info("Conversation history reset")
                 continue
 
-            if user_input.lower() == "/compact":
+            command = user_input.strip().casefold()
+
+            if command == "/compact":
                 cli.print_info("Compacting conversation...")
                 result = agent.compact()
                 cli.print_info(result)
                 continue
 
-            if user_input.lower() == "/paste":
+            if command == "/paste":
                 cli.print_info("Paste text directly — it's detected automatically.")
                 cli.print_info("Alt+V pastes images from your clipboard.")
                 cli.print_info(
@@ -230,12 +272,15 @@ def main():
                 )
                 continue
 
-            if user_input.lower() == "/resume":
+            if command == "/resume" or command.startswith("/resume "):
                 sessions = session_mgr.list_sessions()
                 if not sessions:
                     cli.print_info("No saved chats found.")
                     continue
-                selected_id = cli.pick_session(sessions)
+                # Accept both the interactive form (/resume, then 1) and the
+                # convenient single-line form (/resume 1).
+                initial_choice = user_input.strip()[len("/resume"):].strip() or None
+                selected_id = cli.pick_session(sessions, initial_choice=initial_choice)
                 if selected_id:
                     history = session_mgr.load_session(selected_id)
                     if history:
@@ -267,7 +312,6 @@ def main():
                             except Exception as e:
                                 cli.stop_thinking()
                                 cli.print_error(str(e))
-                                cli.console.print(f"[dim]{traceback.format_exc()}[/dim]")
                                 response = None
                             finally:
                                 cli.stop_thinking()
@@ -276,17 +320,6 @@ def main():
                             cli._skip_print_response = False
                             _save_now()
                 continue
-
-            # --- Resolve paste tokens -> extract text + images ----------
-            paste_image_data_url = None
-            for token, data in list(_paste_registry.items()):
-                if token in user_input:
-                    if data["type"] == "text":
-                        user_input = user_input.replace(token, data["text_stripped"])
-                    elif data["type"] == "image":
-                        paste_image_data_url = data["data_url"]
-                        user_input = user_input.replace(token, "")
-            _paste_registry.clear()
 
             # Empty input: if no image was pasted, just skip
             if not user_input.strip():
@@ -303,14 +336,13 @@ def main():
                 )
             except Exception as e:
                 cli.stop_thinking()
-                # Show the full error with details
+                # APIRequestError already contains concise diagnostics. Avoid
+                # printing chained tracebacks: gateway failures can otherwise
+                # dump many pages of httpx/httpcore internals into the CLI.
                 error_detail = str(e)
-                # If the error has extra info (like from _format_api_error), show it
                 if type(e).__name__ != "Exception":
                     error_detail = f"{type(e).__name__}: {error_detail}"
                 cli.print_error(error_detail)
-                # Also show traceback for debugging
-                cli.console.print(f"[dim]{traceback.format_exc()}[/dim]")
                 response = None
             finally:
                 cli.stop_thinking()

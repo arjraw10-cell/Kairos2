@@ -1,13 +1,24 @@
 """Token counting and display using tiktoken."""
 
+import json
+from typing import Any
+
 import tiktoken
 
 
 class TokenCounter:
-    """Tracks token usage across a session and per-turn."""
+    """Tracks token usage across a session and per-turn.
 
-    def __init__(self, model: str = "gpt-4o"):
-        # Try to get the encoding for the model; fall back to cl100k_base
+    The context count is deliberately conservative.  It includes message
+    metadata and assistant tool-call arguments, not only visible text, because
+    those fields are sent to the chat-completions endpoint too.  Tool schema
+    tokens are supplied by :class:`kairos.agent.Agent` as ``extra_tokens``.
+    """
+
+    DEFAULT_CONTEXT_WINDOW = 262_000
+
+    def __init__(self, model: str = "gpt-4o", context_window: int | None = None):
+        # Try to get the encoding for the model; fall back to cl100k_base.
         try:
             self._enc = tiktoken.encoding_for_model(model)
         except KeyError:
@@ -24,12 +35,36 @@ class TokenCounter:
         self.turn_input = 0
         self.turn_output = 0
 
-        # Estimated max context (conservative default)
-        self.context_window = 262_000
+        # The configured budget is intentionally conservative for compatible
+        # gateways whose advertised model context may be larger than the
+        # deployment actually accepts.
+        if context_window is None:
+            try:
+                from .config import Config
+
+                context_window = Config.CONTEXT_WINDOW()
+            except (ImportError, AttributeError):
+                context_window = self.DEFAULT_CONTEXT_WINDOW
+        try:
+            context_window = int(context_window)
+        except (TypeError, ValueError):
+            context_window = self.DEFAULT_CONTEXT_WINDOW
+        self.context_window = max(1, context_window)
+
+    def _encode_len(self, value: Any) -> int:
+        """Return the encoded length of a value without raising on odd data."""
+        if value is None:
+            return 0
+        if not isinstance(value, str):
+            try:
+                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                value = str(value)
+        return len(self._enc.encode(value))
 
     @staticmethod
     def _extract_text(content) -> str:
-        """Extract plain text from message content (string or vision content array)."""
+        """Extract plain text from message content (string or vision array)."""
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -44,78 +79,114 @@ class TokenCounter:
     def _estimate_image_tokens(content: list) -> int:
         """Estimate tokens for image_url blocks in a vision content array.
 
-        Uses data URL length as a proxy for image size. Not exact, but
-        close enough for context tracking — and when the API reports
-        real usage, those numbers override this estimate entirely.
+        Image billing is based on image dimensions/detail rather than the raw
+        base64 URL length.  Keep a fixed conservative estimate and do not turn
+        the URL into text tokens: an inline screenshot can be hundreds of
+        thousands of characters while costing only a bounded vision budget.
         """
         tokens = 0
         for block in content:
-            if not isinstance(block, dict):
+            if not isinstance(block, dict) or block.get("type") != "image_url":
                 continue
-            if block.get("type") != "image_url":
-                continue
-            url = block.get("image_url", {}).get("url", "")
-            if url.startswith("data:"):
-                # Rough estimate: 85 base tokens + ~1 token per 2000 chars of data URL
-                # Yields ~200 tokens for small images, ~1500-3000 for large photos
-                tokens += 85 + max(0, len(url) // 2000)
-            else:
-                # External URL — can't know actual size, assume base tokens
-                tokens += 85
+            image = block.get("image_url", {})
+            if not isinstance(image, dict):
+                image = {}
+            detail = image.get("detail")
+            tokens += 765 if detail == "high" else 85
         return tokens
 
     def count_message(self, msg: dict) -> int:
-        """Count tokens in a single message dict.
+        """Count the fields from one message that contribute to API context.
 
-        NOTE: Tool call arguments on assistant messages are intentionally
-        NOT counted here. They were already counted as output tokens when
-        generated (via add_output_tokens in step()). Counting them again
-        here as input would double-count the same bytes across turns.
+        In particular, assistant ``tool_calls`` and tool message IDs/names are
+        included.  They were previously omitted when assistant content was
+        non-empty, which could make the displayed context materially smaller
+        than the request sent to the provider.
         """
+        if not isinstance(msg, dict):
+            return self._encode_len(msg) + 4
+
+        total = 0
         content = msg.get("content", "")
-        # Extract text content
-        text = self._extract_text(content)
+        if isinstance(content, str):
+            total += self._encode_len(content)
+        elif isinstance(content, list):
+            total += self._encode_len(self._extract_text(content))
+            total += self._estimate_image_tokens(content)
+            # Count small non-image fields (for example image detail/type),
+            # but never count the raw image URL as text.
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "image_url":
+                    image = block.get("image_url", {})
+                    if isinstance(image, dict):
+                        total += self._encode_len(block.get("type"))
+                        total += self._encode_len(image.get("detail"))
+                elif block.get("type") != "text":
+                    total += self._encode_len(block)
+        elif content is not None:
+            total += self._encode_len(content)
 
-        # Count image tokens if content is a vision content array
-        image_tokens = 0
-        if isinstance(content, list):
-            image_tokens = self._estimate_image_tokens(content)
+        # These metadata fields are part of the serialized chat message.
+        for key in ("role", "name", "tool_call_id"):
+            total += self._encode_len(msg.get(key))
 
-        # For messages with no extractable text at all, use str() as fallback
-        if not text:
-            text = str(msg)
-        return len(self._enc.encode(text)) + image_tokens
+        tool_calls = msg.get("tool_calls") or []
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    total += self._encode_len(tool_call)
+                    continue
+                total += self._encode_len(tool_call.get("id"))
+                total += self._encode_len(tool_call.get("type"))
+                function = tool_call.get("function", {})
+                if isinstance(function, dict):
+                    total += self._encode_len(function.get("name"))
+                    total += self._encode_len(function.get("arguments"))
+                else:
+                    total += self._encode_len(function)
+
+        # ChatML/message JSON framing and field separators.  This is a
+        # conservative approximation; exact provider usage replaces it when
+        # the streaming response includes usage data.
+        return total + 4
 
     def count_history(self, messages: list[dict]) -> int:
-        """Count total tokens in a list of messages."""
-        total = 0
-        for msg in messages:
-            total += self.count_message(msg)
-            # Overhead for message structure (~4 tokens per message)
-            total += 4
-        return total
+        """Count total message tokens in a conversation history."""
+        return sum(self.count_message(msg) for msg in messages)
 
-    def start_turn(self, messages: list[dict]):
+    def count_tools(self, tools: list[dict] | None) -> int:
+        """Count function-tool definitions included alongside a request."""
+        if not tools:
+            return 0
+        try:
+            serialized = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            serialized = str(tools)
+        # A small framing reserve covers the top-level tools parameter and
+        # provider-specific wrappers not represented in the JSON itself.
+        return self._encode_len(serialized) + 16
+
+    def count_request(self, messages: list[dict], tools: list[dict] | None = None) -> int:
+        """Count messages plus optional function-tool definitions."""
+        return self.count_history(messages) + self.count_tools(tools)
+
+    def start_turn(self, messages: list[dict], extra_tokens: int = 0):
         """Called at the start of a turn — count input tokens."""
-        self.turn_input = self.count_history(messages)
+        self.turn_input = self.count_history(messages) + max(0, int(extra_tokens))
         self.context_tokens = self.turn_input
         self.turn_output = 0
 
     def add_output_tokens(self, text: str):
         """Accumulate output tokens during streaming (tiktoken estimate)."""
-        n = len(self._enc.encode(text or ""))
-        self.turn_output += n
+        self.turn_output += len(self._enc.encode(text or ""))
 
     def set_turn_from_api(self, prompt_tokens: int, completion_tokens: int):
-        """Override turn counters with ground-truth values from the API.
-
-        Called when stream_options={"include_usage": True} returns real counts.
-        The API's prompt_tokens replaces the tiktoken estimate entirely,
-        and completion_tokens replaces the accumulated output estimate.
-        """
-        self.turn_input = prompt_tokens
-        self.context_tokens = prompt_tokens
-        self.turn_output = completion_tokens
+        """Override turn counters with ground-truth API usage when available."""
+        self.turn_input = max(0, int(prompt_tokens or 0))
+        self.context_tokens = self.turn_input
+        self.turn_output = max(0, int(completion_tokens or 0))
 
     def finish_turn(self):
         """Called when a turn completes — update session totals."""
@@ -130,11 +201,7 @@ class TokenCounter:
         return (self.context_tokens / self.context_window) * 100
 
     def format_status(self) -> str:
-        """Format a status line showing all token info.
-
-        Layout:
-          Session: X in / Y out  |  Context: Z%  |  Turn: A in / B out
-        """
+        """Format a status line showing all token info."""
         si = f"{self.session_input:,}"
         so = f"{self.session_output:,}"
         ctx = f"{self.context_pct:.1f}%"

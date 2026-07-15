@@ -25,8 +25,16 @@ from .tools import (
 )
 from .tools.skills import SkillManager
 
+
+class APIRequestError(Exception):
+    """A concise, user-facing error raised after an API request is exhausted."""
+
+
 class Agent:
     MAX_HISTORY_MESSAGES = 10000000
+    API_MAX_RETRIES = 2  # Two retries after the initial request.
+    API_RETRY_BASE_DELAY = 1.0
+    MAX_TOOL_RESULT_CHARS = Config.DEFAULT_MAX_TOOL_RESULT_CHARS
 
     def __init__(self, workspace: str):
         self.client = OpenAI(
@@ -34,6 +42,7 @@ class Agent:
             base_url=Config.OPENAI_BASE_URL(),
         )
         self.model = Config.OPENAI_MODEL()
+        self.max_tool_result_chars = Config.MAX_TOOL_RESULT_CHARS()
         self.terminal_manager = TerminalManager()
         self._interrupt_event = threading.Event()
         self._stop_requested = False
@@ -171,6 +180,7 @@ class Agent:
             "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, it will not automatically be injected, so you will have to look for the AGENTS.md file in that directory. Note that the AGENTS.md does not always exist.\n\n"
             "## Terminal Tools\n"
             "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call requires a finite positive timeout; values above 20 seconds are capped at 20 seconds. Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately, the persistent shell stays alive, and a completion notification containing capped output is delivered while the agent is active or queued for the next user message when the agent is idle. The full output remains available through read_logs.\n\n"
+            f"## Tool Result Limits\nText returned by tools is capped before it is added to conversation history: up to {self.max_tool_result_chars:,} characters per tool result. Oversized results contain a truncation marker and preserve both the beginning and end. Use narrower commands or queries; for complete background-terminal output, use read_logs.\n\n"
             "## Browser Tools\n"
             "You can browse the web using browser tools. The workflow is:\n"
             "1. `browser_launch` \u2014 start the browser (optionally with a named profile for persistent sessions)\n"
@@ -294,6 +304,7 @@ class Agent:
                             "path": {"type": "string", "description": "Directory to search in (defaults to cwd)"},
                             "include": {"type": "string", "description": "Filename glob filter"},
                             "max_results": {"type": "integer", "description": "Max matches to return (default 50)"},
+                            "timeout": {"type": "number", "description": "Maximum search time in seconds (default 10; non-negative)"},
                         },
                         "required": ["pattern"],
                     },
@@ -894,13 +905,74 @@ class Agent:
             )]
         return tools
 
-    def _execute_tool(self, name: str, args: Dict[str, Any]) -> str:
-        """Execute a tool and return the result as a JSON string."""
+    TOOL_ERROR_RESERVE_CHARS = 4_000
+
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int) -> str:
+        """Keep both ends of oversized text while preserving Unicode safely."""
+        if len(text) <= max_chars:
+            return text
+        marker = (
+            f"\n... [tool output truncated: original length {len(text):,} characters; "
+            f"showing the first and last portions] ...\n"
+        )
+        if max_chars <= len(marker):
+            return marker[:max_chars]
+        available = max_chars - len(marker)
+        head_chars = (available + 1) // 2
+        tail_chars = available - head_chars
+        tail = text[-tail_chars:] if tail_chars else ""
+        return text[:head_chars] + marker + tail
+
+    def _cap_tool_result(
+        self, result: Dict[str, Any], max_chars: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Cap textual result fields while never copying inline image data.
+
+        The configured budget applies to textual output/error fields.  Image
+        URLs are removed from the model-facing tool message and re-injected as
+        a separate user vision message by ``step()``; counting them as text
+        here was the primary source of multi-million-token context estimates.
+        """
+        capped = dict(result)
+        configured_limit = (
+            self.max_tool_result_chars if max_chars is None else max_chars
+        )
+        limit = max(1, int(configured_limit))
+        output = capped.get("output")
+        error = capped.get("error")
+
+        if isinstance(error, str):
+            error_limit = min(limit, self.TOOL_ERROR_RESERVE_CHARS)
+            capped["error"] = self._truncate_text(error, error_limit)
+        error_length = len(capped["error"]) if isinstance(capped.get("error"), str) else 0
+
+        if isinstance(output, str):
+            output_limit = max(0, limit - error_length)
+            capped["output"] = (
+                self._truncate_text(output, output_limit)
+                if output_limit
+                else ""
+            )
+
+        # A malformed/custom tool may return an inline image in another field;
+        # preserve the normal image_url contract but do not include it in the
+        # textual budget. Non-text metadata remains untouched.
+        return capped
+
+    def _execute_tool(self, name: str, args: Dict[str, Any], max_chars: Optional[int] = None) -> str:
+        """Execute a tool and return a capped JSON result for the model."""
         dispatch = {
             "read": lambda a: self.read_tool(a["path"]).to_dict(),
             "write": lambda a: self.write_tool(a["path"], a["content"]).to_dict(),
             "edit": lambda a: self.edit_tool(a["path"], a["oldText"], a["newText"]).to_dict(),
-            "search": lambda a: self.search_tool(a["pattern"], a.get("path"), a.get("include"), a.get("max_results", 50)).to_dict(),
+            "search": lambda a: self.search_tool(
+                a["pattern"],
+                a.get("path"),
+                a.get("include"),
+                a.get("max_results", 50),
+                a.get("timeout", SearchTool.DEFAULT_TIMEOUT),
+            ).to_dict(),
             "git": lambda a: self.git_tool(a["command"], path=a.get("path"), count=a.get("count", 10), message=a.get("message", "")).to_dict(),
             "new_terminal": lambda a: self.new_terminal_tool(a["background"]).to_dict(),
             "execute_command": lambda a: self.execute_command_tool(a["terminal_id"], a["command"], a.get("timeout"), a.get("is_background")).to_dict(),
@@ -952,20 +1024,38 @@ class Agent:
         }
 
         if name not in dispatch:
-            return json.dumps({"success": False, "output": "", "error": f"Unknown tool: {name}"})
+            return json.dumps(
+                self._cap_tool_result({
+                    "success": False,
+                    "output": "",
+                    "error": f"Unknown tool: {name}",
+                }, max_chars=max_chars),
+                ensure_ascii=False,
+            )
 
         try:
             result = dispatch[name](args)
-            return json.dumps(result)
+            return json.dumps(
+                self._cap_tool_result(result, max_chars=max_chars),
+                ensure_ascii=False,
+            )
         except Exception as e:
-            return json.dumps({"success": False, "output": "", "error": str(e)})
+            return json.dumps(
+                self._cap_tool_result(
+                    {"success": False, "output": "", "error": str(e)},
+                    max_chars=max_chars,
+                ),
+                ensure_ascii=False,
+            )
 
     @staticmethod
     def _tool_summary(name: str, args: Dict[str, Any]) -> str:
         if name == "read": return f"read file: {args.get('path', '?')}"
         if name == "write": return f"wrote file: {args.get('path', '?')}"
         if name == "edit": return f"edited file: {args.get('path', '?')}"
-        if name == "search": return f"search: '{args.get('pattern', '?')}' in {args.get('path', 'cwd')}"
+        if name == "search":
+            timeout = args.get("timeout", SearchTool.DEFAULT_TIMEOUT)
+            return f"search: '{args.get('pattern', '?')}' in {args.get('path', 'cwd')} (timeout: {timeout}s)"
         if name == "git":
             cmd = args.get("command", "?")
             if cmd == "commit": return f"git commit: {args.get('message', '')[:40]}"
@@ -1060,6 +1150,49 @@ class Agent:
             return "\n".join(parts)
         return ""
 
+    def _normalize_history_for_context(self) -> int:
+        """Cap legacy tool messages before they reach an API request.
+
+        Older saved sessions may contain multi-megabyte search/read results,
+        including image data accidentally embedded inside a JSON tool result.
+        Current execution paths cap results before insertion, but resumed
+        sessions need the same protection before compaction can be effective.
+        """
+        changed = 0
+        for message in self.conversation_history:
+            if not isinstance(message, dict) or message.get("role") != "tool":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            normalized = content
+            try:
+                parsed = json.loads(content)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                # Image data belongs in the separate vision user message. A
+                # legacy tool message containing it cannot be sent as text.
+                legacy_image_url = parsed.pop("image_url", None)
+                if legacy_image_url:
+                    # We cannot safely reconstruct the original tool-to-image
+                    # association in a saved history, but retaining a short
+                    # marker makes the lost vision context explicit without
+                    # putting base64 data back into the prompt.
+                    parsed["output"] = (
+                        f"{parsed.get('output', '')}\n[legacy image omitted; "
+                        "use a fresh screenshot/read-image call if needed]"
+                    )
+                parsed = self._cap_tool_result(parsed)
+                normalized = json.dumps(parsed, ensure_ascii=False)
+
+            elif len(content) > self.max_tool_result_chars:
+                normalized = self._truncate_text(content, self.max_tool_result_chars)
+            if normalized != content:
+                message["content"] = normalized
+                changed += 1
+        return changed
+
     def _truncate_history_if_needed(self):
         if len(self.conversation_history) >= 1 + self.MAX_HISTORY_MESSAGES:
             system = self.conversation_history[0]
@@ -1133,7 +1266,19 @@ Use this EXACT format:
 - [Data, file paths, function names, error messages needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages."""
+## User Messages & Agent-to-User Messages
+### User Messages
+- [Chronological, concise summary of every user message in the conversation being summarized]
+- [Preserve each request, correction, constraint, preference, and explicit question; do not omit messages]
+- [Or "(none)" if not applicable]
+
+### Agent-to-User Messages
+- [Chronological, concise summary of every substantive assistant response intended for the user]
+- [Preserve answers, explanations, status updates, decisions, and commitments; do not omit messages]
+- [Do not treat tool-call-only messages or tool results as agent-to-user messages]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages. The User Messages and Agent-to-User Messages subsections must cover every applicable message, in chronological order."""
 
     COMPACT_UPDATE_PROMPT = """The messages above are NEW conversation messages to incorporate into the existing summary.
 
@@ -1143,6 +1288,8 @@ Update the existing structured summary with new information. RULES:
 - UPDATE Progress: move items from "In Progress" to "Done" when completed
 - UPDATE "Next Steps" based on what was accomplished
 - PRESERVE exact file paths, function names, and error messages
+- PRESERVE the complete chronological User Messages and Agent-to-User Messages record
+- APPEND or update that record for every applicable new user message and substantive assistant response; do not silently omit any
 
 Use this EXACT format:
 
@@ -1168,32 +1315,139 @@ Use this EXACT format:
 ## Critical Context
 - [Preserve and add important context]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages."""
+## User Messages & Agent-to-User Messages
+### User Messages
+- [Chronological, concise summary of every user message represented by the existing summary or new messages]
+- [Preserve each request, correction, constraint, preference, and explicit question]
+- [Or "(none)" if not applicable]
+
+### Agent-to-User Messages
+- [Chronological, concise summary of every substantive assistant response represented by the existing summary or new messages]
+- [Preserve answers, explanations, status updates, decisions, and commitments]
+- [Do not treat tool-call-only messages or tool results as agent-to-user messages]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages. The User Messages and Agent-to-User Messages subsections must cover every applicable message, in chronological order."""
+
+    def _make_user_message(
+        self, user_message: Optional[str], image_url: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Build the same user message shape used by ``step()`` for preflight."""
+        if user_message is None:
+            return None
+        if image_url:
+            return {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_message},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        return {"role": "user", "content": user_message}
+
+    def _refresh_context_tokens(
+        self, pending_user_message: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Refresh context, including tools and a user message about to append."""
+        self._normalize_history_for_context()
+        messages = self.conversation_history
+        if pending_user_message is not None:
+            messages = [*messages, pending_user_message]
+        self.tokens.context_tokens = self.tokens.count_request(
+            messages,
+            self._get_tool_schema(),
+        )
 
     def _should_auto_compact(self) -> bool:
         if self.tokens.context_window == 0:
             return False
         return self.tokens.context_pct >= self.COMPACT_THRESHOLD_PCT
 
+    def _is_safe_compact_boundary(self, index: int) -> bool:
+        """Return whether ``index`` can begin the preserved API message tail."""
+        history = self.conversation_history
+        if index == len(history):
+            return True  # Summarize the entire non-system history.
+        if index <= 1 or index >= len(history):
+            return False
+
+        message = history[index]
+        role = message.get("role")
+        if role == "user":
+            return True
+        if role != "assistant":
+            return False
+
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return True
+
+        # An assistant tool-call message is only valid when every requested
+        # call has its matching result immediately after it. Never cut in the
+        # middle of that chain, or the next API request will be rejected.
+        expected_ids = [tc.get("id") for tc in tool_calls]
+        if not expected_ids or any(not call_id for call_id in expected_ids):
+            return False
+        found_ids = set()
+        result_index = index + 1
+        while result_index < len(history) and history[result_index].get("role") == "tool":
+            tool_call_id = history[result_index].get("tool_call_id")
+            if tool_call_id:
+                found_ids.add(tool_call_id)
+            result_index += 1
+        return set(expected_ids).issubset(found_ids)
+
     def _find_compact_boundary(self) -> int:
+        """Find a safe boundary even when the only user turn is still running.
+
+        Previously this method could only return a later ``user`` message.
+        An active request commonly has ``user -> assistant tool_calls -> tool``
+        messages and no later user message, so compaction fell through with an
+        empty summary range. The checkpoint inserted by :meth:`compact` is a
+        user message, which means the preserved tail may safely begin at a
+        complete assistant/tool chain instead.
+        """
+        history_length = len(self.conversation_history)
         keep_tokens = max(int(self.tokens.context_window * self.COMPACT_KEEP_RECENT_PCT), 1000)
         accumulated = 0
-        for i in range(len(self.conversation_history) - 1, 0, -1):
-            msg = self.conversation_history[i]
-            text = self._get_text_content(msg.get("content", "") or "")
-            if msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    func = tc.get("function", {})
-                    text += func.get("name", "") + func.get("arguments", "")
-            msg_tokens = len(self.tokens._enc.encode(text)) + 4
-            accumulated += msg_tokens
+        candidate = 2 if history_length > 2 else 1
+        for index in range(history_length - 1, 0, -1):
+            message = self.conversation_history[index]
+            # Use the same field-aware counter as the preflight decision so
+            # the retention target cannot be reached by an estimate that
+            # silently omits tool IDs, names, arguments, or vision metadata.
+            accumulated += self.tokens.count_message(message)
             if accumulated >= keep_tokens:
-                for j in range(i, len(self.conversation_history)):
-                    if self.conversation_history[j].get("role") == "user":
-                        return j
-        return min(2, len(self.conversation_history) - 1)
+                candidate = index
+                break
+
+        # Prefer the latest safe boundary at or before the token target. If
+        # the target is inside a tool result, this backs up to its assistant
+        # call. If the target is the only user message, the earliest later
+        # safe boundary summarizes that request while preserving the live
+        # execution context. ``len(history)`` is the last-resort valid choice
+        # for an incomplete chain: summarize it rather than send orphaned
+        # messages.
+        for index in range(min(candidate, history_length - 1), 1, -1):
+            if self._is_safe_compact_boundary(index):
+                return index
+
+        # No safe boundary exists before the target. Move forward to the
+        # first complete assistant/tool chain or user message. If the history
+        # ends in an incomplete chain, keeping the full chain in the summary
+        # is safer than leaving orphaned tool messages in the preserved tail.
+        for index in range(max(candidate + 1, 2), history_length + 1):
+            if self._is_safe_compact_boundary(index):
+                return index
+        return history_length
 
     def _serialize_messages_for_summary(self, messages: list) -> str:
+        """Serialize old messages with hard bounds for the summary request.
+
+        A compaction request is itself an API request. Passing an entire large
+        tool result (or an inline image URL) to the summarizer can exceed the
+        provider before compaction has a chance to reduce the main history.
+        """
         parts = []
         for msg in messages:
             role = msg.get("role", "unknown")
@@ -1217,8 +1471,43 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 parts.append(f"User: {content}")
         return "\n\n".join(parts)
 
+    def _cap_compaction_prompt(self, prompt: str, previous_summary: Optional[str]) -> tuple[str, Optional[str]]:
+        """Bound summarizer input while retaining room for its instructions."""
+        # Reserve room for the summarizer's requested completion and leave a
+        # safety margin for provider message framing/hidden system overhead.
+        available = max(
+            1_000,
+            self.tokens.context_window - self.COMPACT_RESERVE_TOKENS - 1_024,
+        )
+        instruction = self.COMPACT_UPDATE_PROMPT if previous_summary else self.COMPACT_SUMMARY_PROMPT
+        fixed = len(self.tokens._enc.encode(
+            f"<conversation>\n\n</conversation>\n\n{instruction}"
+        ))
+        previous = previous_summary or ""
+        previous_tokens = len(self.tokens._enc.encode(previous)) if previous else 0
+        conversation_budget = max(1_000, available - fixed - previous_tokens)
+        prompt_tokens = self.tokens._enc.encode(prompt)
+        if len(prompt_tokens) > conversation_budget:
+            # Keep the beginning and end; both often contain the user's goal
+            # and the latest active tool result/error respectively.
+            marker = "\n[older summary input truncated]\n"
+            marker_tokens = self.tokens._enc.encode(marker)
+            if len(marker_tokens) >= conversation_budget:
+                prompt = self.tokens._enc.decode(prompt_tokens[:conversation_budget])
+            else:
+                usable = conversation_budget - len(marker_tokens)
+                head = max(1, usable // 2)
+                tail = max(1, usable - head)
+                prompt = (
+                    self.tokens._enc.decode(prompt_tokens[:head])
+                    + marker
+                    + self.tokens._enc.decode(prompt_tokens[-tail:])
+                )
+        return prompt, previous_summary
+
     def _generate_summary(self, messages_to_summarize: list, previous_summary: Optional[str] = None) -> str:
         prompt = self._serialize_messages_for_summary(messages_to_summarize)
+        prompt, previous_summary = self._cap_compaction_prompt(prompt, previous_summary)
         if previous_summary:
             full_prompt = f"<conversation>\n{prompt}\n</conversation>\n\n<previous-summary>\n{previous_summary}\n</previous-summary>\n\n{self.COMPACT_UPDATE_PROMPT}"
         else:
@@ -1241,13 +1530,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         if len(history) <= 2:
             return "Nothing to compact \u2014 conversation is still short."
         boundary = self._find_compact_boundary()
-        if boundary >= len(history) or history[boundary].get("role") != "user":
-            for idx in range(2, len(history)):
-                if history[idx].get("role") == "user":
-                    boundary = idx
-                    break
-            else:
-                return "Nothing to compact \u2014 couldn't find a user message boundary."
+        if not self._is_safe_compact_boundary(boundary):
+            return "Nothing to compact \u2014 couldn't find a safe message boundary."
         to_summarize = history[1:boundary]
         if not to_summarize:
             return "Nothing to compact \u2014 all messages are recent."
@@ -1267,8 +1551,15 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         }
         recent = history[boundary:]
         self.conversation_history = [system_msg, compaction_msg] + recent
-        self.tokens.start_turn(self.conversation_history)
-        self.tokens.finish_turn()
+        # Recount the compacted request for display/trigger decisions, but do
+        # not add it to cumulative session input: those messages were already
+        # accounted for on their original turns.
+        self.tokens.context_tokens = self.tokens.count_request(
+            self.conversation_history,
+            self._get_tool_schema(),
+        )
+        self.tokens.turn_input = self.tokens.context_tokens
+        self.tokens.turn_output = 0
         return f"Compacted: summarized {len(to_summarize)} messages into checkpoint."
 
     def auto_compact_if_needed(self) -> Optional[str]:
@@ -1308,30 +1599,22 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         return messages
 
     def _format_api_error(self, e: Exception) -> str:
-        lines = [f"OpenAI API Error: {type(e).__name__}\n"]
+        """Return concise API diagnostics without an exception traceback.
+
+        Gateway/proxy failures often arrive as low-level ``httpx`` or
+        ``httpcore`` exceptions.  Their ``str`` value is useful, but their
+        chained traceback is not actionable for a normal CLI response, so
+        only the exception type and one-line message are surfaced here.
+        """
+        error_name = type(e).__name__
+        message = " ".join(str(e).split()) or "No additional details provided."
+        lines = [f"OpenAI API Error: {error_name}", f"  Message: {message}"]
+
         if isinstance(e, APIStatusError):
-            lines.append(f"  Status Code: {e.status_code}")
-            lines.append(f"  Request ID:  {e.request_id or '(none)'}")
-            body = getattr(e, "body", None)
-            if body:
-                if isinstance(body, dict):
-                    error_obj = body.get("error", body)
-                    if isinstance(error_obj, dict):
-                        lines.append(f"  Error Type:  {error_obj.get('type', '(none)')}")
-                        lines.append(f"  Error Code:  {error_obj.get('code', '(none)')}")
-                        lines.append(f"  Message:     {error_obj.get('message', str(body))}")
-                        param = error_obj.get("param")
-                        if param:
-                            lines.append(f"  Param:       {param}")
-                    else:
-                        lines.append(f"  Body: {body}")
-                else:
-                    lines.append(f"  Body: {body}")
-            resp = getattr(e, "response", None)
-            if resp is not None:
-                text = getattr(resp, "text", None)
-                if text and text != str(body):
-                    lines.append(f"  Response:    {text[:500]}")
+            lines.insert(1, f"  Status Code: {e.status_code}")
+            request_id = getattr(e, "request_id", None)
+            if request_id:
+                lines.insert(2, f"  Request ID:  {request_id}")
         elif isinstance(e, AuthenticationError):
             lines.append("  Hint: Check your OPENAI_API_KEY and OPENAI_BASE_URL in .env")
         elif isinstance(e, RateLimitError):
@@ -1339,11 +1622,12 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         elif isinstance(e, APIConnectionError):
             lines.append(f"  Hint: Could not connect to {self.client.base_url}")
             lines.append("  Check that the API server is running and reachable.")
-        else:
-            lines.append(f"  Message: {str(e)}")
-        lines.append(f"\n  Config:")
-        lines.append(f"    Model:    {self.model}")
-        lines.append(f"    Base URL: {self.client.base_url}")
+
+        lines.extend([
+            "  Config:",
+            f"    Model:    {self.model}",
+            f"    Base URL: {self.client.base_url}",
+        ])
         return "\n".join(lines)
 
     @staticmethod
@@ -1353,11 +1637,19 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         if isinstance(e, APIStatusError):
             return e.status_code in (500, 502, 503, 504)
         err = str(e).lower()
-        return any(c in err for c in ["timeout", "connection", "network"])
+        return any(c in err for c in ["timeout", "connection", "network", "remoteprotocolerror", "incomplete chunked read"])
 
-    def _call_openai_with_retry(self, max_retries: int = 3, base_delay: float = 1.0):
+    def _retry_delay(self, attempt: int, base_delay: Optional[float] = None) -> float:
+        """Return a short exponential backoff with small deterministic jitter."""
+        delay = self.API_RETRY_BASE_DELAY if base_delay is None else base_delay
+        return delay * (2 ** attempt) + 0.5 * attempt
+
+    def _call_openai_with_retry(self, max_retries: Optional[int] = None, base_delay: Optional[float] = None):
+        """Call the non-streaming endpoint, retrying transient failures twice."""
+        retries = self.API_MAX_RETRIES if max_retries is None else max_retries
+        attempts = retries + 1
         last_exc = None
-        for attempt in range(max_retries):
+        for attempt in range(attempts):
             try:
                 return self.client.chat.completions.create(
                     model=self.model,
@@ -1367,17 +1659,25 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 )
             except Exception as e:
                 last_exc = e
-                if not self._is_retryable_error(e) or attempt == max_retries - 1:
+                if not self._is_retryable_error(e) or attempt == attempts - 1:
                     break
-                time.sleep(base_delay * (2 ** attempt) + 0.5 * attempt)
-        raise Exception(self._format_api_error(last_exc)) from last_exc
+                time.sleep(self._retry_delay(attempt, base_delay))
+        raise APIRequestError(self._format_api_error(last_exc)) from None
 
     def _stream_response(self) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, int]]]:
-        max_retries = 3
-        base_delay = 1.0
+        """Stream a response, retrying transient connection failures twice.
+
+        Retries cover both request creation and iteration: a gateway can close
+        a chunked response after streaming has already started.  Partial data
+        is discarded before retrying so content/tool calls are never mixed
+        across attempts.
+        """
+        retries = self.API_MAX_RETRIES
+        attempts = retries + 1
         last_exc = None
-        stream = None
-        for attempt in range(max_retries):
+
+        for attempt in range(attempts):
+            stream = None
             try:
                 stream = self.client.chat.completions.create(
                     model=self.model,
@@ -1387,56 +1687,64 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                     stream=True,
                     stream_options={"include_usage": True},
                 )
-                break
+
+                if self.on_stream_start:
+                    self.on_stream_start()
+                content = ""
+                tool_calls: Dict[int, Dict[str, str]] = {}
+                api_usage = None
+                for chunk in stream:
+                    self._check_interrupt()
+                    if not chunk.choices:
+                        if chunk.usage:
+                            api_usage = {
+                                "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                                "completion_tokens": chunk.usage.completion_tokens or 0,
+                            }
+                        continue
+                    delta = chunk.choices[0].delta
+                    if not delta:
+                        continue
+                    if delta.content:
+                        content += delta.content
+                        if self.on_stream_token:
+                            self.on_stream_token(delta.content)
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in tool_calls:
+                                tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                            if tc.id:
+                                tool_calls[idx]["id"] = tc.id
+                            if tc.function:
+                                if tc.function.name:
+                                    tool_calls[idx]["name"] = tc.function.name
+                                if tc.function.arguments:
+                                    tool_calls[idx]["arguments"] += tc.function.arguments
+
+                assembled = []
+                for idx in sorted(tool_calls.keys()):
+                    tc = tool_calls[idx]
+                    try:
+                        args = json.loads(tc["arguments"])
+                    except json.JSONDecodeError:
+                        args = {}
+                    assembled.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+                return content, assembled, api_usage
+            except InterruptedError:
+                raise
             except Exception as e:
                 last_exc = e
-                if not self._is_retryable_error(e) or attempt == max_retries - 1:
+                if not self._is_retryable_error(e) or attempt == attempts - 1:
                     break
-                time.sleep(base_delay * (2 ** attempt) + 0.5 * attempt)
-        if stream is None:
-            raise Exception(self._format_api_error(last_exc)) from last_exc
-        if self.on_stream_start:
-            self.on_stream_start()
-        content = ""
-        tool_calls: Dict[int, Dict[str, str]] = {}
-        api_usage = None
-        for chunk in stream:
-            self._check_interrupt()
-            if not chunk.choices:
-                if chunk.usage:
-                    api_usage = {
-                        "prompt_tokens": chunk.usage.prompt_tokens or 0,
-                        "completion_tokens": chunk.usage.completion_tokens or 0,
-                    }
-                continue
-            delta = chunk.choices[0].delta
-            if not delta:
-                continue
-            if delta.content:
-                content += delta.content
-                if self.on_stream_token:
-                    self.on_stream_token(delta.content)
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls:
-                        tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
-                    if tc.id:
-                        tool_calls[idx]["id"] = tc.id
-                    if tc.function:
-                        if tc.function.name:
-                            tool_calls[idx]["name"] = tc.function.name
-                        if tc.function.arguments:
-                            tool_calls[idx]["arguments"] += tc.function.arguments
-        assembled = []
-        for idx in sorted(tool_calls.keys()):
-            tc = tool_calls[idx]
-            try:
-                args = json.loads(tc["arguments"])
-            except json.JSONDecodeError:
-                args = {}
-            assembled.append({"id": tc["id"], "name": tc["name"], "arguments": args})
-        return content, assembled, api_usage
+                # The UI may still hold a partial stream from this attempt;
+                # close it before the next request rather than appending a
+                # second response to the same panel.
+                if self.on_stream_end:
+                    self.on_stream_end("", False)
+                time.sleep(self._retry_delay(attempt))
+
+        raise APIRequestError(self._format_api_error(last_exc)) from None
 
     def step(self, user_message: Optional[str] = None, image_url: Optional[str] = None) -> Tuple[Optional[str], List[Dict[str, Any]]]:
         self._check_interrupt()
@@ -1476,10 +1784,19 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                     f"{background_notifications}"
                 ),
             })
+        normalized_count = self._normalize_history_for_context()
         recovery = self._validate_history_before_api()
-        if recovery and self.on_compact:
-            self.on_compact(recovery)
-        self.tokens.start_turn(self.conversation_history)
+        if (normalized_count or recovery) and self.on_compact:
+            details = []
+            if normalized_count:
+                details.append(f"normalized {normalized_count} oversized legacy tool result(s)")
+            if recovery:
+                details.append(recovery)
+            self.on_compact("; ".join(details) + ".")
+        self.tokens.start_turn(
+            self.conversation_history,
+            extra_tokens=self.tokens.count_tools(self._get_tool_schema()),
+        )
         content, assembled_tool_calls, api_usage = self._stream_response()
         if api_usage:
             self.tokens.set_turn_from_api(api_usage["prompt_tokens"], api_usage["completion_tokens"])
@@ -1519,7 +1836,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             image_data_url = result_dict.pop("image_url", None)
             if image_data_url:
                 tool_image_data_urls.append(image_data_url)
-            text_content = json.dumps(result_dict)
+            text_content = json.dumps(result_dict, ensure_ascii=False)
             tool_msg = {
                 "tool_call_id": tc["id"],
                 "role": "tool",
@@ -1552,10 +1869,16 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             while True:
                 if self._should_stop():
                     return "[Stopped \u2014 waiting for your input]"
-                if current is not None:
-                    compact_msg = self.auto_compact_if_needed()
-                    if compact_msg and self.on_compact:
-                        self.on_compact(compact_msg)
+                # Check before every API step, not only before the initial
+                # user message. A tool-call loop sets ``current`` to None
+                # after its first step, so restricting this check to
+                # ``current is not None`` delayed compaction until the next
+                # user request.
+                pending_user = self._make_user_message(current, _first_image)
+                self._refresh_context_tokens(pending_user)
+                compact_msg = self.auto_compact_if_needed()
+                if compact_msg and self.on_compact:
+                    self.on_compact(compact_msg)
                 response, tool_calls = self.step(current, image_url=_first_image)
                 _first_image = None
                 current = None

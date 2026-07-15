@@ -12,25 +12,30 @@ Kairos is a minimal coding agent written in Python. It uses the OpenAI chat comp
 Agent2/
 ├── main.py                 # Root entry point (imports from kairos.main)
 ├── temp.py                 # Headless agent runner — run_agent(prompt) with no CLI
+├── run_temp_cli.py         # Textual frontend launcher
 ├── .env                    # Environment configuration (API keys)
 ├── .env.example            # Template for .env file
 ├── requirements.txt        # Python dependencies
 ├── pyproject.toml          # Project metadata and build configuration
 ├── README.md               # User-facing documentation
 ├── AGENTS.md               # This file - architecture documentation
+├── kairos_old.bat          # Windows legacy CLI launcher (runs Agent2 source while preserving caller CWD)
 ├── kairos.bat              # Windows shortcut (py main.py)
-├── chats/                  # Saved chat sessions (gitignored)
-│   └── chats.json          # All chat history in one file
+├── chats/                  # Default/direct-caller saved chat sessions (gitignored)
+│   └── chats.json          # Legacy fallback history; workspace CLI sessions use <workspace>/chats/chats.json
 ├── skills/                 # Skills directory (gitignored, stays local)
 │   └── moodle-quiz/        # Example: Moodle quiz skill
 │       └── SKILL.md
+├── tests/                  # Local regression tests
+│   └── test_compaction.py  # Context accounting, compaction, and legacy-result tests
 └── kairos/
     ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, SkillManager, TerminalManager, BrowserManager
     ├── main.py             # CLI REPL loop, signal handlers, auto-save, paste resolution
     ├── resume.py           # Shared saved-history repair and mid-execution resume logic
     ├── config.py           # Lazy .env loading via lru_cache
     ├── agent.py            # Core agent: streaming, tool dispatch, compaction, error handling
-    ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling, KairosMarkdown for enhanced table rendering
+    ├── cli.py              # Terminal UI: streaming panels, thinking dots, paste handling, session picker, KairosMarkdown for enhanced table rendering
+    ├── temp_cli.py         # Textual frontend, workspace-aware numbered resume picker
     ├── tokens.py           # TokenCounter using tiktoken
     ├── terminal_manager.py # Terminal lifecycle (background + blocking)
     ├── browser_manager.py  # Playwright/CloakBrowser in dedicated worker thread + CDP cross-origin iframe support
@@ -62,6 +67,8 @@ from kairos.main import main
 if __name__ == "__main__":
     main()
 ```
+
+`kairos_old.bat` is a PATH-safe legacy launcher. It invokes this root entry point by absolute path while preserving the caller's current directory, so the current directory remains the Agent workspace even when the launcher is found through `PATH`.
 
 ### `kairos/__init__.py`
 
@@ -104,11 +111,18 @@ Lazy-loads `.env` on first access via `python-dotenv`. Uses `@lru_cache(maxsize=
 
 **Key detail**: `OPENAI_API_KEY()` clears its own cache if the key is missing (so `validate()` can re-check after `.env` is created).
 
+| `Config.MAX_TOOL_RESULT_CHARS()` | `int` | 20,000 |
+| `Config.CONTEXT_WINDOW()` | `int` | 262,000 |
+
+`Config.MAX_TOOL_RESULT_CHARS()` reads the optional `KAIROS_MAX_TOOL_RESULT_CHARS` setting. Invalid or non-positive values fall back to the 20,000-character default.
+
+`Config.CONTEXT_WINDOW()` reads the optional `KAIROS_CONTEXT_WINDOW` setting. It is the conservative prompt budget used by `TokenCounter`, dynamic keep-recent compaction, and compaction-prompt budgeting; invalid or non-positive values fall back to 262,000. Set it to the actual context limit accepted by the configured gateway/model.
+
 ### `kairos/main.py` — CLI Entry Point
 
 **Function**: `main()` — orchestrates the entire application lifecycle.
 
-**Resume flow**: `/resume` delegates to `kairos.resume.sanitize_history_for_resume()`. It anchors resume decisions at the latest real user request, repairs incomplete assistant/tool chains with synthetic failed results, and automatically sends `Continue where you left off. Pick up the next step.` for mid-execution sessions.
+**Resume flow**: `/resume` delegates to `kairos.resume.sanitize_history_for_resume()`. It anchors resume decisions at the latest real user request, repairs incomplete assistant/tool chains with synthetic failed results, and automatically sends `Continue where you left off. Pick up the next step.` for mid-execution sessions. The standard CLI accepts both `/resume` followed by a numbered picker entry and `/resume 1`; its picker consumes buffered handoff input and retries invalid choices instead of returning to the agent prompt. The Textual frontend uses the active agent workspace's `chats/chats.json`, extracts the selected metadata dictionary's string `id`, and keeps selection mode active until a valid chat is loaded.
 
 **Global state**: `_session_mgr` and `_agent` are module-level globals shared with signal handlers.
 
@@ -123,15 +137,18 @@ Lazy-loads `.env` on first access via `python-dotenv`. Uses `@lru_cache(maxsize=
 1. Starts an Escape key listener (via `cli.start_escape_listener`)
 2. Runs `agent.run(user_input, image_url)` in a background thread
 3. Main thread polls `t.join(timeout=0.15)` — catches `KeyboardInterrupt` to call `agent.interrupt()`
-4. Returns the agent's response or `"[Interrupted]"`
+4. Stops the Escape listener completely before the next prompt owns stdin, and returns the agent's response or `"[Interrupted]"`
+
+The Escape listener shares the terminal with `PromptSession`, so it buffers ordinary characters (including a complete command typed during the response-to-prompt handoff) instead of discarding them. Escape itself still requests a graceful stop. The listener uses short polling waits and no terminal-input flush, preventing a command such as `/exit` from being lost and requiring a second entry.
 
 **REPL loop** (inside `main()`):
-1. `cli.get_user_input()` → handles paste token resolution (text + images from clipboard)
-2. Command dispatch: `exit`, `clear`, `reset`, `/resume`, `/compact`, `/paste`
-3. Clipboard image auto-detection on empty input or alongside text
-4. `cli.start_thinking()` → `process_request()` → `cli.stop_thinking()`
-5. Response display (streaming panel handles it; `_skip_print_response` prevents double-print)
-6. Auto-save after each exchange (all saves go through `_save_now()` which holds `_auto_save_lock` to prevent race conditions with the auto-save thread)
+1. `cli.get_user_input()` → returns prompt text and handles any buffered handoff input
+2. `_resolve_paste_input()` resolves text/image tokens before command dispatch, so pasted aliases such as `/exit` are handled locally
+3. Command dispatch: `exit`, `clear`, `reset`, `/resume`, `/compact`, `/paste`
+4. Clipboard image auto-detection on empty input or alongside text
+5. `cli.start_thinking()` → `process_request()` → `cli.stop_thinking()`
+6. Response display (streaming panel handles it; `_skip_print_response` prevents double-print)
+7. Auto-save after each exchange (all saves go through `_save_now()` which holds `_auto_save_lock` to prevent race conditions with the auto-save thread)
 
 **Resume sanitization** (`kairos.resume.sanitize_history_for_resume(history)`):
 - Anchors the decision at the latest real user request, so an older clean response cannot hide a newer interrupted request
@@ -140,7 +157,7 @@ Lazy-loads `.env` on first access via `python-dotenv`. Uses `@lru_cache(maxsize=
 - Returns `(sanitized_history, last_agent_content, is_mid_execution)` — `(None, "", False)` if no resumable state exists
 - The CLI displays the last clean response on normal resume and auto-continues mid-execution sessions with `Continue where you left off. Pick up the next step.`
 
-The Textual frontend (`kairos/temp_cli.py`) uses the same shared sanitizer and continuation behavior.
+The Textual frontend (`kairos/temp_cli.py`) uses the same shared sanitizer and continuation behavior. It uses `SessionManager(agent.cwd)` so both frontends list the same workspace-local sessions, and its numbered picker passes `sessions[index]["id"]` to `load_session()` while retaining selection mode after invalid or unloadable entries.
 
 `kairos.main._sanitize_history_for_resume` remains a compatibility alias to the shared function for existing callers.
 
@@ -157,6 +174,7 @@ agent.on_background_notification = cli.print_background_notification
 agent.subagent_tool._tool_printer = lambda summary: cli.console.print(f"  ↓ subagent: {summary}")
 agent.subagent_tool._stream_start = lambda: cli.start_stream()
 agent.subagent_tool._stream_token = cli.on_stream_token
+agent.subagent_tool._token_update = lambda subagent_id, tc: cli.print_subagent_token_status(subagent_id, tc)
 agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream()
 ```
 
@@ -167,6 +185,8 @@ agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream
 ### `kairos/agent.py` — Agent (Core)
 
 **Background terminal notifications**: `Agent` retains completed background-terminal events in the manager queue. While `Agent.run()` is processing, completions display immediately through `on_background_notification`; while idle they stay quiet and are shown when the next request drains them. They are inserted as a separate user message after the next real user message (or before the next API step if the agent is still working). Notification output is capped by the terminal manager.
+
+**Tool-result limits**: `_execute_tool()` caps textual `output` and `error` fields before serialization and history insertion. The default per-result limit is 20,000 characters. Truncation preserves the beginning and end, records the original length in a marker, and never copies inline image URLs into the textual tool message. Screenshot/read images are stripped from the tool result and re-injected as a separate user vision message. Configure the text limit with `KAIROS_MAX_TOOL_RESULT_CHARS`. Full background-terminal output remains available through `read_logs`.
 
 **Class**: `Agent`
 
@@ -196,9 +216,11 @@ agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream
 - `on_stream_start() -> None`
 - `on_stream_token(token: str) -> None`
 - `on_stream_end(content: str, has_tool_calls: bool) -> None`
-- `on_token_update(counter: TokenCounter) -> None`
+- `on_token_update(counter: TokenCounter) -> None` — parent-agent token status after each turn
 - `on_compact(status_msg: str) -> None`
 - `on_background_notification(message: str) -> None` — visible completion notice while processing; idle notices remain queued until the next request
+
+`SubAgentTool._token_update(subagent_id, counter)` is an optional frontend callback. Each child agent installs it as its `on_token_update` callback, so blocking and non-blocking subagents report their own session/context/turn token status without mutating the parent's `TokenCounter`. The legacy CLI and Textual frontend display these updates with the child ID.
 
 #### System Prompt (`_setup_system_prompt`)
 
@@ -225,7 +247,7 @@ Returns a list of 40 OpenAI function tool definitions. If `self._is_subagent` is
 
 #### Tool Execution (`_execute_tool(name, args)`)
 
-Dispatch dict mapping tool names to lambdas. Each calls the corresponding tool instance and returns `json.dumps(result.to_dict())`. Catches all exceptions and returns error JSON.
+Dispatch dict mapping tool names to lambdas. Each calls the corresponding tool instance and returns capped JSON. Text output and errors are centrally limited before entering `conversation_history`: the default is 20,000 characters per result. Oversized text preserves its beginning and end and includes the original character count. `KAIROS_MAX_TOOL_RESULT_CHARS` can override the default. Image URLs are not text-truncated. Catches all exceptions and returns capped error JSON.
 
 #### Tool Summaries (`_tool_summary(name, args)`)
 
@@ -235,7 +257,9 @@ Static method. Returns a one-line human-readable summary string for each tool ca
 
 Returns `(full_content: str, assembled_tool_calls: List[Dict], api_usage: Dict | None)`.
 
-**Retry logic**: Up to 3 attempts for retryable errors (rate limits, connection errors, 500/502/503/504). Exponential backoff with jitter.
+**Retry logic**: API requests make an initial attempt plus two retries for retryable errors (rate limits, connection errors, timeouts, network errors, interrupted chunked streams such as `RemoteProtocolError`, and 500/502/503/504 responses). Exponential backoff is used between attempts. Retries cover both request creation and streaming response iteration, and partial stream content is discarded before retrying.
+
+When all attempts fail, `APIRequestError` carries concise one-line diagnostics (exception type/message, relevant status/request ID, hints, model, and base URL) without an exception traceback. The CLI suppresses traceback output for normal request failures so gateway errors do not dump `httpx`/`httpcore` internals.
 
 **Streaming loop**:
 1. Calls `on_stream_start()` callback
@@ -260,7 +284,7 @@ Returns `(response_text | None, tool_calls_made: List[Dict])`.
 7. If no tool calls: calls `tokens.finish_turn()`, returns response
 8. If tool calls: when using tiktoken fallback, counts tool call argument tokens via `add_output_tokens()` (API counts already include these); executes each via `_execute_tool()`, appends tool results to history, truncates history if >10,000,000 messages (effectively disabled), calls `tokens.finish_turn()`
 
-**Important**: Tool results have `image_url` stripped before appending to history. Screenshot images are re-injected as a user vision message (with `[Screenshot captured]` prefix) so the model can actually see them, since tool messages can't carry images on most providers. Tool results are NOT counted as output tokens — they become input tokens in the next turn via `start_turn()`.
+**Important**: Tool results have `image_url` stripped before appending to history. Screenshot images are re-injected as a user vision message (with `[Screenshot captured]` prefix) so the model can actually see them, since tool messages can't carry images on most providers. Textual tool results are centrally capped before appending; image URLs are preserved separately and counted with a bounded vision estimate. Legacy saved tool results are normalized before the next API request; an old embedded image is replaced with a short omission marker because its original vision message cannot be safely reconstructed. Tool results are NOT counted as output tokens — they become input tokens in the next turn via `start_turn()`.
 
 #### Run (`run(user_message, image_url?)`)
 
@@ -268,7 +292,8 @@ The main agent loop:
 1. Clears interrupt event
 2. Loops indefinitely until one of the termination conditions is met:
    - Checks `_should_stop()` (Escape) between steps
-   - Auto-compacts if context > 80%
+   - Recounts the current in-memory history and checks auto-compaction before **every** API step, including steps inside a tool-call loop. This is necessary because API prompt usage is measured before tool results are appended; the next step must see the newly added history rather than waiting for another user request.
+   - Auto-compacts if context > 80%, using a safe user boundary or a complete assistant/tool-call chain so active execution can continue with valid API message ordering.
    - Calls `step()`
    - **Empty response retry**: If `step()` returns no content AND no tool calls, removes the assistant message from history and retries up to 2 times. This handles transient API issues where the model returns empty responses.
    - Returns when: final response received (3+ words or tool calls), no tool calls (after retries exhausted), interrupt, or graceful stop (Escape)
@@ -282,7 +307,7 @@ The main agent loop:
 - `COMPACT_THRESHOLD_PCT = 80.0` — auto-compact threshold
 
 **`compact()`**:
-1. `_find_compact_boundary()` — walks backward from end, accumulates tokens, finds cut point keeping 20% of context window
+1. `_find_compact_boundary()` — walks backward from end, accumulates the same field-aware message tokens used by preflight (including tool-call metadata and bounded vision estimates), and chooses a safe user boundary or complete assistant/tool-call chain while keeping 20% of the context window recent
 2. Serializes old messages into readable text (`_serialize_messages_for_summary()`)
 3. `_generate_summary()` — non-streaming API call with structured prompt
 4. If existing compaction summary exists, passes it as `<previous-summary>` for incremental update
@@ -290,6 +315,8 @@ The main agent loop:
    - Compaction message is `role: "user"` so it flows naturally in conversation ordering
    - Existing compaction summaries are detected by content prefix `"[Conversation compacted"`
 6. Re-counts tokens
+
+`auto_compact_if_needed()` is evaluated before every API step in `run()`, not just the first step of a user request. `_refresh_context_tokens()` recounts the in-memory history after tool results are appended, includes the function-tool schema, and preflights the user message about to be appended, because API prompt usage from the previous step does not include those results or the next request. Message counting includes assistant tool-call metadata/arguments and tool IDs/names; the old visible-text-only estimate could under-report the request substantially. Compaction also bounds the separate summarizer prompt to the configured context budget minus `COMPACT_RESERVE_TOKENS` and a 1,024-token framing margin, so a huge tool result cannot make the compaction request breach the same window.
 
 **Summary format** (structured checkpoint):
 ```
@@ -299,13 +326,22 @@ The main agent loop:
 ## Key Decisions
 ## Next Steps
 ## Critical Context
+## User Messages & Agent-to-User Messages
+### User Messages
+### Agent-to-User Messages
 ```
+
+The compaction prompt requires the final two subsections to preserve a concise, chronological record of every user message and every substantive agent-to-user response represented by the summarized history. Tool-call-only assistant messages and tool results are excluded from the agent-to-user record. Incremental compaction must preserve and extend both records.
 
 #### Error Handling
 
-**`_format_api_error(e)`**: Extracts maximum detail from OpenAI exceptions — status code, request ID, error type/code/message, response body, config (model + base URL). Returns formatted string.
+**`APIRequestError`**: User-facing exception raised after the initial API attempt and two retries are exhausted. It intentionally has no traceback chaining at the display boundary.
 
-**`_is_retryable_error(e)`**: Returns True for `RateLimitError`, `APIConnectionError`, and `APIStatusError` with 500/502/503/504.
+**`_format_api_error(e)`**: Produces concise diagnostics from OpenAI and low-level gateway exceptions — one-line exception type/message, status/request ID where available, a targeted hint, and config (model + base URL). It does not include response bodies or traceback text.
+
+**`_is_retryable_error(e)`**: Returns True for `RateLimitError`, `APIConnectionError`, `APIStatusError` with 500/502/503/504, and matching timeout/connection/network/`RemoteProtocolError`/incomplete-chunk messages.
+
+**`_stream_response()`** retries errors raised both when opening the stream and while iterating its chunks. A failed partial stream is closed in the UI and discarded before retrying.
 
 #### Reset (`reset()`)
 
@@ -317,11 +353,13 @@ Keeps `system + last MAX_HISTORY_MESSAGES (10,000,000)`. After truncation, verif
 
 #### History Validation (`_validate_history_before_api()`)
 
-Called before every API request in `step()`. Handles two structural problems that cause 400 errors:
+Called before every API request in `step()`. `_normalize_history_for_context()` runs first so legacy saved tool results are capped and embedded `image_url` fields are removed before the request is counted. Handles two structural problems that cause 400 errors:
 1. **No user message**: If the conversation history has no user message (from truncation or compaction), triggers a `compact()` to restore a valid state.
 2. **Orphaned tool messages**: If trailing tool messages lack a preceding assistant message (from truncation cutting at a bad point), they are trimmed to restore valid ordering.
 
 ### `kairos/cli.py` — CLI (Terminal UI)
+
+The saved-chat picker accepts an optional inline choice for `/resume N`, consumes complete lines buffered by the Escape listener before opening its prompt, and loops after invalid input so a numeric selection cannot fall through to normal agent processing.
 
 **Classes**: `CLI`, `KairosMarkdown`, `_EnhancedTableElement`
 
@@ -352,46 +390,49 @@ A `MarkdownElement` subclass that yields a `rich.table.Table` with `box.ROUNDED`
 - `_paste_registry: Dict[str, dict]` — maps token strings to `{type: "text"|"image", ...}`
 - `_make_image_token()` / `_make_text_token()` — creates numbered tokens like `(Pasted Image #1)`
 - `_reset_paste_counters()` — resets token counters at the start of each prompt
-- `_paste_handler(event)` — Ctrl+V key binding: text paste only (reads clipboard, inserts text token)
+- `_insert_text_paste(buf, text)` — stores pasted text and inserts a visible `(Pasted Text #N)` token
+- `_bracketed_paste_handler(event)` — handles `Keys.BracketedPaste` events and normalizes line endings before token insertion
+- `_paste_handler(event)` — handles Ctrl+V when the terminal passes the key through; reads the clipboard only in response to that explicit key event
 - `_alt_v_handler(event)` — Alt+V key binding: image paste only (reads clipboard image, inserts image token; shows `[no image on clipboard]` if none)
-- `_backspace_handler(event)` — deletes entire paste token if cursor is inside one
-- `_on_text_changed(b)` — detects clipboard paste using `GetClipboardSequenceNumber()` (a single ctypes call on Windows, returns 0 on other platforms). Captures a baseline sequence number before each prompt starts. On each buffer change, if the sequence number hasn't changed since the baseline, the change is treated as normal typing and left alone. Only when the clipboard sequence number has advanced (indicating a real Ctrl+V or clipboard paste) does it extract the inserted text via `_diff_inserted_text()` and replace it with a `(Pasted Text #N)` token. This prevents false positives where every keystroke was being misdetected as a paste.
-- Image pasting is explicit via Alt+V — no background polling or auto-detection
+- `_backspace_handler(event)` — deletes the entire paste token if the cursor is inside or immediately after one
+- Paste handling is event-based. It does not watch `Buffer.on_text_changed` or use the Windows clipboard sequence number, because copying new content changes that number without meaning that a paste occurred.
 
 **Clipboard helpers** (cross-platform):
 - `_check_clipboard_has_image()` — Windows: PowerShell + `System.Windows.Forms.Clipboard`, macOS: `pngpaste`, Linux: `xclip`
-- `_read_system_clipboard()` — same platforms
+- `_read_system_clipboard()` — same platforms; called for explicit Ctrl+V handling
 - `_detect_mime(data)` — detects PNG/JPEG/GIF/WEBP/BMP/TIFF from magic bytes
 - `_image_data_to_url(data)` — converts to base64 data URL
-- `_get_clipboard_sequence_number()` — Windows: single ctypes call to `GetClipboardSequenceNumber()` (microseconds), returns 0 on other platforms
-- `_get_clipboard_sequence_number()` — Windows: single ctypes call to `GetClipboardSequenceNumber()` (microseconds), returns 0 on other platforms
 
 **Escape key listener**:
-- `start_escape_listener(on_escape)` — spawns thread listening for raw Escape key
+- `start_escape_listener(on_escape)` — spawns a thread listening for Escape while buffering ordinary input captured during the handoff
+- `stop_escape_listener()` — signals the thread and waits for it to finish before the prompt resumes ownership of stdin (no timed handoff)
+- `_take_pending_input_for_prompt()` — returns a complete buffered line or pre-fills a partial line in the next prompt
 - Windows: `msvcrt.kbhit()` + `msvcrt.getwch()`
-- Unix: `tty.setraw()` + `select.select()` + `os.read()`
+- Unix: `tty.setcbreak()` + `select.select()` + `os.read()`; restores terminal settings without flushing queued input
 
 ### `kairos/tokens.py` — TokenCounter
 
 **Class**: `TokenCounter`
 
-**Constructor**: `TokenCounter(model: str = "gpt-4o")` — loads tiktoken encoding for model (falls back to `cl100k_base`)
+**Constructor**: `TokenCounter(model: str = "gpt-4o", context_window: int | None = None)` — loads tiktoken encoding for model (falls back to `cl100k_base`) and reads `Config.CONTEXT_WINDOW()` when no explicit budget is supplied
 
 **Attributes**:
 - `session_input` / `session_output` — cumulative across all turns
 - `context_tokens` — tokens in current conversation_history
 - `turn_input` / `turn_output` — per-turn counters
-- `context_window` — max context (default 999,000)
+- `context_window` — configured prompt budget (default 262,000; override with `KAIROS_CONTEXT_WINDOW`)
 
 **Methods**:
-- `start_turn(messages)` — counts all tokens in conversation_history via tiktoken, sets `context_tokens`
+- `start_turn(messages, extra_tokens=0)` — counts conversation history plus optional tool-schema tokens, sets `context_tokens`
+- `count_request(messages, tools?)` — counts message fields, assistant tool-call metadata/arguments, and optional function-tool definitions
+- `count_tools(tools)` — estimates the tokens added by the function-tool schema
 - `add_output_tokens(text)` — encodes text and adds to `turn_output` (tiktoken estimate)
 - `set_turn_from_api(prompt_tokens, completion_tokens)` — overrides turn counters with ground-truth values from the API's `stream_options={"include_usage": True}` response
 - `finish_turn()` — adds turn totals to session totals
 - `context_pct` — property: `(context_tokens / context_window) * 100`
 - `format_status()` — `"Session: X in / Y out  |  Context: Z%  |  Turn: A in / B out"`
 
-**Counting strategy**: `count_message()` intentionally does NOT count tool call arguments on assistant messages — they were already counted as output tokens when generated via `add_output_tokens()`. This prevents double-counting the same bytes across turns. Image tokens on vision content blocks are estimated via `_estimate_image_tokens()` using data URL length as a proxy.
+**Counting strategy**: `count_message()` includes assistant tool-call IDs/types/names/arguments and tool message IDs/names, because all of those fields are sent in the next API prompt. API-reported usage replaces estimates for completed turns, so these fields are not double-counted in session totals. Image tokens on vision content blocks are estimated with a bounded vision estimate (85 low-detail / 765 high-detail tokens), never by treating the raw base64 URL as ordinary text.
 
 ### `kairos/terminal_manager.py` — TerminalManager
 
@@ -531,7 +572,7 @@ class ToolResult:
                  workspace_changed: Optional[str] = None, image_url: Optional[str] = None):
 ```
 
-`to_dict()` returns `{"success": bool, "output": str, "error": str|None, "image_url": str|None}`. The `image_url` field is only included when present (used by `ReadTool` for images).
+`to_dict()` returns `{"success": bool, "output": str, "error": str|None, "image_url": str|None}`. The optional `image_url` field is only included when present (used by `ReadTool` and browser screenshots for vision); image data is kept out of the textual tool message and re-injected as a user vision message.
 
 ### `kairos/tools/read.py` — ReadTool
 
@@ -569,17 +610,22 @@ class EditTool:
 
 ```python
 class SearchTool:
+    DEFAULT_TIMEOUT = 10.0
     SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox",
                  ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs"}
     
     def __call__(self, pattern: str, path: Optional[str] = None,
-                 include: Optional[str] = None, max_results: int = 50) -> ToolResult:
+                 include: Optional[str] = None, max_results: int = 50,
+                 timeout: Optional[float] = DEFAULT_TIMEOUT) -> ToolResult:
 ```
 
 - Compiles `pattern` as `re.IGNORECASE` regex
 - Uses `os.walk` with `SKIP_DIRS` pruning
 - `include` glob converted via `fnmatch.translate()`
 - Binary detection: reads first 512 bytes, skips if contains `\x00`
+- Enforces a finite, non-negative timeout (default 10 seconds) using a monotonic deadline
+- Checks the deadline between files and while reading lines; timed-out searches return a failed result with any partial matches found so far
+- Validates `max_results` as a positive integer
 - Returns `"file:line: text"` format
 
 ### `kairos/tools/git.py` — GitTool
@@ -616,10 +662,13 @@ class SubAgentTool:
 **`spawn()`**:
 1. Generates UUID-based ID
 2. Creates child `Agent` with `_is_subagent = True`, shares parent's `client` and `model`
-3. **Blocking**: Calls `sub_agent.run(prompt)` synchronously, returns result
-4. **Non-blocking**: Starts daemon thread, returns ID for polling
+3. Wires the optional `_token_update(subagent_id, counter)` callback to the child's `on_token_update`
+4. **Blocking**: Calls `sub_agent.run(prompt)` synchronously, returns result
+5. **Non-blocking**: Starts daemon thread, returns ID for polling
 
 **`get_result()`**: Returns `"Running..."` if still going, otherwise pops and returns the result.
+
+Child token reports use the child's independent `TokenCounter`; they include session totals, current context percentage, and the latest turn input/output counts. They are emitted after every completed child API turn, including turns inside tool-call loops.
 
 **Sub-agent restrictions** (enforced in `Agent._get_tool_schema()`):
 - No `spawn_subagent` / `get_subagent_result`
@@ -687,10 +736,12 @@ Each returns `ToolResult`. `BrowserLaunchTool` catches `ImportError` specificall
 
 ### `kairos/tools/session.py` — SessionManager
 
+Interactive frontends pass their active workspace to `SessionManager`, so standard and Textual `/resume` commands use the same `<workspace>/chats/chats.json` store. Direct callers that omit a workspace retain the historical fallback.
+
 ```python
 class SessionManager:
-    def __init__(self):
-        CHATS_DIR.mkdir(exist_ok=True)  # CHATS_DIR = Agent2/chats/
+    def __init__(self, workspace: str | os.PathLike[str] | None = None):
+        # workspace/chats/chats.json when supplied; historical Agent2/chats fallback otherwise
         self._current_session_id: Optional[str] = None
     
     def save_chat(self, conversation_history: List[Dict]): ...
@@ -711,6 +762,8 @@ class SessionManager:
 - If all atomic replace attempts fail, falls back to direct file write (non-atomic) to avoid crashing — the temp file with full data remains available for manual recovery
 - Prevents file corruption from interrupted writes (Ctrl+C, crash, power loss) in the common case
 
+When the legacy CLI passes a workspace, sessions are stored in `<workspace>/chats/chats.json`; direct callers that omit it retain the historical `Agent2/chats/chats.json` location.
+
 **`save_chat()`** deduplication strategy:
 1. If `_current_session_id` set and exists on disk → update it
 2. Otherwise → create new entry keyed by `chat_<timestamp>`
@@ -729,6 +782,10 @@ No fuzzy/prefix matching — each session is tracked by its ID. This prevents di
 ```
 
 ---
+
+## Tests
+
+`tests/test_compaction.py` contains focused regression coverage for function-tool/schema accounting, message metadata, bounded vision estimates, pending-user preflight, safe tool-chain boundaries, compaction-prompt limits, and normalization of oversized legacy saved results. Run it with `python -m unittest discover -s tests -v`.
 
 ## Design Principles
 
