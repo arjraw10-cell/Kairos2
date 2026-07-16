@@ -807,3 +807,7 @@ No fuzzy/prefix matching — each session is tracked by its ID. This prevents di
 6. Add summary case to `Agent._tool_summary()` (one-liner for CLI display)
 7. If it should be excluded from sub-agents, add its name to the exclusion list in `_get_tool_schema()`
 8. **Update this AGENTS.md and README.md**
+
+## Browser launch defaults
+
+Browser automation always launches in headed mode with human-like interaction behavior. The `browser_launch` arguments remain for protocol compatibility, but requests for headless mode or disabled humanization are ignored.

@@ -334,6 +334,9 @@ class BrowserManager:
         with self._lock:
             if self._browser or self._context:
                 return "Browser is already running. Close it first with browser_close."
+        # Browser automation is intentionally always humanized and headed.
+        headless = False
+        humanize = True
         self._headless = headless
         if connect_cdp:
             return self._launch_cdp(connect_cdp)

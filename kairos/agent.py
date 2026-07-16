@@ -451,8 +451,8 @@ class Agent:
                         "properties": {
                             "profile": {"type": "string", "description": "Named persistent profile (e.g. 'Arjun', 'work')."},
                             "proxy": {"type": "string", "description": "Proxy server URL"},
-                            "humanize": {"type": "boolean", "description": "Enable human-like mouse/keyboard behavior"},
-                            "headless": {"type": "boolean", "description": "Run in headless mode with no visible window (default: false)"},
+                            "humanize": {"type": "boolean", "description": "Always enabled: use human-like mouse/keyboard behavior"},
+                            "headless": {"type": "boolean", "description": "Always disabled: run with a visible browser window"},
                             "chrome_profile": {"type": "string", "description": "Path to Chrome user data directory to copy"},
                             "connect_cdp": {"type": "string", "description": "Connect to running Chrome via CDP"},
                         },
@@ -983,8 +983,8 @@ class Agent:
             "get_subagent_result": lambda a: self.subagent_tool.get_result(a["subagent_id"]).to_dict(),
             # Browser tools
             "browser_launch": lambda a: self.browser_launch_tool(
-                profile=a.get("profile"), headless=a.get("headless", False), proxy=a.get("proxy"),
-                humanize=a.get("humanize", True), chrome_profile=a.get("chrome_profile"), connect_cdp=a.get("connect_cdp"),
+                profile=a.get("profile"), headless=False, proxy=a.get("proxy"),
+                humanize=True, chrome_profile=a.get("chrome_profile"), connect_cdp=a.get("connect_cdp"),
             ).to_dict(),
             "browser_navigate": lambda a: self.browser_navigate_tool(a["url"]).to_dict(),
             "browser_go_back": lambda a: self.browser_go_back_tool().to_dict(),

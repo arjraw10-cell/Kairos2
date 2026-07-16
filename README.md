@@ -298,3 +298,7 @@ The tests cover tool-schema and metadata accounting, bounded vision estimates, p
 ## License
 
 MIT
+
+## Browser launch defaults
+
+Browser automation always launches in headed mode with human-like interaction behavior. The `browser_launch` arguments remain for protocol compatibility, but requests for headless mode or disabled humanization are ignored.
