@@ -23,13 +23,14 @@ Agent2/
 ├── kairos_cli_new.bat      # Standard CLI launcher; starts the gateway if health is unavailable
 ├── kairos_old.bat          # Windows legacy CLI launcher (runs Agent2 source while preserving caller CWD)
 ├── kairos.bat              # Windows shortcut (py main.py)
-├── chats/                  # Default/direct-caller saved chat sessions (gitignored)
-│   └── chats.json          # Legacy fallback history; workspace CLI sessions use <workspace>/chats/chats.json
+├── chats/                  # Legacy workspace-local/direct-caller chat sessions (gitignored)
+│   └── chats.json          # Read-compatible fallback; new saves use ~/.kairos/chats/<workspace>--<path-id>/chats.json
 ├── skills/                 # Skills directory (gitignored, stays local)
 │   └── moodle-quiz/        # Example: Moodle quiz skill
 │       └── SKILL.md
 ├── tests/                  # Local regression tests
-│   └── test_compaction.py  # Context accounting, compaction, and legacy-result tests
+│   ├── test_compaction.py  # Context accounting, compaction, and legacy-result tests
+│   └── test_sessions.py    # Workspace-isolated home chat storage and legacy loading tests
 └── kairos/
     ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, SkillManager, TerminalManager, BrowserManager
     ├── main.py             # CLI REPL loop, signal handlers, auto-save, paste resolution
@@ -57,7 +58,7 @@ Agent2/
         ├── subagent.py     # SubAgentTool — spawn/track child agents
         ├── browser.py      # 26 browser tool wrappers (scroll, wait, send_keys, search, find, think, index-based, etc.)
         ├── skills.py       # SkillManager — list, load, write skills
-        └── session.py      # SessionManager — save/load chats to chats/chats.json
+        └── session.py      # SessionManager — isolated ~/.kairos chat stores with legacy fallback loading
 ```
 
 ---
@@ -129,7 +130,7 @@ Lazy-loads `.env` on first access via `python-dotenv`. Uses `@lru_cache(maxsize=
 
 **Function**: `main()` — orchestrates the entire application lifecycle.
 
-**Resume flow**: `/resume` delegates to `kairos.resume.sanitize_history_for_resume()`. It anchors resume decisions at the latest real user request, repairs incomplete assistant/tool chains with synthetic failed results, and automatically sends `Continue where you left off. Pick up the next step.` for mid-execution sessions. The standard CLI accepts both `/resume` followed by a numbered picker entry and `/resume 1`; its picker consumes buffered handoff input and retries invalid choices instead of returning to the agent prompt. The Textual frontend uses the active agent workspace's `chats/chats.json`, extracts the selected metadata dictionary's string `id`, and keeps selection mode active until a valid chat is loaded.
+**Resume flow**: `/resume` delegates to `kairos.resume.sanitize_history_for_resume()`. It anchors resume decisions at the latest real user request, repairs incomplete assistant/tool chains with synthetic failed results, and automatically sends `Continue where you left off. Pick up the next step.` for mid-execution sessions. The standard CLI accepts both `/resume` followed by a numbered picker entry and `/resume 1`; its picker consumes buffered handoff input and retries invalid choices instead of returning to the agent prompt. The Textual frontend uses the active agent workspace's isolated `~/.kairos/chats/<directory>--<stable-path-id>/chats.json` store (with legacy workspace-local loading), extracts the selected metadata dictionary's string `id`, and keeps selection mode active until a valid chat is loaded.
 
 **Global state**: `_session_mgr` and `_agent` are module-level globals shared with signal handlers.
 
@@ -165,7 +166,7 @@ The Escape listener shares the terminal with `PromptSession`, so it buffers ordi
 - Returns `(sanitized_history, last_agent_content, is_mid_execution)` — `(None, "", False)` if no resumable state exists
 - The CLI displays the last clean response on normal resume and auto-continues mid-execution sessions with `Continue where you left off. Pick up the next step.`
 
-The Textual frontend (`kairos/temp_cli.py`) uses the same shared sanitizer and continuation behavior. It uses `SessionManager(agent.cwd)` so both frontends list the same workspace-local sessions, and its numbered picker passes `sessions[index]["id"]` to `load_session()` while retaining selection mode after invalid or unloadable entries.
+The Textual frontend (`kairos/temp_cli.py`) uses the same shared sanitizer and continuation behavior. It uses `SessionManager(agent.cwd)` so both frontends list the same workspace-isolated sessions, and its numbered picker passes `sessions[index]["id"]` to `load_session()` while retaining selection mode after invalid or unloadable entries.
 
 `kairos.main._sanitize_history_for_resume` remains a compatibility alias to the shared function for existing callers.
 
@@ -748,12 +749,15 @@ Each returns `ToolResult`. `BrowserLaunchTool` catches `ImportError` specificall
 
 ### `kairos/tools/session.py` — SessionManager
 
-Interactive frontends pass their active workspace to `SessionManager`, so standard and Textual `/resume` commands use the same `<workspace>/chats/chats.json` store. Direct callers that omit a workspace retain the historical fallback.
+Interactive frontends pass their active workspace to `SessionManager`, so standard and Textual `/resume` commands use the same isolated store at `~/.kairos/chats/<directory>--<stable-path-id>/chats.json`. The directory basename remains readable, while the deterministic SHA-256 path prefix prevents collisions between workspaces with the same basename. The canonical JSON envelope stores the absolute workspace path in `workspace` for verification. Direct callers that omit a workspace use the current working directory.
+
+`<workspace>/chats/chats.json` remains a read-compatible legacy source for that workspace. Legacy-only sessions appear in the picker and are saved into the canonical store on the next save; the legacy file is never deleted or modified.
 
 ```python
 class SessionManager:
     def __init__(self, workspace: str | os.PathLike[str] | None = None):
-        # workspace/chats/chats.json when supplied; historical Agent2/chats fallback otherwise
+        # Canonical: ~/.kairos/chats/<directory>--<stable-path-id>/chats.json
+        # Legacy fallback read: <workspace>/chats/chats.json
         self._current_session_id: Optional[str] = None
     
     def save_chat(self, conversation_history: List[Dict]): ...
@@ -763,32 +767,26 @@ class SessionManager:
     def load_session(self, session_id: str) -> Optional[List[Dict]]: ...
 ```
 
-**`_load_all()`** — corruption-recovering loader:
-- Tries `json.loads()` first
-- On `JSONDecodeError`: uses `JSONDecoder.raw_decode()` to parse up to the last valid JSON boundary, re-saves the recovered data
-- Last resort: iterates through JSON blocks and merges any that parse successfully
-- Returns `{}` if completely unrecoverable
+**`_load_all()`** — loads canonical sessions first with canonical IDs winning, then merges sessions from the workspace-local legacy file. It accepts both the new envelope and the old flat session format, verifies the canonical `workspace` metadata, and recovers damaged JSON by parsing valid JSON boundaries.
 
-**`_save_all()`** — atomic writer:
-- Writes to a temp file in the same directory, then `fsync()`s, then atomically replaces the target via `os.replace()` with a 5-attempt retry loop (handles transient PermissionError from antivirus/indexers/OneDrive on Windows, with 100–500ms exponential backoff)
-- If all atomic replace attempts fail, falls back to direct file write (non-atomic) to avoid crashing — the temp file with full data remains available for manual recovery
-- Prevents file corruption from interrupted writes (Ctrl+C, crash, power loss) in the common case
-
-When the legacy CLI passes a workspace, sessions are stored in `<workspace>/chats/chats.json`; direct callers that omit it retain the historical `Agent2/chats/chats.json` location.
+**`_save_all()`** — atomic-writes the canonical envelope to `~/.kairos` through a same-directory temp file, `fsync()`, and `os.replace()` with a 5-attempt retry loop. If all replacements fail due to a transient Windows lock, it falls back to direct writing while leaving the complete temp file available.
 
 **`save_chat()`** deduplication strategy:
-1. If `_current_session_id` set and exists on disk → update it
-2. Otherwise → create new entry keyed by `chat_<timestamp>`
+1. If `_current_session_id` set and exists in the merged workspace-specific sessions → update it
+2. Otherwise → create a new entry keyed by `chat_<timestamp>`
 
 No fuzzy/prefix matching — each session is tracked by its ID. This prevents different sessions from accidentally overwriting each other.
 
-**Session data** (in `chats.json`):
+**Session data** (in `~/.kairos/chats/<directory>--<stable-path-id>/chats.json`):
 ```json
 {
-  "chat_2024-01-15 10:30:00": {
-    "timestamp": "2024-01-15 10:30:00",
-    "preview": "Fix the login bug",
-    "messages": [...]
+  "workspace": "C:/Users/arja/Documents/App",
+  "sessions": {
+    "chat_2024-01-15 10:30:00": {
+      "timestamp": "2024-01-15 10:30:00",
+      "preview": "Fix the login bug",
+      "messages": [...]
+    }
   }
 }
 ```
@@ -797,7 +795,7 @@ No fuzzy/prefix matching — each session is tracked by its ID. This prevents di
 
 ## Tests
 
-`tests/test_compaction.py` contains focused regression coverage for function-tool/schema accounting, message metadata, bounded vision estimates, pending-user preflight, safe tool-chain boundaries, compaction-prompt limits, and normalization of oversized legacy saved results. Run it with `python -m unittest discover -s tests -v`.
+`tests/test_compaction.py` contains focused regression coverage for function-tool/schema accounting, message metadata, bounded vision estimates, pending-user preflight, safe tool-chain boundaries, compaction-prompt limits, and normalization of oversized legacy saved results. `tests/test_sessions.py` covers deterministic workspace IDs, home-directory storage, JSON workspace metadata, workspace isolation, and loading/migrating legacy workspace-local chats. Run the suite with `python -m unittest discover -s tests -v`.
 
 ## Design Principles
 
