@@ -21,6 +21,7 @@ Agent2-gateway/
 ├── AGENTS.md               # This file - architecture documentation
 ├── kairos.bat              # Windows shortcut — starts gateway + launches Electron UI
 ├── kairos_cli.bat          # Windows shortcut — starts gateway (if needed) + launches CLI
+├── kairos_old_g.bat        # Emergency fallback — materializes backup/main-before-gateway and runs the legacy runtime-owning CLI
 ├── chats/                  # Saved chat sessions (gitignored)
 │   └── chats.json          # All chat history in one file
 ├── skills/                 # Skills directory (gitignored, stays local)

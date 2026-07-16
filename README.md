@@ -71,6 +71,7 @@ python main.py /path/to/project  # specific workspace
 |------|-------------|
 | `kairos.bat` | Starts the gateway + launches the **Electron UI** |
 | `kairos_cli.bat` | Starts the gateway (if not already running) + launches the **CLI** |
+| `kairos_old_g.bat` | Emergency fallback: runs the legacy CLI with its own Agent runtime from `backup/main-before-gateway` |
 
 `kairos_cli.bat` checks if the gateway is already listening on port 8765 before starting it. If the gateway is already running (e.g., from a previous `kairos.bat` launch), it skips startup and goes straight to the CLI. Any arguments are forwarded to the CLI (e.g., a workspace path).
 
