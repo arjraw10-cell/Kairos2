@@ -57,7 +57,9 @@ async def _async_main():
             # ── Resume or new session ─────────────────────────────
             session_id = None
             if sessions:
-                choice = cli.pick_session(sessions)
+                choice = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: cli.pick_session(sessions)
+                )
                 if choice:
                     await _ws_send(ws, {"type": "load_session", "session_id": choice})
                     resp = await _ws_recv(ws)
@@ -90,7 +92,7 @@ async def _async_main():
 
                 # Handle exit commands
                 if user_input.lower() in ("exit", "quit", "q", "/exit", "/quit"):
-                    await _ws_send(ws, {"type": "message", "content": "exit"})
+                    await _ws_send(ws, {"type": "message", "session_id": session_id, "content": "exit"})
                     break
 
                 # Handle clear
@@ -101,7 +103,7 @@ async def _async_main():
 
                 # Handle special commands (send as messages to gateway)
                 if user_input.lower() in ("reset", "/reset", "/compact"):
-                    await _ws_send(ws, {"type": "message", "content": user_input})
+                    await _ws_send(ws, {"type": "message", "session_id": session_id, "content": user_input})
                     # Receive confirmation
                     resp = await _ws_recv(ws)
                     if resp["type"] == "new_session_created":
@@ -128,7 +130,7 @@ async def _async_main():
                     user_input = "Describe this image."
 
                 # Send message
-                msg_payload = {"type": "message", "content": user_input}
+                msg_payload = {"type": "message", "session_id": session_id, "content": user_input}
                 if paste_image_data_url:
                     msg_payload["image_url"] = paste_image_data_url
                 await _ws_send(ws, msg_payload)
@@ -140,7 +142,12 @@ async def _async_main():
                         raw = await _ws_recv(ws)
                         msg_type = raw["type"]
 
-                        if msg_type == "stream_start":
+                        if msg_type == "new_session_created":
+                            # Server auto-created a session (previous was idle-unloaded)
+                            session_id = raw["session_id"]
+                            cli.print_info(f"New session: {session_id}")
+                            continue
+                        elif msg_type == "stream_start":
                             cli.stop_thinking()
                             cli.start_stream()
                         elif msg_type == "stream_token":
@@ -178,14 +185,14 @@ async def _async_main():
                             continue
 
                 except asyncio.CancelledError:
-                    await _ws_send(ws, {"type": "interrupt"})
+                    await _ws_send(ws, {"type": "interrupt", "session_id": session_id})
                     cli.stop_thinking()
                     cli.print_info("[Interrupted]")
                     continue
 
             # ── Shutdown ──────────────────────────────────────────
             if session_id:
-                await _ws_send(ws, {"type": "unload"})
+                await _ws_send(ws, {"type": "unload", "session_id": session_id})
             cli.print_exit()
 
     except (ConnectionRefusedError, OSError):

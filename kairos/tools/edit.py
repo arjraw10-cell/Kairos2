@@ -57,7 +57,7 @@ class EditTool:
                 + newText
                 + content[matches[0] + len(oldText) :]
             )
-            resolved.write_text(new_content, encoding="utf-8", errors="replace")
+            resolved.write_text(new_content, encoding="utf-8")
 
             line_num = content[: matches[0]].count("\n") + 1
             return ToolResult(True, f"Successfully edited {path} at line {line_num}")

@@ -64,6 +64,7 @@ class _WorkerThread:
         self._thread: Optional[threading.Thread] = None
         self._started = threading.Event()
         self._pw = None
+        self._interrupt_event: Optional[threading.Event] = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -107,16 +108,20 @@ class _WorkerThread:
         done = threading.Event()
         result_holder: Dict[str, Any] = {"_done": done}
         self._task_queue.put((fn, result_holder))
-        # Block with zero latency until the worker signals completion or timeout
-        completed = done.wait(timeout=timeout + 5)
+        # Poll with short intervals so we can react to interrupt signals
+        deadline = _time.monotonic() + timeout + 5
+        while not done.wait(timeout=0.05):
+            if self._interrupt_event and self._interrupt_event.is_set():
+                raise InterruptedError("Browser operation interrupted by user")
+            if _time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Browser operation timed out after {timeout + 5}s. "
+                    "The page may be unresponsive or the operation is taking too long."
+                )
         if "error" in result_holder:
             raise result_holder["error"]
         if "result" in result_holder:
             return result_holder["result"]
-        raise TimeoutError(
-            f"Browser operation timed out after {timeout + 5}s. "
-            "The page may be unresponsive or the operation is taking too long."
-        )
 
     def stop(self):
         if self._thread and self._thread.is_alive():
@@ -146,6 +151,10 @@ class BrowserManager:
         self._cdp = CDPManager()
         # Snapshot cache for index-based interactions
         self._last_snapshot_elements: List[Dict[str, Any]] = []
+
+    def set_interrupt_event(self, event: threading.Event):
+        """Wire the agent's interrupt event to the browser worker thread."""
+        self._worker._interrupt_event = event
 
     # ------------------------------------------------------------------
 
@@ -608,6 +617,7 @@ class BrowserManager:
         if not page:
             return "No active page."
         self._active_frame = None
+        self._active_frame_type = None
         try:
             url = self._worker.dispatch(
                 lambda: (page.reload(wait_until="domcontentloaded"), page.url)[1],
@@ -657,7 +667,12 @@ class BrowserManager:
     def wait(self, seconds: int = 3) -> str:
         fp = self._capture_fingerprint()
         actual = min(max(seconds, 0), 30)
-        _time.sleep(actual)
+        # Interruptible sleep — checks every 50ms
+        deadline = _time.monotonic() + actual
+        while _time.monotonic() < deadline:
+            if self._worker._interrupt_event and self._worker._interrupt_event.is_set():
+                return "Wait interrupted by user"
+            _time.sleep(min(0.05, deadline - _time.monotonic()))
         return self._post_action(f"Waited {actual} seconds", pre_fingerprint=fp)
 
     # ------------------------------------------------------------------
@@ -688,13 +703,19 @@ class BrowserManager:
                 self._worker.dispatch(_do_wait, timeout=timeout // 1 + 10)
                 result = f"Element '{selector}' appeared on page"
             else:
+                # Poll in a loop until text appears or timeout
+                deadline = _time.monotonic() + (timeout_ms / 1000)
 
                 def _do_wait_text():
-                    found = target.evaluate(
-                        "text => document.body.innerText.includes(text)", text
-                    )
-                    if not found:
-                        raise Exception(f"Text '{text}' not found")
+                    while True:
+                        found = target.evaluate(
+                            "text => document.body.innerText.includes(text)", text
+                        )
+                        if found:
+                            return True
+                        if _time.monotonic() >= deadline:
+                            raise Exception(f"Text '{text}' not found")
+                        _time.sleep(0.25)
 
                 self._worker.dispatch(_do_wait_text, timeout=timeout // 1 + 10)
                 result = f"Text '{text}' found on page"
@@ -1409,10 +1430,15 @@ class BrowserManager:
                 result = self._worker.dispatch(
                     lambda: target.evaluate(expression), timeout=15
                 )
-            except SyntaxError:
-                result = self._worker.dispatch(
-                    lambda: target.evaluate(f"() => {{ {expression} }}"), timeout=15
-                )
+            except Exception as e:
+                # Playwright raises its own Error for JS syntax issues, not SyntaxError
+                err_str = str(e).lower()
+                if "syntaxerror" in err_str or "unexpected token" in err_str:
+                    result = self._worker.dispatch(
+                        lambda: target.evaluate(f"() => {{ {expression} }}"), timeout=15
+                    )
+                else:
+                    raise
             if result is None:
                 return "JavaScript executed (returned null/undefined)"
             if isinstance(result, str):
@@ -1420,8 +1446,6 @@ class BrowserManager:
                     result if len(result) < 10000 else result[:10000] + "...[truncated]"
                 )
             return json.dumps(result, indent=2, default=str)
-        except SyntaxError:
-            return f"JavaScript syntax error in: {expression!r}\nUse 'return' with full function body."
         except Exception as e:
             return f"JavaScript error: {type(e).__name__}: {e}"
 

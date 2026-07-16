@@ -2,6 +2,8 @@
 
 **MANDATORY: Whenever you make any code change (edit, add, or remove code), you MUST also update this AGENTS.md file AND README.md to reflect the change. This ensures the documentation stays in sync with the code. Failure to update documentation after a code change is not acceptable.**
 
+**UI SYNC RULE: If a code change affects what the UI displays, what data the UI receives, or how the UI behaves (new protocol messages, changed message shapes, new features visible to the user), you MUST also update the corresponding UI files in `ui/src/` (components, hooks, types) and verify the build passes with `npm run build`. This includes but is not limited to: new message types, changed response payloads, new UI states, and default values that the user sees.**
+
 ## Overview
 
 Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 40 tools. All file operations use absolute paths — no workspace containment.
@@ -9,7 +11,7 @@ Kairos is a minimal coding agent written in Python. It uses the OpenAI chat comp
 ## Project Structure
 
 ```
-Agent2/
+Agent2-gateway/
 ├── main.py                 # Root entry point (imports from kairos.main)
 ├── .env                    # Environment configuration (API keys)
 ├── .env.example            # Template for .env file
@@ -17,12 +19,31 @@ Agent2/
 ├── pyproject.toml          # Project metadata and build configuration
 ├── README.md               # User-facing documentation
 ├── AGENTS.md               # This file - architecture documentation
-├── kairos.bat              # Windows shortcut (py main.py)
+├── kairos.bat              # Windows shortcut — starts gateway + launches Electron UI
+├── kairos_cli.bat          # Windows shortcut — starts gateway (if needed) + launches CLI
 ├── chats/                  # Saved chat sessions (gitignored)
 │   └── chats.json          # All chat history in one file
 ├── skills/                 # Skills directory (gitignored, stays local)
 │   └── moodle-quiz/        # Example: Moodle quiz skill
 │       └── SKILL.md
+├── ui/                     # Electron + React frontend
+│   ├── src/
+│   │   ├── App.tsx             # Root component — routes between WorkspacePicker and ChatView, renders TabBar above main content. handleNewThread resets pickWorkspace=true before calling openNewTab() so the workspace picker re-appears.
+│   │   ├── main.tsx            # React entry point
+│   │   ├── types.ts            # Protocol types (ClientMsg, ServerMsg, Session, UIMessage with image_url, etc.)
+│   │   ├── styles.css          # All CSS (dark theme, CSS variables, hover states, image preview styles, skeleton loading animations)
+│   │   ├── markdown.tsx        # Simple markdown renderer (no deps)
+│   │   ├── utils.ts            # toHomeRelative, toFolderName helpers
+│   │   ├── components/
+│   │   ├── WorkspacePicker.tsx  # Workspace selection screen (shown on new thread)
+│   │   ├── Sidebar.tsx          # Session list grouped by workspace folder (streaming indicators on all running sessions, close button)
+│   │   ├── TabBar.tsx           # Chrome-style horizontal tabs for quick session switching (streaming indicators, close button, new tab +)
+│   │   ├── ChatArea.tsx         # Messages + streaming + collapsible thinking blocks (tool badges always visible) + image rendering in user messages + skeleton loading placeholders
+│   │   ├── ChatInput.tsx        # Text input with send/stop buttons, image upload (file picker), Ctrl+V paste, drag-and-drop, image preview
+│   │   └── StatusBar.tsx        # Connection + token stats bar
+│   │   └── hooks/
+│   │       └── useGateway.ts        # WebSocket client — per-session state + actions (multi-session routing, streaming buffers, loading states, tab management)
+│   └── ...
 └── kairos/
     ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, SkillManager, TerminalManager, BrowserManager
     ├── main.py             # CLI REPL — thin WebSocket client connected to the gateway
@@ -87,56 +108,26 @@ Lazy-loads `.env` on first access via `python-dotenv`. Uses `@lru_cache(maxsize=
 
 **Key detail**: `OPENAI_API_KEY()` clears its own cache if the key is missing (so `validate()` can re-check after `.env` is created).
 
-### `kairos/main.py` — CLI Entry Point
+### `kairos/main.py` — CLI as Thin Client
 
-**Function**: `main()` — orchestrates the entire application lifecycle.
+**Function**: `main()` — async WebSocket client that connects to the gateway and runs a REPL.
 
-**Global state**: `_session_mgr` and `_agent` are module-level globals shared with signal handlers.
+**Connection**: Connects to the gateway WebSocket at `ws://{host}:{port}/ws`. On startup, lists saved sessions and offers to resume one or create a new session.
 
-**Signal handlers** (installed at startup):
-- `SIGINT` → `_save_now()` + `sys.exit(0)`
-- `SIGTERM` → `_save_now()` + `sys.exit(0)`
-- `SIGHUP` (Unix only) → `_save_now()` + `sys.exit(0)`
+**Session tracking**: Maintains a local `session_id` variable. All outgoing messages include `session_id` so the gateway routes them to the correct agent:
+- `message` (with `session_id`) — send user text or images
+- `interrupt` (with `session_id`) — cancel running operations
+- `unload` (with `session_id`) — save and destroy session on exit
+- Special commands (`reset`, `/compact`) are sent as `message` with `session_id`
 
-**Auto-save**: `_start_auto_save(agent, interval_seconds=60)` runs a daemon thread that saves every 60 seconds.
+**REPL loop**:
+1. `cli.get_user_input()` — handles paste token resolution (text + images from clipboard)
+2. Command dispatch: `exit`, `clear`, special commands (`reset`, `/compact`)
+3. Paste token resolution (text tokens replaced inline, image tokens extracted for `image_url`)
+4. Sends message to gateway, then enters a receive loop processing: `stream_start`, `stream_token`, `tool_call`, `stream_end`, `token_update`, `compacted`, `done`, `error`, `exit`, `unloaded`, `new_session_created`
+5. On `new_session_created` (auto-recovery from idle unload), updates local `session_id`
 
-**`process_request(cli, agent, user_input, image_url?)`**:
-1. Starts an Escape key listener (via `cli.start_escape_listener`)
-2. Runs `agent.run(user_input, image_url)` in a background thread
-3. Main thread polls `t.join(timeout=0.15)` — catches `KeyboardInterrupt` to call `agent.interrupt()`
-4. Returns the agent's response or `"[Interrupted]"`
-
-**REPL loop** (inside `main()`):
-1. `cli.get_user_input()` → handles paste token resolution (text + images from clipboard)
-2. Command dispatch: `exit`, `clear`, `reset`, `/resume`, `/compact`, `/paste`
-3. Clipboard image auto-detection on empty input or alongside text
-4. `cli.start_thinking()` → `process_request()` → `cli.stop_thinking()`
-5. Response display (streaming panel handles it; `_skip_print_response` prevents double-print)
-6. Auto-save after each exchange (all saves go through `_save_now()` which holds `_auto_save_lock` to prevent race conditions with the auto-save thread)
-
-**Resume sanitization** (`_sanitize_history_for_resume(history)`):
-- Walks backward through saved history to find the last clean agent response (an `assistant` message *without* `tool_calls`)
-- Skips dirty messages: `tool` results, `assistant` messages with `tool_calls` (incomplete execution), and user screenshot injection messages (`[Screenshot captured ...]`)
-- Returns `(sanitized_history, last_agent_content)` on success, or `(None, "")` if no clean response exists
-- On resume, the last agent message is displayed in a green panel so the user can see where the conversation left off
-- If a chat was interrupted mid-execution (no clean agent response), a warning is shown and the chat is skipped
-
-**Helper**: `_is_screenshot_injection(msg)` — detects user messages that are agent-injected screenshots (content array starting with `[Screenshot captured ...`) vs real user messages.
-
-**Wiring** (in `main()`): The agent's callbacks are wired to CLI methods:
-```python
-agent.on_tool_call = lambda name, args: cli.print_tool_summary(agent._tool_summary(name, args))
-agent.on_stream_start = lambda: cli.start_stream()
-agent.on_stream_token = cli.on_stream_token
-agent.on_stream_end = _on_stream_end  # Finalizes as green response or grey thinking trace
-agent.on_token_update = lambda tc: cli.print_token_status(tc)
-agent.on_compact = lambda msg: cli.print_info(msg)
-# Sub-agent visibility:
-agent.subagent_tool._tool_printer = lambda summary: cli.console.print(f"  ↓ subagent: {summary}")
-agent.subagent_tool._stream_start = lambda: cli.start_stream()
-agent.subagent_tool._stream_token = cli.on_stream_token
-agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream()
-```
+**Auto-recovery**: If the gateway auto-creates a new session (previous was idle-unloaded), the CLI receives `new_session_created` and updates its `session_id` accordingly.
 
 ### `kairos/agent.py` — Agent (Core)
 
@@ -238,13 +229,31 @@ The main agent loop:
 1. Clears interrupt event
 2. Loops indefinitely until one of the termination conditions is met:
    - Checks `_should_stop()` (Escape) between steps
-   - Auto-compacts if context > 80%
+   - Auto-compacts if context ≥ 80% (checked every iteration, not just the first)
    - Calls `step()`
    - **Empty response retry**: If `step()` returns no content and no tool calls (API returned nothing), removes the empty assistant message from history (to prevent consecutive assistant messages), then retries the same call up to 2 times with a status message before giving up. This handles transient API issues where the model returns an empty response.
-   - Returns when: final response received, no tool calls (after retries exhausted), interrupt, or graceful stop (Escape)
+   - Returns when: final response received, no tool calls (after retries exhausted), or interrupt
 3. Returns `"[Interrupted]"` on `InterruptedError`
 
-#### Compaction
+### Stop Behavior
+
+Kairos has **two stop signals**, both now treated as **instant interrupts**:
+
+- **Interrupt** (`{"type": "interrupt"}`): The UI's Escape key sends this. Sets a `threading.Event` that propagates immediately to:
+  - `_execute_tool()` — aborts before dispatching any tool
+  - `_stream_response()` — aborts mid-stream (per-chunk check)
+  - `step()` — aborts between sequential tool calls
+  - `TerminalManager.execute_command()` — kills blocking subprocesses
+  - `BrowserManager._WorkerThread.dispatch()` — aborts while waiting for Playwright operations (polls every 50ms)
+  - `BrowserManager.wait()` — interruptible sleep (polls every 50ms)
+
+- **Stop** (`{"type": "stop"}`): Legacy message type, now **also triggers instant interrupt** (same as interrupt). Kept for backward compatibility.
+
+**Before this change**: Interrupt couldn't stop browser operations (`page.goto()` blocked up to 30s), and the `stop` message waited for the entire step to finish.
+
+**After**: Both interrupt and stop abort instantly at the next 50ms checkpoint, including browser waits, navigations, and terminal commands. The `stop` message type is now aliased to `interrupt` for backward compatibility. The graceful stop mechanism (`_stop_requested`/`request_stop`) has been removed entirely.
+
+### Compaction
 
 **Constants**:
 - `COMPACT_RESERVE_TOKENS = 16384` — tokens for summary prompt + output
@@ -259,7 +268,7 @@ The main agent loop:
 5. Rebuilds history: `[system_prompt, compaction_summary, recent_messages]`
    - Compaction message is `role: "user"` so it flows naturally in conversation ordering
    - Existing compaction summaries are detected by content prefix `"[Conversation compacted"`
-6. Re-counts tokens
+6. Updates `context_tokens` for display without inflating session totals (avoids double-counting since recent messages were already counted in previous turns)
 
 **Summary format** (structured checkpoint):
 ```
@@ -411,7 +420,7 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 
 **Worker Thread** (`_WorkerThread`):
 - `start()` — spawns thread, initializes Playwright, signals `_started` event when ready
-- `dispatch(fn, timeout)` — queues callable, blocks using `threading.Event` for zero-latency notification; raises `TimeoutError` if task never completes
+- `dispatch(fn, timeout)` — queues callable, polls every 50ms with `done.wait(timeout=0.05)` so it can react to interrupt signals. Checks `_interrupt_event` on each poll and raises `InterruptedError` if set. Raises `TimeoutError` if task never completes
 - `stop()` — sends sentinel, joins thread
 
 **Launch modes**:
@@ -424,10 +433,10 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 
 **Key operations** (all dispatched to worker thread):
 - `navigate(url)` — `page.goto(url, wait_until="domcontentloaded")`, clears active frame; reports specific error types (DNS, connection, timeout) on failure. Auto-screenshots after navigate.
-- `go_back()` / `go_forward()` / `reload()` — navigation history, clear active frame
+- `go_back()` / `go_forward()` / `reload()` — navigation history, clear active frame (both `_active_frame` and `_active_frame_type`)
 - `scroll(direction?, pages?)` — scroll page using `page.mouse.wheel()` by viewport heights. `direction="down"|"up"`, `pages=1.0` (full viewport)
 - `wait(seconds?)` — sleep for up to 30 seconds to let animations/AJAX complete
-- `wait_for(selector?, text?, timeout?)` — wait for a specific element to become visible or text to appear (uses Playwright's built-in wait mechanisms, much more efficient than blind waiting)
+- `wait_for(selector?, text?, timeout?)` — wait for a specific element to become visible or text to appear (text mode polls every 250ms until timeout, element mode uses Playwright's built-in wait mechanisms)
 - `send_keys(keys)` — send keyboard shortcut via `page.keyboard.press()` (e.g. "Enter", "Tab", "Control+a")
 - `hover(selector)` — hover over an element to trigger hover states (dropdown menus, tooltips, hover cards). Uses Playwright's `locator.hover()` with text fallback.
 - `hover_by_index(index)` — hover by snapshot index (PREFERRED)
@@ -445,7 +454,7 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 - `search_page(pattern, regex?, case_sensitive?, max_results?)` — in-page text search via `document.createTreeWalker` + regex. Returns matches with context. Zero LLM cost.
 - `find_elements(selector, max_results?)` — CSS selector query returning matching elements with index, tag, text, attributes. Zero LLM cost.
 - Tab management: `open_new_tab()`, `switch_tab()`, `list_tabs()`, `close_tab()` (invalidates CDP session on close)
-- `evaluate(expression)` — tries expression directly first, wraps in arrow function on `SyntaxError` fallback; returns JSON-stringified result
+- `evaluate(expression)` — tries expression directly first, wraps in arrow function on `SyntaxError` fallback (detects JS syntax errors from Playwright exceptions); returns JSON-stringified result
 - Frame management: `switch_frame(frame_selector?)` — uses CDP `get_all_frame_ids()` as fallback for cross-origin iframes, stores CDP frame info in `_active_frame_type="cdp"`
 
 **Internal**:
@@ -517,7 +526,7 @@ class EditTool:
 - Finds ALL occurrences of `oldText` via `str.find()` loop
 - **0 matches**: Error with line count + similar text locations (checks first 20 chars of `oldText` against each line)
 - **Multiple matches**: Error with line numbers of each occurrence
-- **1 match**: Replaces, writes file, reports line number
+- **1 match**: Replaces, writes file (strict UTF-8), reports line number
 
 ### `kairos/tools/search.py` — SearchTool
 
@@ -651,6 +660,7 @@ class SessionManager:
     def new_session(self): ...
     def set_current_session(self, session_id: str): ...
     def list_sessions(self) -> List[Dict[str, str]]: ...
+    def list_workspaces(self) -> List[str]: ...
     def load_session(self, session_id: str) -> Optional[List[Dict]]: ...
 ```
 
@@ -671,11 +681,14 @@ class SessionManager:
 
 No fuzzy/prefix matching — each session is tracked by its ID. This prevents different sessions from accidentally overwriting each other.
 
+**`list_workspaces()`**: Returns a deduplicated list of workspace directory paths from all saved sessions. Used by the gateway to offer workspace suggestions to UI clients.
+
 **Session data** (in `chats.json`):
 ```json
 {
   "chat_2024-01-15 10:30:00": {
     "timestamp": "2024-01-15 10:30:00",
+    "workspace": "/path/to/project",
     "preview": "Fix the login bug",
     "messages": [...]
   }
@@ -712,22 +725,23 @@ kairos/gateway/
 
 Message type constants. Every WebSocket message is JSON with a `type` field.
 
-**Client → Server:** `connect`, `new_session`, `load_session`, `unload`, `list_sessions`, `message`, `interrupt`, `stop`, `compact`, `ping`
+**Client → Server:** `connect`, `new_session`, `load_session`, `unload`, `list_sessions`, `list_workspaces`, `message` (with `session_id`), `interrupt` (with `session_id`), `stop` (with `session_id`), `compact` (with `session_id`), `ping`
 
-**Server → Client:** `connected`, `new_session_created`, `sessions_list`, `stream_start`, `stream_token`, `tool_call`, `stream_end`, `done`, `token_update`, `compacted`, `unloaded`, `error`, `pong`, `exit`
+**Server → Client:** `connected`, `new_session_created`, `sessions_list`, `workspaces_list`, `stream_start`, `stream_token`, `tool_call`, `stream_end`, `done`, `token_update`, `compacted`, `unloaded`, `error`, `pong`, `exit`
 
 ### `kairos/gateway/manager.py` — GatewayManager
 
 **`ManagedSession`**: One conversation = one workspace + one Agent instance + one `is_running` flag.
 
 **`GatewayManager`**:
-- `create_session(workspace?)` — create new conversation (defaults to `default_workspace`)
-- `load_session(session_id)` — pull full history from disk, create Agent
+- `create_session(workspace?)` — create new conversation. **Workspace is required** — falls back to `default_workspace`, raises `ValueError` if neither is provided
+- `load_session(session_id)` — pull full history from disk, create Agent, repair broken tool chains via `_sanitize_history_for_resume`, initialize token counters from sanitized history. Raises `ValueError` with descriptive message if workspace cannot be determined
 - `unload_session(session_id)` — save to disk, destroy Agent, release memory
 - `send_message(session_id, content, callbacks)` — run `agent.run()` in thread, pipe events via callbacks
 - `compact(session_id)` — compact + save
-- `interrupt(session_id)` / `stop(session_id)` — hard/graceful stop
-- `list_sessions()` — list all sessions from `chats.json`
+- `interrupt(session_id)` — instant hard interrupt (both interrupt and stop use this)
+- `list_sessions()` — list all sessions (merged from disk + in-memory, so active sessions appear in the sidebar immediately). In-memory sessions always include a live `active` field reflecting `is_running` status, even for sessions also on disk
+- `list_workspaces()` — return deduplicated list of workspace paths from all saved sessions (includes `default_workspace` if set)
 - `cleanup_idle()` — background task: auto-unload sessions idle > 30 min
 
 **Key design**: The gateway owns zero workspace state. Each `ManagedSession` carries its own workspace and creates its own `Agent(workspace)` instance.
@@ -735,24 +749,40 @@ Message type constants. Every WebSocket message is JSON with a `type` field.
 ### `kairos/gateway/server.py` — FastAPI
 
 Routes:
-- `GET /health` — gateway status
+- `GET /health` — gateway status (includes `default_workspace`)
 - `GET /api/sessions` — list all sessions (REST)
+- `GET /api/workspaces` — list all known workspaces (REST)
 - `WS /ws` — main WebSocket endpoint
 
 **Thread safety**: Agent callbacks fire from background threads. Uses `asyncio.run_coroutine_threadsafe()` to safely schedule WebSocket sends on the event loop.
 
+**Non-blocking message handling**: When a client sends a `message`, the server runs `send_message()` as a background task via `asyncio.create_task()` instead of awaiting it inline. This keeps the WebSocket handler loop free to process other messages (interrupt, new_session, load_session, list_sessions, etc.) while the agent is streaming. Without this, all other messages would be stuck in the WebSocket buffer until the agent finishes, making interrupts non-functional and new-session/sidebar-click unresponsive. Background tasks are tracked in a `_bg_tasks` set to prevent garbage collection.
+
 ### WebSocket Protocol
 
+**Multi-session support**: A single WebSocket client can have multiple concurrent sessions. Messages include a `session_id` field to route to the correct agent. Switching focus between sessions does NOT unload the old one — agents continue running in the background.
+
 **Sending a message flow:**
-1. Client sends `{"type": "message", "content": "..."}` (optionally with `"image_url"`)
-2. Server sends `stream_start` → multiple `stream_token` → `stream_end` → `token_update` → `done`
-3. Tool calls emit `tool_call` events between `stream_start` and `done`
+1. Client sends `{"type": "message", "session_id": "...", "content": "..."}` (optionally with `"image_url"`)
+2. If no session is loaded (or previous was idle-unloaded), server auto-creates a new session. If a `"workspace"` field is included in the message payload, that workspace is used. Otherwise the default workspace is used. If neither is available, an error is sent. Server sends `new_session_created` before streaming begins
+3. Server runs `send_message` as a **non-blocking background task** (`asyncio.create_task`), immediately returning control to the WebSocket handler loop. This means interrupt, new_session, load_session, etc. are processed immediately even while the agent is streaming
+4. Server sends `stream_start` → multiple `stream_token` → `stream_end` → `token_update` → `done`
+5. Tool calls emit `tool_call` events between `stream_start` and `done`
+6. Client sends `list_sessions` after receiving `done` to refresh the sidebar
 
 **Session lifecycle:**
-- `new_session` → creates Agent in given/default workspace
-- `load_session` → loads from `chats.json`, creates Agent, sends history
-- `unload` → saves to disk, destroys Agent
+- `new_session` → **creates new Agent first** (sends `new_session_created` + `sessions_list` immediately so the workspace picker disappears), then **unloads old sessions in the background** (sends `unloaded` for each after completion). This prevents `browser_manager.close()` and `save_chat()` from blocking the client response.
+- `load_session` → loads from `chats.json` (or returns if already loaded), adds to client's active set. Does NOT unload other sessions — this is a focus switch
+- `unload` → saves to disk, destroys specific Agent. Client sends `{"type": "unload", "session_id": "..."}`
 - Idle 30 min → auto-unload
+- **Auto-recovery**: If a message arrives with no active session (client disconnected/reconnected, idle timeout, etc.), the server transparently creates a new session using the workspace from the message payload (or the default) and sends a `new_session_created` event followed by `sessions_list` to the client before proceeding
+
+**Routing**: All messages that target a specific session (`message`, `interrupt`, `stop`, `compact`, `unload`) include a `session_id` field. The server routes to the correct agent. Streaming events (`stream_start`, `stream_token`, `tool_call`, `stream_end`, `done`, `token_update`) include `session_id` so the client can route them to the correct session's display buffer.
+
+**Workspace flow (for UI clients):**
+- On `connect`, the server responds with `"workspaces"` — a list of all known workspace paths from saved sessions plus the default. The UI uses this to present a workspace picker
+- On `new_session`, the client must include `"workspace"` in the payload
+- On `list_workspaces`, the server responds with `workspaces_list` containing all known workspace paths
 
 ### `kairos/main.py` — CLI as Thin Client
 
@@ -760,15 +790,17 @@ The CLI is now a WebSocket client. It connects to the gateway, sends messages, a
 
 ### `kairos/main_gateway.py` — Gateway Entry Point
 
-Starts the FastAPI server with uvicorn. Takes an optional workspace argument (falls back to `KAIROS_DEFAULT_WORKSPACE` env var or cwd).
+Starts the FastAPI server with uvicorn. Takes an optional workspace argument. If none is provided, falls back to `KAIROS_DEFAULT_WORKSPACE` env var. If that is also not set, the gateway starts with no default — each client must specify a workspace when creating a new session.
 
-### `kairos/config.py` — New Gateway Settings
+### `kairos/config.py` — Gateway Settings
 
-| Method | Default |
-|--------|---------|
-| `Config.KAIROS_DEFAULT_WORKSPACE()` | `os.getcwd()` |
-| `Config.KAIROS_GATEWAY_PORT()` | `8765` |
-| `Config.KAIROS_GATEWAY_HOST()` | `127.0.0.1` |
+| Method | Returns | Default |
+|--------|---------|---------|
+| `Config.KAIROS_DEFAULT_WORKSPACE()` | `str` | `kairos-workspace` |
+| `Config.KAIROS_GATEWAY_PORT()` | `int` | `8765` |
+| `Config.KAIROS_GATEWAY_HOST()` | `str` | `127.0.0.1` |
+
+**Note**: `KAIROS_DEFAULT_WORKSPACE` defaults to `kairos-workspace` (relative to the gateway's working directory). If set via env var or CLI argument, that value is used instead. The directory is auto-created if it doesn't exist.
 
 ### `kairos/tools/session.py` — Workspace Support
 
@@ -814,3 +846,9 @@ websockets>=14.0
 6. Add summary case to `Agent._tool_summary()` (one-liner for CLI display)
 7. If it should be excluded from sub-agents, add its name to the exclusion list in `_get_tool_schema()`
 8. **Update this AGENTS.md and README.md**
+
+## Unicode in UI Components
+
+**IMPORTANT**: When editing React/TSX files (`ui/src/`), always use actual Unicode characters (▶, ⏳, ✓, ▸, …, ▌) in JSX text nodes — **never** use `\uXXXX` escape sequences. JSX text content does NOT process JavaScript Unicode escapes; they render as literal text. For example:
+- ✅ `<span>▶</span>` — renders the arrow character
+- ❌ `<span>\u25b6</span>` — renders the literal text `\u25b6`

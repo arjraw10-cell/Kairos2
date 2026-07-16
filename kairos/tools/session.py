@@ -190,6 +190,18 @@ class SessionManager:
             )
         return sessions
 
+    def list_workspaces(self) -> List[str]:
+        """Return deduplicated list of workspace paths from all persisted sessions."""
+        data = self._load_all()
+        seen = set()
+        workspaces = []
+        for session in data.values():
+            ws = session.get("workspace", "")
+            if ws and ws not in seen:
+                seen.add(ws)
+                workspaces.append(ws)
+        return workspaces
+
     def load_session(self, session_id: str) -> Optional[List[Dict[str, Any]]]:
         """Load a specific session by its ID."""
         data = self._load_all()

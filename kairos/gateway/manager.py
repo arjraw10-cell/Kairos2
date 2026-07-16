@@ -33,22 +33,47 @@ class GatewayManager:
     its own workspace and creates its own Agent instance.
     """
 
-    def __init__(self, default_workspace: str):
-        self.default_workspace = str(Path(default_workspace).resolve())
+    def __init__(self, default_workspace: str = None):
+        # Fall back to config if no explicit default
+        ws = default_workspace
+        if not ws:
+            from ..config import Config
+            ws = Config.KAIROS_DEFAULT_WORKSPACE()
+        self.default_workspace = str(Path(ws).resolve()) if ws else None
         self._persistence = SessionManager()
         self._sessions: Dict[str, ManagedSession] = {}
         self._lock = asyncio.Lock()
 
-    def _resolve_workspace(self, workspace: Optional[str]) -> str:
-        """Return given workspace, or fall back to default."""
-        if workspace and Path(workspace).is_dir():
-            return str(Path(workspace).resolve())
-        return self.default_workspace
+    def _resolve_workspace(self, workspace: str = None) -> str:
+        """Resolve a workspace path. Auto-creates directory if needed.
+        
+        Relative paths are resolved against the user's home directory.
+        """
+        # Explicit workspace provided
+        if workspace:
+            path = Path(workspace)
+            if not path.is_absolute():
+                path = Path.home() / path
+            path = path.resolve()
+            path.mkdir(parents=True, exist_ok=True)
+            return str(path)
+        # Fall back to default
+        if self.default_workspace:
+            path = Path(self.default_workspace)
+            path.mkdir(parents=True, exist_ok=True)
+            return str(path.resolve())
+        # Nothing available
+        raise ValueError(
+            "No workspace specified. Please provide a valid workspace path."
+        )
 
     # ── Session lifecycle ──────────────────────────────────────────
 
     async def create_session(self, workspace: str = None) -> ManagedSession:
-        """Create a brand-new conversation in the given workspace."""
+        """Create a brand-new conversation in the given workspace.
+        
+        Raises ValueError if workspace cannot be resolved.
+        """
         resolved = self._resolve_workspace(workspace)
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         session_id = f"chat_{timestamp}"
@@ -73,14 +98,21 @@ class GatewayManager:
             raise ValueError(f"Session not found: {session_id}")
 
         workspace = self._persistence.get_workspace(session_id)
-        resolved = self._resolve_workspace(workspace)
+        try:
+            resolved = self._resolve_workspace(workspace)
+        except ValueError:
+            raise ValueError(
+                f"Session '{session_id}' has no stored workspace "
+                f"and no default workspace is configured. "
+                f"Cannot determine where to run the agent."
+            )
 
         session = ManagedSession(session_id, resolved)
         # Repair any broken tool chains from interrupted execution
         sanitized, last_response = Agent._sanitize_history_for_resume(history)
         session.agent.conversation_history = sanitized
         try:
-            session.agent.tokens.start_turn(history)
+            session.agent.tokens.start_turn(sanitized)
             session.agent.tokens.finish_turn()
         except Exception:
             pass  # Token counting is best-effort on load
@@ -117,7 +149,7 @@ class GatewayManager:
 
         # Close background terminals
         try:
-            for tid in list(session.agent.terminal_manager._terminals.keys()):
+            for tid in list(session.agent.terminal_manager.terminals.keys()):
                 session.agent.terminal_manager.close_terminal(tid)
         except Exception:
             pass
@@ -139,7 +171,7 @@ class GatewayManager:
         if not session:
             raise ValueError(f"Session not loaded: {session_id}")
         if session.is_running:
-            raise ValueError("Session is already processing a message")
+            raise ValueError(f"Session {session_id} is already processing a message")
 
         session.is_running = True
         cb = callbacks or {}
@@ -202,17 +234,63 @@ class GatewayManager:
         if session and session.is_running:
             session.agent.interrupt()
 
-    async def stop(self, session_id: str):
-        """Graceful stop (Escape equivalent — finishes current step)."""
-        session = self._sessions.get(session_id)
-        if session:
-            session.agent.request_stop()
-
     # ── Queries ────────────────────────────────────────────────────
 
     def list_sessions(self):
-        """List all persisted sessions from disk."""
-        return self._persistence.list_sessions()
+        """List all sessions — persisted (disk) + in-memory (active).
+
+        Merges both sources so active sessions appear in the sidebar
+        immediately, even before they've been saved to disk.
+        """
+        disk = self._persistence.list_sessions()
+        disk_ids = {s["id"] for s in disk}
+
+        # Build in-memory entries (all of them, including those also on disk)
+        in_memory = []
+        for sid, session in self._sessions.items():
+            preview = ""
+            try:
+                if sid in disk_ids:
+                    # Use disk preview for known sessions
+                    for d in disk:
+                        if d["id"] == sid:
+                            preview = d.get("preview", "")
+                            break
+                else:
+                    preview = SessionManager._extract_preview(
+                        session.agent.get_history()
+                    )
+            except Exception:
+                pass
+            in_memory.append({
+                "id": sid,
+                "timestamp": sid.replace("chat_", ""),
+                "workspace": session.workspace,
+                "preview": preview,
+                "active": session.is_running,
+            })
+
+        # Merge: in-memory first (has live 'active' status), then disk-only
+        # Deduplicate by id — in-memory wins over disk
+        seen = set()
+        result = []
+        for entry in in_memory:
+            if entry["id"] not in seen:
+                seen.add(entry["id"])
+                result.append(entry)
+        for entry in disk:
+            if entry["id"] not in seen:
+                seen.add(entry["id"])
+                result.append(entry)
+        return result
+
+    def list_workspaces(self):
+        """Return deduplicated list of workspace paths from all saved sessions."""
+        workspaces = self._persistence.list_workspaces()
+        # Include default workspace at the front if set
+        if self.default_workspace and self.default_workspace not in workspaces:
+            workspaces.insert(0, self.default_workspace)
+        return workspaces
 
     def get_session(self, session_id: str) -> Optional[ManagedSession]:
         """Get a currently-loaded session, or None."""

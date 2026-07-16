@@ -5,6 +5,10 @@ Usage:
 
 Or:
     kairos serve [default_workspace]
+
+If no default_workspace is provided and KAIROS_DEFAULT_WORKSPACE is not
+set in .env, the gateway starts with no default — each client must
+specify a workspace when creating a new session.
 """
 import logging
 import os
@@ -36,11 +40,14 @@ def main():
 
     app = create_app(default_workspace=workspace)
 
-    print(f"Kairos Gateway")
+    print("Kairos Gateway")
     print(f"  URL:      ws://{host}:{port}/ws")
     print(f"  Health:   http://{host}:{port}/health")
     print(f"  Sessions: http://{host}:{port}/api/sessions")
-    print(f"  Default:  {workspace}")
+    if workspace:
+        print(f"  Default:  {workspace}")
+    else:
+        print("  Default:  (none — clients choose workspace)")
     print()
 
     uvicorn.run(app, host=host, port=port, log_level="info")

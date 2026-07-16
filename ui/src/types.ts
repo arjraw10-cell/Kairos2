@@ -1,10 +1,10 @@
-// Protocol types matching kairos/gateway/protocol.py
+// === Protocol Types (matching kairos/gateway/protocol.py) ===
 
-// Server -> Client message types
 export type ServerMessageType =
   | "connected"
   | "new_session_created"
   | "sessions_list"
+  | "workspaces_list"
   | "stream_start"
   | "stream_token"
   | "stream_end"
@@ -17,13 +17,13 @@ export type ServerMessageType =
   | "pong"
   | "exit";
 
-// Client -> Server message types
 export type ClientMessageType =
   | "connect"
   | "new_session"
   | "load_session"
   | "unload"
   | "list_sessions"
+  | "list_workspaces"
   | "message"
   | "interrupt"
   | "stop"
@@ -40,18 +40,7 @@ export interface Session {
   timestamp: string;
   workspace: string;
   preview: string;
-}
-
-export interface ChatMessage {
-  id: string;
-  role: "user" | "assistant" | "tool" | "system";
-  content: string;
-  timestamp: number;
-}
-
-export interface ToolCallInfo {
-  name: string;
-  summary: string;
+  active?: boolean;
 }
 
 export interface TokenInfo {
@@ -63,3 +52,43 @@ export interface TokenInfo {
 }
 
 export type ConnectionStatus = "disconnected" | "connecting" | "connected";
+
+// === UI Types ===
+
+export interface ToolCallInfo {
+  name: string;
+  summary: string;
+}
+
+export interface TurnStep {
+  thinking: string;
+  toolCalls: ToolCallInfo[];
+  durationMs: number;
+}
+
+export interface AssistantTurn {
+  steps: TurnStep[];
+  response: string | null;
+}
+
+export interface UIMessage {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  image_urls?: string[];
+  turn?: AssistantTurn;
+}
+
+/** The complete renderable state for one loaded conversation. */
+export interface SessionView {
+  id: string;
+  workspace: string;
+  preview: string;
+  messages: UIMessage[];
+  streamText: string;
+  toolCalls: ToolCallInfo[];
+  completedSteps: TurnStep[];
+  tokens: TokenInfo | null;
+  streaming: boolean;
+  loading: boolean;
+}

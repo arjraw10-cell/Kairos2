@@ -1,5 +1,7 @@
 import os
 from functools import lru_cache
+from pathlib import Path
+from typing import Optional
 
 # Lazy-load .env file at first access instead of at import time
 _load_dotenv_done = False
@@ -50,7 +52,12 @@ class Config:
     @lru_cache(maxsize=1)
     def KAIROS_DEFAULT_WORKSPACE(cls) -> str:
         _ensure_dotenv()
-        return os.getenv("KAIROS_DEFAULT_WORKSPACE", os.getcwd())
+        raw = os.getenv("KAIROS_DEFAULT_WORKSPACE", "kairos-workspace")
+        # Resolve relative paths against the user's home directory
+        p = Path(raw)
+        if not p.is_absolute():
+            p = Path.home() / p
+        return str(p.resolve())
 
     @classmethod
     @lru_cache(maxsize=1)

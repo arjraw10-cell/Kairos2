@@ -34,16 +34,17 @@ class Agent:
             base_url=Config.OPENAI_BASE_URL(),
         )
         self.model = Config.OPENAI_MODEL()
-        self.terminal_manager = TerminalManager()
-        self.terminal_manager._interrupt_event = self._interrupt_event
         self._interrupt_event = threading.Event()
-        self._stop_requested = False
 
         # Token counter
         self.tokens = TokenCounter(self.model)
 
         # Working directory (used by git and search defaults)
         self.cwd = Path(workspace).resolve()
+
+        # Terminal manager (shares interrupt event for hard-stop support)
+        self.terminal_manager = TerminalManager()
+        self.terminal_manager._interrupt_event = self._interrupt_event
 
         # Individual tools
         self.read_tool = ReadTool()
@@ -69,6 +70,7 @@ class Agent:
 
         # Browser tools
         self.browser_manager = BrowserManager()
+        self.browser_manager.set_interrupt_event(self._interrupt_event)
         self.browser_launch_tool = BrowserLaunchTool(self.browser_manager)
         self.browser_navigate_tool = BrowserNavigateTool(self.browser_manager)
         self.browser_click_tool = BrowserClickTool(self.browser_manager)
@@ -120,7 +122,7 @@ class Agent:
             "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, inspect version control, and browse the web.\n\n"
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
-            "You have 29 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
+            "You have 40 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
             "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, it will not automatically be injected, so you will have to look for the AGENTS.md file in that directory. Note that the AGENTS.md does not always exist.\n\n"
             "## Browser Tools\n"
             "You can browse the web using browser tools. The workflow is:\n"
@@ -1208,8 +1210,11 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         }
         recent = history[boundary:]
         self.conversation_history = [system_msg, compaction_msg] + recent
+        # Update context_tokens for display without inflating session totals.
+        # The recent messages were already counted in previous turns, and
+        # the next step()'s start_turn() will recount the full (shorter)
+        # history correctly. Calling finish_turn() here would double-count.
         self.tokens.start_turn(self.conversation_history)
-        self.tokens.finish_turn()
         return f"Compacted: summarized {len(to_summarize)} messages into checkpoint."
 
     def auto_compact_if_needed(self) -> Optional[str]:
@@ -1224,15 +1229,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         if self._interrupt_event.is_set():
             self._interrupt_event.clear()
             raise InterruptedError("Interrupted by user")
-
-    def request_stop(self):
-        self._stop_requested = True
-
-    def _should_stop(self) -> bool:
-        if self._stop_requested:
-            self._stop_requested = False
-            return True
-        return False
 
     def _prepare_messages_for_api(self) -> List[Dict[str, Any]]:
         messages = []
@@ -1574,12 +1570,9 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         retry_count = 0
         try:
             while True:
-                if self._should_stop():
-                    return "[Stopped \u2014 waiting for your input]"
-                if current is not None:
-                    compact_msg = self.auto_compact_if_needed()
-                    if compact_msg and self.on_compact:
-                        self.on_compact(compact_msg)
+                compact_msg = self.auto_compact_if_needed()
+                if compact_msg and self.on_compact:
+                    self.on_compact(compact_msg)
                 response, tool_calls = self.step(current, image_url=_first_image)
                 _first_image = None
                 current = None

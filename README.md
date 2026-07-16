@@ -11,6 +11,12 @@ A minimal personal coding agent in Python.
 - **Auto-Compaction**: Conversation history is automatically summarized when context usage exceeds 80%
 - **Sub-Agents**: Spawn autonomous child agents to work on tasks in parallel
 - **Browser Automation**: Full Playwright/CloakBrowser integration with stealth mode, persistent profiles, multi-tab, and CDP support
+- **Image Support (UI)**: Paste images with Ctrl+V, attach via file picker button, or drag-and-drop directly into the chat. Images are sent to the agent as vision data and displayed in the message history.
+- **Markdown Rendering (UI)**: Full markdown support via `react-markdown` with GFM (tables, blockquotes, task lists, strikethrough), syntax highlighting (highlight.js/GitHub Dark), and copy-to-clipboard buttons on code blocks.
+- **Background Session Notifications (UI)**: When a background session finishes while you're focused on another, a toast notification appears showing which session completed.
+- **Skeleton Loading (UI)**: When loading a conversation from the sidebar, animated grey skeleton placeholders appear in the message area while the history is being fetched — giving instant visual feedback instead of a blank screen.
+- **Unlocked Sidebar (UI)**: Sessions appear in the sidebar immediately after creation (even while the agent is running). You can switch between sessions without interrupting running agents — they continue in the background. Streaming indicators (pulsing dots) show on ALL concurrently running sessions, not just the focused one. Close button (×) to explicitly unload a session.
+- **Chrome-Style Tabs (UI)**: Horizontal tab bar above the main content area shows currently loaded sessions, just like Chrome browser tabs. Each tab displays the session's first message as a label, with streaming indicators on active sessions. Close button on each tab unloads the session; "+" button opens a new thread without closing existing tabs. Middle-click to close a tab. Tabs auto-scroll to keep the active tab visible.
 - **Skills**: Self-extensible skill system — agent can create/load skills stored as `SKILL.md` files in `skills/` directory
 - **Paste System**: Text pastes are detected automatically via bracketed paste (modern terminals wrap pasted text in escape sequences, making it arrive as one atomic chunk). Alt+V pastes images from the clipboard. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content.
 - **Chat Persistence**: All sessions saved to `chats/chats.json` with auto-save every 60 seconds and on window close. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions. **Atomic writes** via temp-file + rename prevent corruption from interrupted saves. **Corruption recovery** auto-heals damaged files by parsing up to the last valid JSON boundary.
@@ -18,9 +24,10 @@ A minimal personal coding agent in Python.
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
 - **Streaming Display**: Real-time tokens in a live-updating panel (grey for thinking, green for final response)
 - **Tool Summaries**: One-line display when tools are called (e.g., `read file: /path`)
-- **Dual Interrupt**: Ctrl+C hard-interrupts mid-step; Escape gracefully stops after the current step finishes
+- **Instant Interrupt**: Both Escape and Ctrl+C hard-interrupt immediately — including browser waits, navigations, and terminal commands. The agent aborts within 50ms at any checkpoint.
 - **OpenAI Compatible**: Works with any OpenAI-compatible API (OpenRouter, local models, etc.)
 - **Clean CLI**: Terminal UI with `rich` and `prompt_toolkit`
+- **Gateway Architecture**: WebSocket server that hosts multiple Agent instances across different workspaces simultaneously. UI clients can run multiple concurrent sessions — switch focus without interrupting background agents. Streaming events are routed per-session so each conversation streams independently.
 
 ## Installation
 
@@ -58,12 +65,21 @@ python main.py                   # cwd as workspace
 python main.py /path/to/project  # specific workspace
 ```
 
+### Windows Shortcuts
+
+| File | Description |
+|------|-------------|
+| `kairos.bat` | Starts the gateway + launches the **Electron UI** |
+| `kairos_cli.bat` | Starts the gateway (if not already running) + launches the **CLI** |
+
+`kairos_cli.bat` checks if the gateway is already listening on port 8765 before starting it. If the gateway is already running (e.g., from a previous `kairos.bat` launch), it skips startup and goes straight to the CLI. Any arguments are forwarded to the CLI (e.g., a workspace path).
+
 ### REPL Commands
 
 | Command | Description |
 |---------|-------------|
-| `Escape` | Stop after current step (finish tool calls, then wait for input) |
-| `Ctrl+C` | Hard-interrupt (abort mid-step) |
+| `Escape` | Instant interrupt (aborts mid-step, mid-browser-wait, etc.) |
+| `Ctrl+C` | Hard-interrupt (same as Escape — aborts immediately) |
 | `Ctrl+V` | Paste text from clipboard |
 | `Alt+V` | Paste image from clipboard |
 | `/resume` | Load a saved chat |
@@ -178,7 +194,8 @@ Browser features:
 ```
 main.py                     # Entry point
 kairos/
-├── main.py                 # CLI REPL loop, signal handlers, auto-save
+├── main.py                 # CLI REPL — thin WebSocket client connected to the gateway
+├── main_gateway.py         # Gateway entry point (kairos serve)
 ├── config.py               # Lazy .env loading (OPENAI_API_KEY, BASE_URL, MODEL)
 ├── agent.py                # Core agent loop, streaming, compaction, tool dispatch
 ├── cli.py                  # Terminal UI (streaming panels, thinking dots, paste handling)
@@ -186,6 +203,11 @@ kairos/
 ├── terminal_manager.py     # Terminal lifecycle (background shells, blocking subprocesses)
 ├── browser_manager.py      # Playwright/CloakBrowser lifecycle in a dedicated worker thread + CDP cross-origin iframe support + smart auto-snapshot
 ├── cdp_manager.py          # CDPManager — low-level Chrome DevTools Protocol access (a11y tree, frame detection)
+├── gateway/
+│   ├── __init__.py         # Exports: GatewayManager, ManagedSession, create_app, ClientMsg, ServerMsg
+│   ├── protocol.py         # Message type constants (ClientMsg, ServerMsg)
+│   ├── manager.py          # GatewayManager + ManagedSession — owns conversations, routes to Agents
+│   └── server.py           # FastAPI app — WebSocket + REST routes, thread-safe streaming
 └── tools/
     ├── base.py             # ToolResult class
     ├── read.py             # Read file (text + images)
@@ -208,7 +230,7 @@ Tokens are streamed in real-time. During the agent's reasoning phase, a grey pan
 
 ### Compaction
 
-When the conversation context exceeds 80% of the context window, old messages are automatically summarized into a structured checkpoint (Goal, Progress, Key Decisions, Next Steps) and replaced. Recent context (20% of context window) is preserved. You can also trigger this manually with `/compact`.
+When the conversation context reaches 80% of the context window, old messages are automatically summarized into a structured checkpoint (Goal, Progress, Key Decisions, Next Steps) and replaced. Recent context (20% of context window) is preserved. The check runs every loop iteration, so compaction triggers reliably even during long tool-call chains. You can also trigger this manually with `/compact`.
 
 ### Skills
 
@@ -224,6 +246,32 @@ Chat history is saved:
 - After every exchange
 - Every 60 seconds in the background
 - On SIGTERM / SIGINT / SIGHUP (window close, task kill)
+
+### Gateway (Multi-Workspace)
+
+Kairos can run as a stateful WebSocket gateway that hosts multiple Agent instances across different workspaces simultaneously. Each conversation gets its own Agent with its own workspace, conversation history, and browser state.
+
+```bash
+# Start gateway with a default workspace (optional)
+python -m kairos.main_gateway [default_workspace]
+
+# CLI connects automatically and sends its cwd as workspace
+python -m kairos.main [workspace]
+```
+
+**How workspaces work:**
+- **CLI clients** send their current working directory (or a CLI argument) as the workspace when creating a new session. No UI picker needed.
+- **UI clients** (Electron, etc.) receive a list of known workspaces on connect. They present a workspace picker and include the selected workspace path in `new_session` messages.
+- If no `KAIROS_DEFAULT_WORKSPACE` env var is set and no CLI argument is given, the gateway requires every client to explicitly provide a workspace.
+- Each session's workspace is persisted to `chats.json` so reloading a session always uses the correct workspace.
+
+**Concurrent sessions:**
+- A single UI client can have multiple sessions loaded simultaneously. Switching focus via the sidebar does NOT unload the old session — its agent keeps running in the background.
+- Messages and session creation are handled **non-blocking**: `send_message` runs as a background task, so the WebSocket loop stays free to process interrupts, new-session requests, and session switches while an agent is streaming. When creating a new session, the server responds with `new_session_created` immediately and unloads old sessions in the background — so the workspace picker disappears instantly instead of blocking on `browser_manager.close()` or `save_chat()`.
+- The **tab bar** at the top of the main content area shows all currently loaded sessions as Chrome-style tabs. Click a tab to switch focus, close a tab to unload it, or click "+" to open a new thread without closing existing tabs.
+- All streaming events (`stream_start`, `stream_token`, `tool_call`, `stream_end`, `done`) include a `session_id` so the UI routes them to the correct conversation's display buffer.
+- The sidebar shows streaming indicators (pulsing dots) on ALL currently running sessions, not just the focused one.
+- Use the close button (×) on a tab or sidebar entry to explicitly unload a session and free its resources (browser, terminals, agent).
 
 ## Design Principles
 
