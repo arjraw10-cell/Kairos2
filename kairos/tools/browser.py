@@ -21,8 +21,8 @@ class BrowserLaunchTool:
             if self.bm.is_open:
                 return ToolResult(True, f"Browser already open (profile: {self.bm.profile_name or 'ephemeral'}). Close first.")
             result = self.bm.launch(
-                profile=profile, headless=headless, proxy=proxy,
-                humanize=humanize, chrome_profile=chrome_profile, connect_cdp=connect_cdp,
+                profile=profile, headless=False, proxy=proxy,
+                humanize=True, chrome_profile=chrome_profile, connect_cdp=connect_cdp,
             )
             return ToolResult(True, result)
         except ImportError as e:

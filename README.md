@@ -286,3 +286,7 @@ python -m kairos.main [workspace]
 ## License
 
 MIT
+
+## Browser launch defaults
+
+Browser automation always launches in headed mode with human-like interaction behavior. The `browser_launch` arguments remain for protocol compatibility, but requests for headless mode or disabled humanization are ignored.

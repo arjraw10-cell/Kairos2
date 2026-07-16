@@ -10,14 +10,24 @@ CHATS_DIR = Path(os.path.dirname(os.path.dirname(__file__))).parent / "chats"
 
 
 class SessionManager:
-    """Manages saving and loading of chat sessions."""
+    """Manages saving and loading of chat sessions.
 
-    def __init__(self):
-        CHATS_DIR.mkdir(exist_ok=True)
+    When a workspace is supplied, its ``chats/chats.json`` is used. This keeps
+    legacy sessions separate when the PATH launcher runs the Agent2 source
+    against another project (for example, Agent2Gateway).
+    """
+
+    def __init__(self, workspace: str | os.PathLike[str] | None = None):
+        if workspace:
+            self._chats_dir = Path(workspace).expanduser().resolve() / "chats"
+        else:
+            # Preserve the historical default for direct library callers.
+            self._chats_dir = CHATS_DIR
+        self._chats_dir.mkdir(parents=True, exist_ok=True)
         self._current_session_id: Optional[str] = None
 
     def _chat_file(self) -> Path:
-        return CHATS_DIR / "chats.json"
+        return self._chats_dir / "chats.json"
 
     def _load_all(self) -> Dict[str, Any]:
         path = self._chat_file()
@@ -78,17 +88,25 @@ class SessionManager:
                 tmp_f.flush()
                 os.fsync(tmp_f.fileno())
             # Atomic replace via os.replace() — works on both Windows and Unix
-            # without requiring exclusive file access. Retry briefly on
-            # PermissionError (transient locks from antivirus / indexer).
-            for attempt in range(3):
+            # without requiring exclusive file access. Retry on
+            # PermissionError (transient locks from antivirus / indexer / OneDrive).
+            for attempt in range(5):
                 try:
                     os.replace(tmp_path, str(path))
                     break
                 except PermissionError:
-                    if attempt < 2:
-                        time.sleep(0.05 * (attempt + 1))  # 50ms, 100ms backoff
+                    if attempt < 4:
+                        time.sleep(0.1 * (attempt + 1))  # 100ms, 200ms, 300ms, 400ms, 500ms
                     else:
-                        raise
+                        # Fallback: write directly to target file (not atomic, but
+                        # better than crashing — temp file with full data is still
+                        # available for manual recovery).
+                        with open(tmp_path, "r", encoding="utf-8") as src:
+                            content = src.read()
+                        with open(str(path), "w", encoding="utf-8") as dst:
+                            dst.write(content)
+                            dst.flush()
+                            os.fsync(dst.fileno())
         except BaseException:
             # Clean up temp file on failure
             try:

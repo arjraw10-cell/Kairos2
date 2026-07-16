@@ -9,16 +9,87 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from rich.console import Console
+from rich.console import Console, ConsoleOptions, RenderResult
 from rich.panel import Panel
-from rich.markdown import Markdown
+from rich.markdown import Markdown, MarkdownElement, MarkdownContext, TableElement as _BaseTableElement
 from rich.syntax import Syntax
 from rich.text import Text
 from rich.live import Live
+from rich.table import Table
+from rich import box
+
+
+class _EnhancedTableElement(MarkdownElement):
+    """TableElement replacement that renders markdown tables with rounded boxes,
+    bold headers on a subtle background, and alternating row shading."""
+
+    def __init__(self) -> None:
+        self.header = None
+        self.body = None
+
+    @classmethod
+    def create(cls, markdown, token):
+        return cls()
+
+    def on_child_close(self, context: MarkdownContext, child: MarkdownElement) -> bool:
+        from rich.markdown import TableHeaderElement, TableBodyElement
+        if isinstance(child, TableHeaderElement):
+            self.header = child
+        elif isinstance(child, TableBodyElement):
+            self.body = child
+        else:
+            raise RuntimeError("Couldn't process markdown table.")
+        return False
+
+    def on_enter(self, context: MarkdownContext) -> None:
+        pass
+
+    def on_leave(self, context: MarkdownContext) -> None:
+        pass
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        table = Table(
+            box=box.ROUNDED,
+            pad_edge=False,
+            border_style="cyan",
+            show_edge=True,
+            collapse_padding=True,
+            header_style="bold bright_white on grey15",
+            row_styles=["", "dim"],
+            title_style="bold cyan",
+        )
+
+        if self.header is not None and self.header.row is not None:
+            for column in self.header.row.cells:
+                heading = column.content.copy()
+                heading.stylize("markdown.table.header")
+                table.add_column(heading)
+
+        if self.body is not None:
+            for row in self.body.rows:
+                row_content = [element.content for element in row.cells]
+                table.add_row(*row_content)
+
+        yield table
+
+
+class KairosMarkdown(Markdown):
+    """Enhanced Markdown renderer with polished table rendering.
+
+    Replaces the default ``TableElement`` with a version that uses rounded
+    boxes, bold headers on a subtle dark background, and alternating row
+    shading for better readability.
+    """
+
+    elements = dict(Markdown.elements)
+    elements["table_open"] = _EnhancedTableElement
 from prompt_toolkit import PromptSession
 from prompt_toolkit.styles import Style
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 
 console = Console()
 
@@ -59,32 +130,6 @@ def _make_text_token() -> str:
 _paste_registry: Dict[str, dict] = {}
 
 _kb = KeyBindings()
-
-
-# ------------------------------------------------------------------ #
-#  Paste detection helpers                                             #
-# ------------------------------------------------------------------ #
-
-def _diff_inserted_text(old: str, new: str) -> Optional[str]:
-    """Given old and new buffer text where *new* contains *old* with a single
-    contiguous insertion, return the inserted text.
-
-    Works by finding the longest common prefix and suffix, then extracting
-    what lies between them.  Returns ``None`` if no clean insertion can be
-    isolated (e.g. multiple edits or overlapping text).
-    """
-    prefix_len = 0
-    while prefix_len < len(old) and prefix_len < len(new) and old[prefix_len] == new[prefix_len]:
-        prefix_len += 1
-
-    old_tail = len(old)
-    new_tail = len(new)
-    while old_tail > prefix_len and new_tail > prefix_len and old[old_tail - 1] == new[new_tail - 1]:
-        old_tail -= 1
-        new_tail -= 1
-
-    inserted = new[prefix_len:new_tail]
-    return inserted if inserted else None
 
 
 # ------------------------------------------------------------------ #
@@ -225,25 +270,47 @@ def _image_data_to_url(data: bytes) -> str:
     return f"data:{mime};base64,{b64}"
 
 
-def _get_clipboard_sequence_number() -> int:
-    """Get the OS clipboard sequence number. Returns 0 on non-Windows platforms.
+def _insert_text_paste(buf, text: str) -> None:
+    """Store pasted text and insert a visible token into the prompt buffer."""
+    if not text:
+        return
+    token = _make_text_token()
+    _paste_registry[token] = {
+        "type": "text",
+        "text": text,
+        "text_stripped": text.strip(),
+    }
+    buf.insert_text(token)
 
-    On Windows, each copy/paste increments this counter, so comparing before
-    and after a buffer change tells us whether the clipboard was involved —
-    which is the reliable signal that a Ctrl+V paste occurred.
+
+# ------------------------------------------------------------------ #
+#  Key bindings (text/image paste, backspace deletes paste tokens)    #
+# ------------------------------------------------------------------ #
+
+@_kb.add(Keys.BracketedPaste)
+def _bracketed_paste_handler(event):
+    """Handle terminals that send a bracketed-paste event."""
+    try:
+        # Match prompt_toolkit's normal bracketed-paste line-ending behavior.
+        text = event.data.replace("\r\n", "\n").replace("\r", "\n")
+        _insert_text_paste(event.current_buffer, text)
+    except Exception:
+        pass
+
+
+@_kb.add("c-v")
+def _paste_handler(event):
+    """Handle Ctrl+V when the terminal passes the key to prompt_toolkit.
+
+    Some terminals intercept Ctrl+V and emit a bracketed-paste event instead;
+    those terminals are handled by ``_bracketed_paste_handler`` above.
     """
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            return ctypes.windll.user32.GetClipboardSequenceNumber()
-        except Exception:
-            return 0
-    return 0
+    try:
+        # Text is the normal Ctrl+V payload. Images remain explicit via Alt+V.
+        _insert_text_paste(event.current_buffer, _read_system_clipboard())
+    except Exception:
+        pass
 
-
-# ------------------------------------------------------------------ #
-#  Key bindings (Alt+V for images, backspace deletes paste tokens)    #
-# ------------------------------------------------------------------ #
 
 @_kb.add("escape", "v")
 def _alt_v_handler(event):
@@ -320,10 +387,16 @@ class CLI:
             enable_open_in_editor=False,
         )
 
-        # Escape key listener (active during agent execution)
+        # Escape key listener (active during agent execution). The listener
+        # shares stdin with the next prompt, so ordinary characters captured
+        # during the response-to-prompt handoff are buffered and replayed
+        # instead of being silently discarded.
         self._escape_listening = False
+        self._escape_stop_event = threading.Event()
         self._escape_listener_thread: Optional[threading.Thread] = None
         self._on_escape: Optional[Callable[[], None]] = None
+        self._pending_input = ""
+        self._pending_input_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     #  Banner / info                                                       #
@@ -348,6 +421,17 @@ class CLI:
 
     def print_info(self, message: str):
         self.console.print(f"[cyan]Info:[/cyan] {message}")
+
+    def print_background_notification(self, message: str):
+        """Show a completed background command without hiding its details."""
+        self.console.print(
+            Panel(
+                message,
+                border_style="yellow",
+                title="Background terminal",
+                padding=(0, 1),
+            )
+        )
 
     def print_error(self, message: str):
         if "\n" in message:
@@ -430,7 +514,7 @@ class CLI:
         text = self._stream_text
         if self._live:
             try:
-                display = Markdown(text) if text else Text("")
+                display = KairosMarkdown(text) if text else Text("")
             except Exception:
                 display = text or ""
             self._live.update(Panel(display, border_style="green", padding=(1, 2)))
@@ -464,13 +548,20 @@ class CLI:
         status = token_counter.format_status()
         self.console.print(f"[dim]{status}[/dim]")
 
+    def print_subagent_token_status(self, subagent_id: str, token_counter):
+        """Print a child agent's token status without mixing it with the parent."""
+        status = token_counter.format_status()
+        self.console.print(
+            f"[dim]Subagent {subagent_id}: {status}[/dim]"
+        )
+
     # ------------------------------------------------------------------ #
     #  Final response (green panel)                                        #
     # ------------------------------------------------------------------ #
 
     def print_response(self, content: str):
         try:
-            md = Markdown(content)
+            md = KairosMarkdown(content)
             self.console.print(Panel(md, border_style="green", padding=(1, 2)))
         except Exception:
             self.console.print(Panel(content, border_style="green", padding=(1, 2)))
@@ -498,7 +589,16 @@ class CLI:
     #  Chat list picker                                                    #
     # ------------------------------------------------------------------ #
 
-    def pick_session(self, sessions: list) -> Optional[str]:
+    def pick_session(
+        self, sessions: list, initial_choice: Optional[str] = None
+    ) -> Optional[str]:
+        """Prompt for and return a saved-session ID.
+
+        ``initial_choice`` supports commands such as ``/resume 1``. Pending
+        input captured by the Escape handoff is consumed here as well as by
+        the normal prompt, so a quickly entered ``/resume`` followed by
+        ``1`` cannot fall through to the agent as an ordinary request.
+        """
         if not sessions:
             self.console.print("[yellow]No saved chats found.[/yellow]")
             return None
@@ -509,29 +609,52 @@ class CLI:
             preview = s.get("preview", "")
             self.console.print(f"  [cyan]{i + 1}.[/cyan] {ts}  {preview}...")
         self.console.print()
-        try:
-            choice = self._prompt_session.prompt(
-                HTML('<style class="prompt">Pick a chat (number) or press Enter to cancel: </style>'),
-                style=PROMPT_STYLE,
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            return None
-        if not choice:
-            return None
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(sessions):
-                return sessions[idx]["id"]
-        except ValueError:
-            pass
-        self.console.print("[red]Invalid choice.[/red]")
-        return None
+
+        choice = initial_choice
+        while True:
+            if choice is None:
+                pending_line, pending_default = self._take_pending_input_for_prompt()
+                if pending_line is not None:
+                    choice = pending_line
+                else:
+                    try:
+                        choice = self._prompt_session.prompt(
+                            HTML(
+                                '<style class="prompt">Pick a chat (number) '
+                                'or press Enter to cancel: </style>'
+                            ),
+                            style=PROMPT_STYLE,
+                            default=pending_default,
+                        ).strip()
+                    except (EOFError, KeyboardInterrupt):
+                        return None
+
+            choice = choice.strip()
+            if not choice:
+                return None
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(sessions):
+                    return sessions[idx]["id"]
+            except ValueError:
+                pass
+
+            self.console.print("[red]Invalid choice. Enter a chat number or press Enter to cancel.[/red]")
+            choice = None
 
     # ------------------------------------------------------------------ #
     #  Escape key listener                                                 #
     # ------------------------------------------------------------------ #
 
     def start_escape_listener(self, on_escape: Callable[[], None]):
+        """Start watching for Escape without losing ordinary terminal input.
+
+        The listener necessarily shares stdin with ``PromptSession``. If a
+        user types the next command while an agent response is finishing, the
+        listener may see those bytes first. It therefore buffers every
+        non-Escape byte for the next prompt instead of silently discarding it.
+        """
+        self._escape_stop_event.clear()
         self._on_escape = on_escape
         self._escape_listening = True
         self._escape_listener_thread = threading.Thread(
@@ -540,11 +663,51 @@ class CLI:
         self._escape_listener_thread.start()
 
     def stop_escape_listener(self):
+        """Stop the Escape listener before the next prompt owns stdin."""
         self._escape_listening = False
-        if self._escape_listener_thread and self._escape_listener_thread.is_alive():
-            self._escape_listener_thread.join(timeout=0.5)
+        self._escape_stop_event.set()
+        thread = self._escape_listener_thread
+        if thread and thread.is_alive():
+            # Both listener loops use short polling timeouts. Wait for the
+            # thread to finish before the next prompt owns stdin; otherwise a
+            # late listener read could still consume the next command.
+            thread.join()
         self._escape_listener_thread = None
         self._on_escape = None
+
+    def _buffer_intercepted_input(self, text: str) -> None:
+        """Save input consumed by the Escape listener for the next prompt."""
+        if not text:
+            return
+        with self._pending_input_lock:
+            self._pending_input += text
+
+    def _take_pending_input_for_prompt(self) -> tuple[Optional[str], str]:
+        """Take a complete intercepted line or return a partial line as default.
+
+        ``PromptSession`` must remain the owner of normal editing, but a user
+        can press keys during the response-to-prompt handoff. Complete lines
+        are returned directly; a partial line is pre-filled into the next
+        prompt so it can be edited or submitted normally.
+        """
+        with self._pending_input_lock:
+            pending = self._pending_input
+            self._pending_input = ""
+
+        if not pending:
+            return None, ""
+
+        for index, char in enumerate(pending):
+            if char not in "\r\n":
+                continue
+            remainder_start = index + 1
+            if char == "\r" and remainder_start < len(pending) and pending[remainder_start] == "\n":
+                remainder_start += 1
+            with self._pending_input_lock:
+                self._pending_input = pending[remainder_start:]
+            return pending[:index], ""
+
+        return None, pending
 
     def _escape_listener_loop(self):
         try:
@@ -557,36 +720,41 @@ class CLI:
 
     def _escape_listener_windows(self):
         import msvcrt
-        while self._escape_listening:
+        while not self._escape_stop_event.is_set() and self._escape_listening:
             if msvcrt.kbhit():
                 ch = msvcrt.getwch()
                 if ch == "\x1b":
                     if self._on_escape:
                         self._on_escape()
                     return
-            time.sleep(0.05)
+                # Extended-key prefixes are not useful as text in the next
+                # prompt. Preserve ordinary characters, including Enter.
+                if ch not in ("\x00", "\xe0"):
+                    self._buffer_intercepted_input(ch)
+            self._escape_stop_event.wait(0.05)
 
     def _escape_listener_unix(self):
         import tty, select, termios
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
-            tty.setraw(fd)
-            while self._escape_listening:
-                rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+            # cbreak keeps Ctrl+C signal handling enabled while still making
+            # individual Escape and character bytes observable.
+            tty.setcbreak(fd)
+            while not self._escape_stop_event.is_set() and self._escape_listening:
+                rlist, _, _ = select.select([fd], [], [], 0.05)
                 if rlist:
                     ch = os.read(fd, 1)
                     if ch == b"\x1b":
                         if self._on_escape:
                             self._on_escape()
                         return
+                    if ch:
+                        self._buffer_intercepted_input(
+                            ch.decode(sys.stdin.encoding or "utf-8", errors="replace")
+                        )
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-            try:
-                import termios as _t
-                _t.tcflush(fd, _t.TCIFLUSH)
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------ #
     #  User input  (the main entry point — handles all paste detection)   #
@@ -598,72 +766,27 @@ class CLI:
             _reset_paste_counters()
             _paste_registry.clear()
 
-            buf = self._prompt_session.default_buffer
+            pending_line, pending_default = self._take_pending_input_for_prompt()
+            if pending_line is not None:
+                # The Escape listener may have captured a complete command
+                # while the previous request was finishing. Return it as the
+                # next prompt submission instead of making the user type it
+                # again.
+                return pending_line.strip()
 
-            # ---- Text paste detection via bracketed paste + on_text_changed ----
-            # Most modern terminals (incl. Windows Terminal) support bracketed
-            # paste, which wraps pasted text in ESC[200~...ESC[201~.  prompt_toolkit
-            # handles the escape sequences automatically and delivers the full
-            # text to on_text_changed in one shot.  We detect a paste by checking
-            # for a single contiguous insertion into the buffer.
-            _handling = [False]       # prevent recursion flag
-            _prev_text = [buf.text]   # last known buffer state
-            _last_clip_seq = [_get_clipboard_sequence_number()]  # baseline before prompt
-
-            def _on_text_changed(b):
-                if _handling[0]:
-                    return
-
-                current = b.text
-                if current == _prev_text[0]:
-                    return
-
-                # Buffer shrank (user deleted) — not a paste
-                if len(current) <= len(_prev_text[0]):
-                    _prev_text[0] = current
-                    return
-
-                # Only treat as paste if the clipboard sequence number changed
-                # (i.e. the user actually pressed Ctrl+V / did a clipboard paste).
-                current_seq = _get_clipboard_sequence_number()
-                if current_seq == _last_clip_seq[0]:
-                    # No clipboard activity — this is regular typing, leave it alone
-                    _prev_text[0] = current
-                    return
-
-                # Clipboard changed since last check — extract the inserted text
-                inserted = _diff_inserted_text(_prev_text[0], current)
-                if not inserted or len(inserted) < 1:
-                    _prev_text[0] = current
-                    _last_clip_seq[0] = current_seq
-                    return
-
-                # We have a paste — replace it with a token
-                _handling[0] = True
-                try:
-                    token = _make_text_token()
-                    _paste_registry[token] = {
-                        "type": "text",
-                        "text": inserted,
-                        "text_stripped": inserted.strip(),
-                    }
-                    b.text = current.replace(inserted, token, 1)
-                    b.cursor_position = b.text.find(token) + len(token)
-                    _prev_text[0] = b.text
-                    _last_clip_seq[0] = _get_clipboard_sequence_number()
-                finally:
-                    _handling[0] = False
-
-            buf.on_text_changed += _on_text_changed
+            # Text and image pastes are handled by explicit key bindings above.
+            # Bracketed-paste events carry their own payload, while Ctrl+V
+            # reads the clipboard only because the user explicitly pressed it.
+            # We intentionally do not infer a paste from arbitrary buffer
+            # changes or from the Windows clipboard sequence number: copying
+            # new content changes that number without performing a paste.
 
             # ---- Run the prompt ----
-            try:
-                result = self._prompt_session.prompt(
-                    HTML(f'<style class="prompt">{prefix}</style>'),
-                    style=PROMPT_STYLE,
-                ).strip()
-            finally:
-                buf.on_text_changed -= _on_text_changed
+            result = self._prompt_session.prompt(
+                HTML(f'<style class="prompt">{prefix}</style>'),
+                style=PROMPT_STYLE,
+                default=pending_default,
+            ).strip()
 
             # Note: paste token resolution happens in main.py, not here.
             # main.py handles both text and image tokens in one pass.

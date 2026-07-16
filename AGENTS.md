@@ -852,3 +852,7 @@ websockets>=14.0
 **IMPORTANT**: When editing React/TSX files (`ui/src/`), always use actual Unicode characters (▶, ⏳, ✓, ▸, …, ▌) in JSX text nodes — **never** use `\uXXXX` escape sequences. JSX text content does NOT process JavaScript Unicode escapes; they render as literal text. For example:
 - ✅ `<span>▶</span>` — renders the arrow character
 - ❌ `<span>\u25b6</span>` — renders the literal text `\u25b6`
+
+## Browser launch defaults
+
+Browser automation always launches in headed mode with human-like interaction behavior. The `browser_launch` arguments remain for protocol compatibility, but requests for headless mode or disabled humanization are ignored.

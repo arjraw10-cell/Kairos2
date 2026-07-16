@@ -27,7 +27,7 @@ class ExecuteCommandTool:
         self,
         terminal_id: int,
         command: str,
-        timeout: Optional[int] = None,
+        timeout: Optional[float] = None,
         is_background: Optional[bool] = None,
     ) -> ToolResult:
         try:
@@ -40,7 +40,7 @@ class ExecuteCommandTool:
 
 
 class ReadLogsTool:
-    """Read logs from a background terminal by line numbers."""
+    """Read output from a background terminal by line numbers."""
 
     def __init__(self, terminal_manager):
         self.terminal_manager = terminal_manager

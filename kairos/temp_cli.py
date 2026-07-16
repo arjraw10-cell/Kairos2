@@ -21,6 +21,7 @@ from rich.text import Text
 
 from kairos.config import Config
 from kairos.agent import Agent
+from kairos.resume import sanitize_history_for_resume
 
 PASTE_TEXT_MASK = "(Pasted text)"
 PASTE_IMAGE_MASK = "(Pasted image)"
@@ -215,6 +216,7 @@ class TempCLI(App):
         self._awaiting_resume = False
         self._resume_sessions: list = []
         self._session_mgr = None  # Initialized on mount
+        self._session_save_lock = threading.Lock()
         # Token registry: maps token string -> content dict
         self._paste_registry: dict = {}
 
@@ -226,6 +228,8 @@ class TempCLI(App):
         agent.on_tool_call = self._cb_tool_call
         agent.on_token_update = self._cb_token_update
         agent.on_compact = self._cb_compact
+        if agent.subagent_tool:
+            agent.subagent_tool._token_update = self._cb_subagent_token_update
 
     # ---- Compose ----
 
@@ -239,7 +243,10 @@ class TempCLI(App):
 
     def on_mount(self):
         from kairos.tools.session import SessionManager
-        self._session_mgr = SessionManager()
+        # Use the same workspace-specific chat store as the standard CLI.
+        # Otherwise /resume can show a different set of chats depending on
+        # which frontend was launched.
+        self._session_mgr = SessionManager(self.agent.cwd)
         self.query_one("#input", Input).focus()
         chat = self.query_one("#chat", RichLog)
         chat.write(Panel(
@@ -362,30 +369,70 @@ class TempCLI(App):
 
     def _handle_resume_selection(self, user_input: str):
         """Handle the user's session selection after /resume."""
-        self._awaiting_resume = False
-
-        if user_input.lower() in ("cancel", "c", "q", "exit"):
+        choice = user_input.strip().casefold()
+        if choice in ("cancel", "c", "q", "exit"):
+            self._awaiting_resume = False
+            self._resume_sessions = []
             self._log_info("Resume cancelled.")
             return
 
         try:
-            idx = int(user_input)
+            idx = int(choice)
             if idx < 1 or idx > len(self._resume_sessions):
-                self._log_error(f"Invalid selection. Enter a number between 1 and {len(self._resume_sessions)}.")
+                self._log_error(
+                    f"Invalid selection. Enter a number between 1 and {len(self._resume_sessions)}."
+                )
                 return
         except ValueError:
             self._log_error("Invalid input. Enter a number or 'cancel'.")
             return
 
-        selected_id = self._resume_sessions[idx - 1]
+        # list_sessions() returns metadata dictionaries; load_session() needs
+        # the actual string ID. Keep selection mode active until the selected
+        # chat has been accepted so a bad entry can never fall through as an
+        # ordinary agent prompt.
+        selected_id = self._resume_sessions[idx - 1]["id"]
         history = self._session_mgr.load_session(selected_id)
-        if history:
-            self._session_mgr.save_chat(self.agent.get_history())
-            self._session_mgr.new_session()
-            self.agent.reset()
-            self.agent.conversation_history = history
-            self._session_mgr.set_current_session(selected_id)
-            self._log_info(f"Loaded chat: {selected_id}")
+        if not history:
+            self._log_error(f"Could not load chat '{selected_id}'.")
+            return
+
+        sanitized, last_msg, mid_exec = sanitize_history_for_resume(history)
+        if sanitized is None:
+            self._log_info(f"Chat '{selected_id}' has no resumable state.")
+            return
+
+        self._awaiting_resume = False
+        self._resume_sessions = []
+        self._session_mgr.save_chat(self.agent.get_history())
+        self._session_mgr.new_session()
+        self.agent.reset()
+        self.agent.conversation_history = sanitized
+        self._session_mgr.set_current_session(selected_id)
+        self._log_info(f"Loaded chat: {selected_id}")
+
+        if last_msg:
+            self._log_info("Restored the last completed agent response.")
+        if mid_exec:
+            self._log_info(
+                "Resuming mid-execution — continuing where the previous run stopped..."
+            )
+            self._processing = True
+            self.query_one("#input", Input).disabled = True
+
+            def _continue():
+                try:
+                    self.agent.run("Continue where you left off. Pick up the next step.")
+                except Exception as e:
+                    self.call_from_thread(self._log_error, f"Resume error: {e}")
+                finally:
+                    # Persist the continuation under the selected session,
+                    # then re-enable input on the Textual/UI thread.
+                    with self._session_save_lock:
+                        self._session_mgr.save_chat(self.agent.get_history())
+                    self.call_from_thread(self._finish_processing)
+
+            threading.Thread(target=_continue, daemon=True).start()
 
     def _finish_processing(self):
         self._processing = False
@@ -408,6 +455,11 @@ class TempCLI(App):
 
     def _cb_token_update(self, token_counter):
         self.call_from_thread(self._handle_token_update, token_counter)
+
+    def _cb_subagent_token_update(self, subagent_id: str, token_counter):
+        self.call_from_thread(
+            self._handle_subagent_token_update, subagent_id, token_counter
+        )
 
     def _cb_compact(self, msg: str):
         self.call_from_thread(self._log_info, msg)
@@ -465,6 +517,12 @@ class TempCLI(App):
     def _handle_token_update(self, token_counter):
         status = token_counter.format_status()
         self.query_one("#status", Static).update(Text(status, style="dim"))
+
+    def _handle_subagent_token_update(self, subagent_id: str, token_counter):
+        status = token_counter.format_status()
+        self.query_one("#chat", RichLog).write(
+            Text(f"Subagent {subagent_id}: {status}", style="dim")
+        )
 
     # ---- Actions ----
 

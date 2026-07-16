@@ -19,6 +19,10 @@ def _ensure_dotenv():
 class Config:
     """Lazy-loaded configuration. .env is loaded on first attribute access."""
 
+    DEFAULT_MAX_TOOL_RESULT_CHARS = 20_000
+    DEFAULT_CONTEXT_WINDOW = 262_000
+    DEFAULT_CONTEXT_RESERVE_TOKENS = 16_384
+
     @staticmethod
     def _get(key: str, default=None):
         _ensure_dotenv()
@@ -47,6 +51,26 @@ class Config:
         _ensure_dotenv()
         model = os.getenv("OPENAI_MODEL", "gpt-4o")
         return model
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def MAX_TOOL_RESULT_CHARS(cls) -> int:
+        _ensure_dotenv()
+        try:
+            value = int(os.getenv("KAIROS_MAX_TOOL_RESULT_CHARS", str(cls.DEFAULT_MAX_TOOL_RESULT_CHARS)))
+        except (TypeError, ValueError):
+            return cls.DEFAULT_MAX_TOOL_RESULT_CHARS
+        return value if value > 0 else cls.DEFAULT_MAX_TOOL_RESULT_CHARS
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def CONTEXT_WINDOW(cls) -> int:
+        _ensure_dotenv()
+        try:
+            value = int(os.getenv("KAIROS_CONTEXT_WINDOW", str(cls.DEFAULT_CONTEXT_WINDOW)))
+        except (TypeError, ValueError):
+            return cls.DEFAULT_CONTEXT_WINDOW
+        return value if value > 0 else cls.DEFAULT_CONTEXT_WINDOW
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -86,6 +110,8 @@ class Config:
         cls.OPENAI_API_KEY.cache_clear()
         cls.OPENAI_BASE_URL.cache_clear()
         cls.OPENAI_MODEL.cache_clear()
+        cls.MAX_TOOL_RESULT_CHARS.cache_clear()
+        cls.CONTEXT_WINDOW.cache_clear()
         cls.KAIROS_DEFAULT_WORKSPACE.cache_clear()
         cls.KAIROS_GATEWAY_PORT.cache_clear()
         cls.KAIROS_GATEWAY_HOST.cache_clear()

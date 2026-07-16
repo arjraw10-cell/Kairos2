@@ -38,6 +38,9 @@ class SubAgentTool:
         self._stream_start: Any = None   # Callable[[], None]
         self._stream_token: Any = None   # Callable[[str], None]
         self._stream_end: Any = None     # Callable[[str, bool], None]
+        # Receives (subagent_id, TokenCounter) after each child turn so
+        # frontends can display usage separately from the parent.
+        self._token_update: Any = None   # Callable[[str, Any], None]
 
     # ------------------------------------------------------------------ #
     #  Public helpers (called from Agent._execute_tool)                     #
@@ -54,9 +57,10 @@ class SubAgentTool:
         sub_id = self._generate_id()
 
         # Build a fresh Agent that has every tool *except* the sub-agent tool.
-        sub_agent = self._create_sub_agent()
-        # Streaming callbacks are already wired by _create_sub_agent()
-        # (tool calls, streaming text, etc. are forwarded to the parent's display)
+        sub_agent = self._create_sub_agent(sub_id)
+        # Streaming and token callbacks are wired by _create_sub_agent()
+        # (tool calls, streaming text, and token status are forwarded to the
+        # parent's display).
 
         if mode == "blocking":
             result = self._run_blocking(sub_agent, prompt)
@@ -100,7 +104,7 @@ class SubAgentTool:
     def _generate_id() -> str:
         return uuid.uuid4().hex[:12]
 
-    def _create_sub_agent(self):
+    def _create_sub_agent(self, subagent_id: str):
         """Create an Agent with the same LLM config but without the sub-agent tool."""
         from kairos.agent import Agent  # local import to avoid circular deps
 
@@ -134,6 +138,10 @@ class SubAgentTool:
             agent.on_stream_token = self._stream_token
         if self._stream_end:
             agent.on_stream_end = self._stream_end
+        if self._token_update:
+            agent.on_token_update = lambda counter: self._token_update(
+                subagent_id, counter
+            )
 
         return agent
 
