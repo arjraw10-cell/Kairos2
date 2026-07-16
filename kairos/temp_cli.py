@@ -332,7 +332,9 @@ class TempCLI(App):
             padding=(0, 1),
         ))
 
-        # Run agent in background thread
+        # Run agent in background thread.  Hard stop closes the active stream
+        # and cancels blocking terminal work; the worker is still allowed to
+        # finish its history cleanup before the next request is admitted.
         self._processing = True
         self.query_one("#input", Input).disabled = True
         _image_url = paste_image_data_url  # capture for closure

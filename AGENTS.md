@@ -141,12 +141,13 @@ Lazy-loads `.env` on first access via `python-dotenv`. Uses `@lru_cache(maxsize=
 **Auto-save**: `_start_auto_save(agent, interval_seconds=60)` runs a daemon thread that saves every 60 seconds.
 
 **`process_request(cli, agent, user_input, image_url?)`**:
-1. Starts an Escape key listener (via `cli.start_escape_listener`)
+1. Starts an Escape key listener (via `cli.start_escape_listener`); Escape invokes the same immediate hard-stop path as Ctrl+C
 2. Runs `agent.run(user_input, image_url)` in a background thread
 3. Main thread polls `t.join(timeout=0.15)` — catches `KeyboardInterrupt` to call `agent.interrupt()`
-4. Stops the Escape listener completely before the next prompt owns stdin, and returns the agent's response or `"[Interrupted]"`
+4. Hard stop closes the active stream and cancels active blocking terminal commands; the worker is joined fully before stdin is handed back, preventing history/callback races
+5. Stops the Escape listener completely before the next prompt owns stdin, and returns the agent's response or `"[Interrupted]"`
 
-The Escape listener shares the terminal with `PromptSession`, so it buffers ordinary characters (including a complete command typed during the response-to-prompt handoff) instead of discarding them. Escape itself still requests a graceful stop. The listener uses short polling waits and no terminal-input flush, preventing a command such as `/exit` from being lost and requiring a second entry.
+The Escape listener shares the terminal with `PromptSession`, so it buffers ordinary characters (including a complete command typed during the response-to-prompt handoff) instead of discarding them. Escape is an immediate hard stop, not a graceful end-of-step request. The listener uses short polling waits and no terminal-input flush, preventing a command such as `/exit` from being lost and requiring a second entry.
 
 **REPL loop** (inside `main()`):
 1. `cli.get_user_input()` → returns prompt text and handles any buffered handoff input
@@ -190,6 +191,8 @@ agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream
 `sanitize_history_for_resume(history)` is the shared repair helper used by both interactive frontends. It returns `(history_or_none, last_agent_content, is_mid_execution)`, recognizes agent-generated user messages, removes trailing screenshot injections from unfinished turns, makes incomplete tool-call chains valid before continuation, and the Textual frontend saves the resumed continuation back into the selected session.
 
 ### `kairos/agent.py` — Agent (Core)
+
+**Immediate stop**: `interrupt()` and `request_stop()` share a hard-stop event. The active OpenAI stream is closed when possible, blocking terminal commands are killed through `TerminalManager.cancel_active_commands()`, and the worker checks the event before/during streaming and between tools. Tool results are checkpointed individually so completed calls survive an interruption. `process_request()` waits for the worker's stable cleanup boundary before reopening the prompt; the next request can then use the shared resume repair for a cut-off stream or incomplete tool chain.
 
 **Background terminal notifications**: `Agent` retains completed background-terminal events in the manager queue. While `Agent.run()` is processing, completions display immediately through `on_background_notification`; while idle they stay quiet and are shown when the next request drains them. They are inserted as a separate user message after the next real user message (or before the next API step if the agent is still working). Notification output is capped by the terminal manager.
 
@@ -289,16 +292,16 @@ Returns `(response_text | None, tool_calls_made: List[Dict])`.
 5. Builds assistant message (with `tool_calls` if present)
 6. Calls `on_stream_end()` — this is where the CLI finalizes the display panel
 7. If no tool calls: calls `tokens.finish_turn()`, returns response
-8. If tool calls: when using tiktoken fallback, counts tool call argument tokens via `add_output_tokens()` (API counts already include these); executes each via `_execute_tool()`, appends tool results to history, truncates history if >10,000,000 messages (effectively disabled), calls `tokens.finish_turn()`
+8. If tool calls: when using tiktoken fallback, counts tool call argument tokens via `add_output_tokens()` (API counts already include these); executes each via `_execute_tool()`, checkpoints each completed tool result immediately, truncates history if >10,000,000 messages (effectively disabled), calls `tokens.finish_turn()`
 
-**Important**: Tool results have `image_url` stripped before appending to history. Screenshot images are re-injected as a user vision message (with `[Screenshot captured]` prefix) so the model can actually see them, since tool messages can't carry images on most providers. Textual tool results are centrally capped before appending; image URLs are preserved separately and counted with a bounded vision estimate. Legacy saved tool results are normalized before the next API request; an old embedded image is replaced with a short omission marker because its original vision message cannot be safely reconstructed. Tool results are NOT counted as output tokens — they become input tokens in the next turn via `start_turn()`.
+**Important**: Tool results have `image_url` stripped before appending to history; each result is checkpointed immediately so an interrupted batch preserves completed calls. Screenshot images are re-injected as a user vision message (with `[Screenshot captured]` prefix) so the model can actually see them, since tool messages can't carry images on most providers. Textual tool results are centrally capped before appending; image URLs are preserved separately and counted with a bounded vision estimate. Legacy saved tool results are normalized before the next API request; an old embedded image is replaced with a short omission marker because its original vision message cannot be safely reconstructed. Tool results are NOT counted as output tokens — they become input tokens in the next turn via `start_turn()`.
 
 #### Run (`run(user_message, image_url?)`)
 
-The main agent loop:
-1. Clears interrupt event
+After a hard stop, the next request is wrapped as a continuation instruction so the model can resume the unfinished work while incorporating the new request. The main agent loop:
+1. Preserves an interrupt arriving during startup rather than clearing it
 2. Loops indefinitely until one of the termination conditions is met:
-   - Checks `_should_stop()` (Escape) between steps
+   - Checks the shared hard-stop event before and during streaming, between tools, and before each API step; both Escape and Ctrl+C use this path
    - Recounts the current in-memory history and checks auto-compaction before **every** API step, including steps inside a tool-call loop. This is necessary because API prompt usage is measured before tool results are appended; the next step must see the newly added history rather than waiting for another user request.
    - Auto-compacts if context > 80%, using a safe user boundary or a complete assistant/tool-call chain so active execution can continue with valid API message ordering.
    - Calls `step()`
@@ -442,6 +445,8 @@ A `MarkdownElement` subclass that yields a `rich.table.Table` with `box.ROUNDED`
 **Counting strategy**: `count_message()` includes assistant tool-call IDs/types/names/arguments and tool message IDs/names, because all of those fields are sent in the next API prompt. API-reported usage replaces estimates for completed turns, so these fields are not double-counted in session totals. Image tokens on vision content blocks are estimated with a bounded vision estimate (85 low-detail / 765 high-detail tokens), never by treating the raw base64 URL as ordinary text.
 
 ### `kairos/terminal_manager.py` — TerminalManager
+
+Blocking commands are registered in `_active_blocking` while running. `cancel_active_commands()` kills their process trees so hard stop does not wait for a normal command timeout; background terminals remain persistent unless explicitly closed. Browser waits/polls also honor the agent's cancellation event through `cancel_active_operation()`.
 
 **Class**: `TerminalManager`
 

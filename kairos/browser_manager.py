@@ -139,6 +139,9 @@ class BrowserManager:
         self._profile_name: Optional[str] = None
         self._headless: bool = False
         self._lock = threading.Lock()
+        # Agent hard-stop sets this event so cancellable waits/polls return
+        # immediately instead of holding the request worker until timeout.
+        self._cancel_event = threading.Event()
         self._worker = _WorkerThread()
         self._active_frame = None
         self._active_frame_type = None  # "playwright" or "cdp"
@@ -217,6 +220,13 @@ class BrowserManager:
     # ------------------------------------------------------------------
     #  Properties
     # ------------------------------------------------------------------
+
+    def cancel_active_operation(self) -> None:
+        """Request cancellation of cancellable waits and polling operations."""
+        self._cancel_event.set()
+
+    def _clear_cancel(self) -> None:
+        self._cancel_event.clear()
 
     @property
     def is_open(self) -> bool:
@@ -661,7 +671,9 @@ class BrowserManager:
     def wait(self, seconds: int = 3) -> str:
         fp = self._capture_fingerprint()
         actual = min(max(seconds, 0), 30)
-        _time.sleep(actual)
+        if self._cancel_event.wait(actual):
+            self._clear_cancel()
+            return "Browser wait cancelled by user."
         return self._post_action(f"Waited {actual} seconds", pre_fingerprint=fp)
 
     # ------------------------------------------------------------------
@@ -704,6 +716,9 @@ class BrowserManager:
                     )
 
                 while elapsed < timeout_s:
+                    if self._cancel_event.is_set():
+                        self._clear_cancel()
+                        return "Browser wait_for cancelled by user."
                     try:
                         found = self._worker.dispatch(_check_text, timeout=5)
                     except Exception:

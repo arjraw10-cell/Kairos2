@@ -18,7 +18,7 @@ A minimal personal coding agent in Python.
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
 - **Streaming Display**: Real-time tokens in a live-updating panel (grey for thinking, green for final response)
 - **Tool Summaries**: One-line display when tools are called (e.g., `read file: /path`)
-- **Dual Interrupt**: Ctrl+C hard-interrupts mid-step; Escape gracefully stops after the current step finishes. Input typed while a response is handing back to the prompt is buffered, so commands such as `/exit` are not silently lost.
+- **Immediate Stop**: Ctrl+C and Escape share one hard-stop path. They close the active stream, cancel running blocking terminal commands and cancellable browser waits, stop before the next tool/API step, and return control to the prompt as soon as cleanup is complete. Interrupted assistant/tool turns remain repairable so the next request can continue them rather than silently losing context. Input typed while a response is handing back to the prompt is buffered, so commands such as `/exit` are not silently lost.
 - **Responsive Terminals**: Blocking commands require a finite positive timeout capped at 20 seconds; background commands return immediately, preserve shell state, stay alive after completion, and notify the CLI/agent asynchronously with capped output
 - **Bounded Tool Results**: Text returned by tools is capped before it enters history or the API (20,000 characters per result by default), preserving both the beginning and end with a truncation marker; image data is kept out of textual tool messages and re-injected as vision context with bounded token estimates; the limit can be configured with `KAIROS_MAX_TOOL_RESULT_CHARS`
 - **OpenAI Compatible**: Works with any OpenAI-compatible API (OpenRouter, local models, etc.)
@@ -96,8 +96,8 @@ Workspace defaults to `C:\Users\arjra`. Edit the `tasks` list in `main()` and ru
 
 | Command | Description |
 |---------|-------------|
-| `Escape` | Stop after current step (finish tool calls, then wait for input) |
-| `Ctrl+C` | Hard-interrupt (abort mid-step) |
+| `Escape` | Immediate hard stop: cut off the stream/tool and return to input |
+| `Ctrl+C` | Immediate hard stop: cut off the stream/tool and return to input |
 | `Ctrl+V` | Explicitly paste text from clipboard when the terminal passes the key through; terminals that emit bracketed-paste events use that event automatically |
 | `Alt+V` | Paste image from clipboard |
 | `/resume` / `/resume 1` | Load a saved chat with the numbered picker, or select chat 1 inline |
@@ -254,7 +254,8 @@ kairos/
 
 ### Streaming
 
-Tokens are streamed in real-time. During the agent's reasoning phase, a grey panel updates live. When a final response is reached, it transitions to a green panel rendered as Markdown with enhanced table styling (rounded boxes, bold headers, alternating rows). Tool call thinking stays as a grey trace.
+Tokens are streamed in real-time. and Escape immediately close the active stream and return to the prompt after the worker has safely checkpointed its current history. A cut-off assistant response or partial tool-call chain remains repairable, so the next request can continue the unfinished turn.
+ During the agent's reasoning phase, a grey panel updates live. When a final response is reached, it transitions to a green panel rendered as Markdown with enhanced table styling (rounded boxes, bold headers, alternating rows). Tool call thinking stays as a grey trace.
 
 API streaming requests retry transient gateway failures twice after the initial attempt. Retries also cover failures raised while iterating the response body, such as `RemoteProtocolError` / incomplete chunked reads. If all attempts fail, Kairos reports a concise `OpenAI API Error` with the exception message and configuration, without printing the Python traceback.
 
@@ -282,7 +283,7 @@ Chat history is saved:
 1. **Streaming First** — Tokens print as they arrive; no waiting for full response
 2. **Absolute Paths** — No workspace containment, just use full paths
 3. **One Tool Per File** — Easy to add new tools
-4. **Interruptible** — Ctrl+C hard-interrupts; Escape gracefully stops between steps
+4. **Interruptible** — Ctrl+C and Escape hard-stop active streams/tools and safely hand control back to the prompt
 5. **Token Aware** — Session, context, and turn token counts displayed; estimates include message metadata, tool calls, schemas, and bounded vision estimates
 6. **Minimal Dependencies** — `openai`, `python-dotenv`, `rich`, `prompt_toolkit`, `tiktoken`, `playwright`
 7. **Loud by Default** — Tools always report what they did. Success includes specifics (e.g. "Wrote 42 lines to `main.py`"). Failure clearly states what went wrong. Nothing happens silently — overwrites, creations, and deletions are always announced.

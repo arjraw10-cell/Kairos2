@@ -52,6 +52,9 @@ class TerminalManager:
         self._lock = threading.Lock()
         self._completed_background_commands: Deque[dict] = deque()
         self._completion_callback = None
+        # Blocking commands are registered while communicate() is waiting so
+        # an external hard interrupt can kill them immediately.
+        self._active_blocking: Dict[int, subprocess.Popen] = {}
 
     def set_completion_callback(self, callback) -> None:
         """Set a callback for asynchronous background-command completions.
@@ -435,8 +438,12 @@ class TerminalManager:
         else:
             process_kwargs["start_new_session"] = True
 
+        process = None
         try:
             process = subprocess.Popen(command, **process_kwargs)
+            with self._lock:
+                # Retain the process by terminal ID for hard cancellation.
+                self._active_blocking[terminal_id] = process
             try:
                 stdout, stderr = process.communicate(timeout=effective_timeout)
             except subprocess.TimeoutExpired as exc:
@@ -467,6 +474,18 @@ class TerminalManager:
             )
         except Exception as e:
             return False, f"Command execution failed: {str(e)}"
+        finally:
+            with self._lock:
+                if self._active_blocking.get(terminal_id) is process:
+                    self._active_blocking.pop(terminal_id, None)
+
+    def cancel_active_commands(self) -> int:
+        """Kill all currently running blocking commands and return a count."""
+        with self._lock:
+            processes = list(self._active_blocking.values())
+        for process in processes:
+            self._terminate_process_tree(process)
+        return len(processes)
 
     def drain_completed_background_commands(self) -> List[dict]:
         """Return and remove background completions in finish order."""

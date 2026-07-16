@@ -59,7 +59,10 @@ def _save_now():
 
 
 def _handle_sigint(sig, frame):
-    """Ctrl+C at the OS level -- save and exit."""
+    """Stop the active request; Ctrl+C while idle still exits."""
+    if _agent is not None and _agent.is_processing:
+        _agent.interrupt()
+        return
     _save_now()
     sys.exit(0)
 
@@ -130,8 +133,12 @@ def process_request(
             try:
                 t.join(timeout=0.15)
             except KeyboardInterrupt:
+                # Signal handlers normally route Ctrl+C here, but prompt-toolkit
+                # can raise KeyboardInterrupt directly. Cancellation is
+                # immediate; the join guarantees the next prompt cannot race
+                # the old worker's history/callback cleanup.
                 agent.interrupt()
-                t.join(timeout=2)
+                t.join()
                 return "[Interrupted]"
 
         if exception_holder[0]:
@@ -175,8 +182,8 @@ def main():
 
     cli.print_banner()
     cli.print_info("Type your request, 'exit' to quit, '/resume' to load a chat")
-    cli.print_info("'/compact' to compact conversation, Ctrl+C to hard-interrupt")
-    cli.print_info("Escape to stop after current step, paste text directly or Alt+V for images")
+    cli.print_info("'/compact' to compact conversation, Ctrl+C or Escape to stop immediately")
+    cli.print_info("Stop cuts off the current stream/tool; type the next request as soon as the prompt returns. Paste text directly or Alt+V for images")
     cli.print_info("Commands: 'clear', 'reset', '/exit', '/quit'")
     cli.print_info("/resume now also resumes mid-execution chats automatically")
     cli.console.print()

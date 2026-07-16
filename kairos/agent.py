@@ -24,6 +24,7 @@ from .tools import (
     BrowserHoverTool, BrowserHoverIndexTool, BrowserDragTool, BrowserDragXYTool, BrowserWaitForTool,
 )
 from .tools.skills import SkillManager
+from .resume import _repair_trailing_tool_chain
 
 
 class APIRequestError(Exception):
@@ -44,10 +45,17 @@ class Agent:
         self.model = Config.OPENAI_MODEL()
         self.max_tool_result_chars = Config.MAX_TOOL_RESULT_CHARS()
         self.terminal_manager = TerminalManager()
+        # A hard interrupt is shared by the UI thread and the worker running
+        # the request.  It stays set until ``run`` reaches its cleanup so a
+        # stop cannot be lost between API steps.
         self._interrupt_event = threading.Event()
-        self._stop_requested = False
+        self._stop_requested = False  # retained for compatibility with callers
         self._processing_lock = threading.Lock()
         self._is_processing = False
+        self._active_stream_lock = threading.Lock()
+        self._active_stream = None
+        self._partial_stream_content = ""
+        self._interrupted_pending = False
         self._background_ui_lock = threading.Lock()
         self._background_ui_notified_ids = set()
 
@@ -179,6 +187,7 @@ class Agent:
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
             "You have 40 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
             "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, it will not automatically be injected, so you will have to look for the AGENTS.md file in that directory. Note that the AGENTS.md does not always exist.\n\n"
+            "When you finish a task, the final message (that has no tool calls) will be showm to user as your message to them.\n\n"
             "## Terminal Tools\n"
             "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call requires a finite positive timeout; values above 20 seconds are capped at 20 seconds. Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately, the persistent shell stays alive, and a completion notification containing capped output is delivered while the agent is active or queued for the next user message when the agent is idle. The full output remains available through read_logs.\n\n"
             f"## Tool Result Limits\nText returned by tools is capped before it is added to conversation history: up to {self.max_tool_result_chars:,} characters per tool result. Oversized results contain a truncation marker and preserve both the beginning and end. Use narrower commands or queries; for complete background-terminal output, use read_logs.\n\n"
@@ -1569,21 +1578,48 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         return self.compact()
 
     def interrupt(self):
+        """Request an immediate hard stop of the current request.
+
+        The event is deliberately not cleared by the checker. Clearing it
+        there allowed a stop observed in one layer to be lost before the run
+        loop noticed it in another layer. The run cleanup clears it only once
+        the worker has stopped, making it safe for the next prompt.
+        """
         self._interrupt_event.set()
+        self._stop_requested = True
+        # Closing an OpenAI stream releases a blocked iterator as well as
+        # stopping further token delivery. The worker still owns history and
+        # is joined by process_request before the next prompt is accepted.
+        with self._active_stream_lock:
+            stream = self._active_stream
+        if stream is not None:
+            try:
+                close = getattr(stream, "close", None)
+                if close:
+                    close()
+            except Exception:
+                pass
+        # A blocking terminal is cancellable independently of the Python
+        # worker, so stop it without waiting for the tool to return.
+        try:
+            self.terminal_manager.cancel_active_commands()
+        except Exception:
+            pass
+        try:
+            self.browser_manager.cancel_active_operation()
+        except Exception:
+            pass
 
     def _check_interrupt(self):
         if self._interrupt_event.is_set():
-            self._interrupt_event.clear()
             raise InterruptedError("Interrupted by user")
 
     def request_stop(self):
-        self._stop_requested = True
+        """Escape uses the same immediate-stop path as Ctrl+C."""
+        self.interrupt()
 
     def _should_stop(self) -> bool:
-        if self._stop_requested:
-            self._stop_requested = False
-            return True
-        return False
+        return self._interrupt_event.is_set()
 
     def _prepare_messages_for_api(self) -> List[Dict[str, Any]]:
         messages = []
@@ -1680,6 +1716,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         for attempt in range(attempts):
             stream = None
             try:
+                self._check_interrupt()
                 stream = self.client.chat.completions.create(
                     model=self.model,
                     messages=self._prepare_messages_for_api(),
@@ -1688,6 +1725,9 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                     stream=True,
                     stream_options={"include_usage": True},
                 )
+                with self._active_stream_lock:
+                    self._active_stream = stream
+                    self._partial_stream_content = ""
 
                 if self.on_stream_start:
                     self.on_stream_start()
@@ -1708,6 +1748,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                         continue
                     if delta.content:
                         content += delta.content
+                        with self._active_stream_lock:
+                            self._partial_stream_content = content
                         if self.on_stream_token:
                             self.on_stream_token(delta.content)
                     if delta.tool_calls:
@@ -1733,8 +1775,19 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                     assembled.append({"id": tc["id"], "name": tc["name"], "arguments": args})
                 return content, assembled, api_usage
             except InterruptedError:
+                # Close the visible panel too: otherwise the CLI would leave
+                # a live partial response on screen after the prompt returns.
+                if self.on_stream_end:
+                    self.on_stream_end("", False)
+                # Never turn a partial assistant stream into a completed
+                # assistant message. Resume repair will continue the latest
+                # user request on the next explicit prompt.
                 raise
             except Exception as e:
+                if self._interrupt_event.is_set():
+                    if self.on_stream_end:
+                        self.on_stream_end("", False)
+                    raise InterruptedError("Interrupted by user")
                 last_exc = e
                 if not self._is_retryable_error(e) or attempt == attempts - 1:
                     break
@@ -1743,7 +1796,20 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 # second response to the same panel.
                 if self.on_stream_end:
                     self.on_stream_end("", False)
-                time.sleep(self._retry_delay(attempt))
+                if self._interrupt_event.wait(self._retry_delay(attempt)):
+                    raise InterruptedError("Interrupted by user")
+            finally:
+                if stream is not None:
+                    try:
+                        close = getattr(stream, "close", None)
+                        if close:
+                            close()
+                    except Exception:
+                        pass
+                with self._active_stream_lock:
+                    if self._active_stream is stream:
+                        self._active_stream = None
+                        self._partial_stream_content = ""
 
         raise APIRequestError(self._format_api_error(last_exc)) from None
 
@@ -1824,7 +1890,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             if self.on_token_update:
                 self.on_token_update(self.tokens)
             return content, []
-        tool_results = []
         tool_image_data_urls = []
         for tc in assembled_tool_calls:
             self._check_interrupt()
@@ -1844,14 +1909,16 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             if image_data_url:
                 tool_image_data_urls.append(image_data_url)
             text_content = json.dumps(result_dict, ensure_ascii=False)
-            tool_msg = {
+            # Checkpoint each result before looking for another interrupt. If
+            # stop arrives while a tool is running, completed tools remain in
+            # history and only the unfinished suffix is repaired on resume.
+            self.conversation_history.append({
                 "tool_call_id": tc["id"],
                 "role": "tool",
                 "name": func_name,
                 "content": text_content,
-            }
-            tool_results.append(tool_msg)
-        self.conversation_history.extend(tool_results)
+            })
+            self._check_interrupt()
         if tool_image_data_urls:
             image_parts = [{"type": "text", "text": "[Screenshot captured \u2014 the image below shows the current browser page]"}]
             for img_url in tool_image_data_urls:
@@ -1867,9 +1934,31 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         self._set_processing(True)
         # A request may start after background commands completed while idle.
         # Mark it processing before draining so those queued notices are shown.
-        self._interrupt_event.clear()
+        # Do not clear a stop here: an interrupt can arrive between thread
+        # creation and this function's first instruction.
+        if self._interrupt_event.is_set():
+            self._set_processing(False)
+            self._stop_requested = False
+            self._interrupt_event.clear()
+            return "[Stopped — waiting for your input]"
         current = user_message
         _first_image = image_url
+        if self._interrupted_pending:
+            # Make the next prompt a continuation boundary. Repair any
+            # incomplete assistant/tool suffix before appending the new user
+            # message; missing tool results then cause the model to reconsider
+            # and re-call the interrupted tool instead of producing an invalid
+            # API message sequence.
+            try:
+                _repair_trailing_tool_chain(self.conversation_history)
+            except Exception:
+                pass
+            current = (
+                "The previous request was interrupted before it finished. "
+                "Continue that work, taking this new instruction into account:\n\n"
+                f"{user_message}"
+            )
+            self._interrupted_pending = False
         max_empty_retries = 2
         empty_retry_count = 0
         try:
@@ -1904,11 +1993,26 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 if response:
                     return response
         except InterruptedError:
+            # Convert an interrupted in-memory suffix into the same valid
+            # repairable shape used by /resume. This is especially important
+            # when a stream was cut off before the assistant message existed.
+            try:
+                _repair_trailing_tool_chain(self.conversation_history)
+            except Exception:
+                pass
+            self._interrupted_pending = True
             return "[Interrupted]"
         finally:
             self._set_processing(False)
+            # This is the stable handoff point: no new prompt may reuse the
+            # agent until this worker has reached here.
+            self._stop_requested = False
+            self._interrupt_event.clear()
 
     def reset(self):
+        self._interrupt_event.clear()
+        self._stop_requested = False
+        self._interrupted_pending = False
         self._setup_system_prompt()
         self.tokens = TokenCounter(self.model)
         if self.browser_manager.is_open:
