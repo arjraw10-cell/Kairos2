@@ -85,6 +85,73 @@ class Config:
         return value
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_GATEWAY_HOST(cls) -> str:
+        _ensure_dotenv()
+        value = os.getenv("KAIROS_GATEWAY_HOST", "127.0.0.1").strip()
+        return value or "127.0.0.1"
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_GATEWAY_PORT(cls) -> int:
+        _ensure_dotenv()
+        raw = os.getenv("KAIROS_GATEWAY_PORT", "8765").strip()
+        try:
+            port = int(raw)
+        except ValueError as exc:
+            raise ValueError("KAIROS_GATEWAY_PORT must be an integer") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError("KAIROS_GATEWAY_PORT must be between 1 and 65535")
+        return port
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_DEFAULT_WORKSPACE(cls) -> str | None:
+        _ensure_dotenv()
+        value = os.getenv("KAIROS_DEFAULT_WORKSPACE", "").strip()
+        return value or None
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_DATA_DIR(cls) -> str:
+        _ensure_dotenv()
+        return os.getenv("KAIROS_DATA_DIR", "")
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_MAX_CONCURRENT_RUNS(cls) -> int:
+        _ensure_dotenv()
+        raw = os.getenv("KAIROS_MAX_CONCURRENT_RUNS", "8")
+        try:
+            return max(1, int(raw))
+        except ValueError as exc:
+            raise ValueError("KAIROS_MAX_CONCURRENT_RUNS must be an integer") from exc
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_RUNTIME_IDLE_SECONDS(cls) -> int:
+        _ensure_dotenv()
+        raw = os.getenv("KAIROS_RUNTIME_IDLE_SECONDS", "1800")
+        try:
+            return max(0, int(raw))
+        except ValueError as exc:
+            raise ValueError("KAIROS_RUNTIME_IDLE_SECONDS must be an integer") from exc
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_AUTH_TOKEN(cls) -> str | None:
+        _ensure_dotenv()
+        value = os.getenv("KAIROS_AUTH_TOKEN", "").strip()
+        return value or None
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_LEGACY_CHAT_FILE(cls) -> str | None:
+        _ensure_dotenv()
+        value = os.getenv("KAIROS_LEGACY_CHAT_FILE", "").strip()
+        return value or None
+
+    @classmethod
     def validate(cls):
         _ensure_dotenv()
         if not cls.OPENAI_API_KEY():
@@ -101,3 +168,11 @@ class Config:
         cls.OPENAI_MODEL.cache_clear()
         cls.MAX_TOOL_RESULT_CHARS.cache_clear()
         cls.CONTEXT_WINDOW.cache_clear()
+        cls.KAIROS_GATEWAY_HOST.cache_clear()
+        cls.KAIROS_GATEWAY_PORT.cache_clear()
+        cls.KAIROS_DEFAULT_WORKSPACE.cache_clear()
+        cls.KAIROS_DATA_DIR.cache_clear()
+        cls.KAIROS_MAX_CONCURRENT_RUNS.cache_clear()
+        cls.KAIROS_RUNTIME_IDLE_SECONDS.cache_clear()
+        cls.KAIROS_AUTH_TOKEN.cache_clear()
+        cls.KAIROS_LEGACY_CHAT_FILE.cache_clear()

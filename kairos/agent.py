@@ -120,6 +120,7 @@ class Agent:
         self.on_stream_start: Optional[Callable[[], None]] = None
         self.on_stream_token: Optional[Callable[[str], None]] = None
         self.on_stream_end: Optional[Callable[[str, bool], None]] = None
+        self.on_tool_result: Optional[Callable[[str, dict, str], None]] = None
         self.on_token_update: Optional[Callable[[TokenCounter], None]] = None
         self.on_compact: Optional[Callable[[str], None]] = None
         self.on_background_notification: Optional[Callable[[str], None]] = None
@@ -1833,6 +1834,12 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 self.on_tool_call(func_name, func_args)
             result_json = self._execute_tool(func_name, func_args)
             result_dict = json.loads(result_json)
+            if self.on_tool_result:
+                try:
+                    self.on_tool_result(func_name, result_dict, result_json)
+                except Exception:
+                    # Client observers must never break tool execution.
+                    pass
             image_data_url = result_dict.pop("image_url", None)
             if image_data_url:
                 tool_image_data_urls.append(image_data_url)

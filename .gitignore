@@ -5,7 +5,13 @@ __pycache__/
 venv/
 *.log
 .DS_Store
+# Gateway runtime data is local state and must not be committed.
+.kairos/
+kairos.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 chats/
 skills/
 kairos.bat
+kairos_nold.bat
 kairoscli.bat

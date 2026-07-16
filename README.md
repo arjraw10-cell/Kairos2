@@ -71,6 +71,8 @@ python temp.py "read and summarize /path/to/file.py"  # headless, no CLI
 
 `kairos_old.bat` is the PATH-safe legacy launcher. It invokes `main.py` from the batch file's own directory while preserving the current directory as the workspace, so running `cd Documents/Agent2Gateway; kairos_old` uses `Agent2Gateway` as workspace context but still executes the current Agent2 source.
 
+`kairos_cli_new.bat` launches the standard Rich/prompt-toolkit CLI (not the Textual frontend). It checks the configured gateway `/healthz` endpoint first and starts `python -m kairos.gateway_main` in a minimized window only when the gateway is unavailable. The caller's current directory remains the CLI workspace; an optional first argument can explicitly select the workspace, matching `python main.py /path/to/project`.
+
 The standard CLI resolves paste placeholders before command dispatch, so pasted aliases such as `/exit` work like typed commands. Its Escape listener also buffers ordinary terminal input captured during the response-to-prompt handoff; this prevents a quickly typed command from being consumed and forcing a second `/exit`.
 
 ### Headless Usage (temp.py)
@@ -298,3 +300,17 @@ The tests cover tool-schema and metadata accounting, bounded vision estimates, p
 ## License
 
 MIT
+
+## Gateway Architecture (feature/gateway-v2)
+
+The gateway layer under `kairos/gateway/` provides durable SQLite-backed conversations, resumable histories, Agent runtime lifecycle management, per-conversation serialization, cross-conversation worker concurrency, REST/WebSocket APIs, authentication, event fan-out, and event replay. The root `gateway_main.py` shim, `python -m kairos.gateway_main`, and `python -m kairos.main_gateway` start the FastAPI gateway. `kairos_cli_new.bat` is the Windows standard-CLI launcher: it probes `/healthz`, starts the gateway only when unavailable, waits for readiness, and preserves the caller's workspace CWD. CLI, Electron, and Telegram clients use the gateway rather than creating Agents or owning browser/terminal resources.
+
+Gateway configuration is exposed through `KAIROS_GATEWAY_HOST`, `KAIROS_GATEWAY_PORT`, `KAIROS_DEFAULT_WORKSPACE`, `KAIROS_DATA_DIR`, `KAIROS_MAX_CONCURRENT_RUNS`, `KAIROS_RUNTIME_IDLE_SECONDS`, `KAIROS_AUTH_TOKEN`, and `KAIROS_LEGACY_CHAT_FILE`. Workspace paths remain context rather than a security boundary. `Config.MAX_TOOL_RESULT_CHARS()` and `Config.CONTEXT_WINDOW()` configure model-facing tool-result limits and conservative context accounting.
+
+`GatewayManager` accepts an injectable `agent_factory` for tests. Runtime operations use state/lifecycle locks, FIFO run queues, stable persistence boundaries, interruption, queued cancellation, manual compaction, continuation repair, idle unloading, and shutdown cleanup. Resource cleanup tolerates minimal Agents without optional token/browser/terminal attributes.
+
+The gateway repository stores workspaces, conversations, messages, runs, and monotonic events in SQLite WAL mode. REST routes cover conversation/runtime/message/run operations; WebSocket commands support loading, sending, interruption, cancellation, compaction, subscriptions, replay, and live streaming. Agent callbacks also expose tool-finished and background-terminal completion events. Replay initializes its cursor before live subscription, serializes replay/live handoff, and deduplicates event IDs. The gateway's manager is compatible with the main branch's background-terminal and tool-result callback additions.
+
+Blocking terminal commands require a finite positive timeout and clamp it to 20 seconds; background terminals remain persistent and report asynchronous completion events with bounded notifications while retaining full logs. Timeout validation is case-insensitive in the regression checks.
+
+Dependency-light gateway validation is available with `python tests/run_gateway_tests.py`; compile checks use `python -m compileall -q kairos gateway_main.py tests`. Full pytest tests require installing `pytest`. Every code change must update this file and `README.md`.
