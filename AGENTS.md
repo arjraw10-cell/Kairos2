@@ -60,6 +60,8 @@ Agent2/
         └── session.py      # SessionManager — isolated ~/.kairos chat stores with legacy fallback loading
 ```
 
+The former root-level `temp.py` helper is intentionally ignored via `.gitignore` and is not part of the repository history.
+
 ---
 
 ## File-by-File Reference

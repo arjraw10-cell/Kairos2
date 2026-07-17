@@ -71,6 +71,8 @@ python main.py                   # cwd as workspace
 python main.py /path/to/project  # specific workspace
 ```
 
+The former root-level `temp.py` helper is intentionally ignored and is not part of the project history.
+
 `kairos_old.bat` is the PATH-safe legacy launcher. It invokes `main.py` from the batch file's own directory while preserving the current directory as the workspace, so running `cd Documents/Agent2Gateway; kairos_old` uses `Agent2Gateway` as workspace context but still executes the current Agent2 source.
 
 `kairos_cli_new.bat` launches the standard Rich/prompt-toolkit CLI (not the Textual frontend). It checks the configured gateway `/healthz` endpoint first and starts `python -m kairos.gateway_main` in a minimized window only when the gateway is unavailable. The caller's current directory remains the CLI workspace; an optional first argument can explicitly select the workspace, matching `python main.py /path/to/project`.
