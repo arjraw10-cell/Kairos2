@@ -10,7 +10,7 @@ A minimal personal coding agent in Python.
 - **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange. Estimates include message metadata, tool-call arguments, and function-tool schemas; uses ground-truth counts from the API when available (`stream_options={"include_usage": True}`), with tiktoken estimates as fallback
 - **Auto-Compaction**: Conversation history is automatically summarized when the configured context budget exceeds 80%; estimates include tool schemas and tool-call metadata, and compaction input is bounded so large results cannot cause a second breach
 - **Sub-Agents**: Spawn autonomous child agents to work on tasks in parallel
-- **Browser Automation**: Full Playwright/CloakBrowser integration with stealth mode, persistent profiles, multi-tab, and CDP support
+- **Browser Automation**: Full Playwright/CloakBrowser integration with stealth mode, persistent profiles, multi-tab, and CDP support. Browser launches are always headed (visible) and humanized; legacy `headless`/`humanize` arguments are accepted but cannot disable this policy.
 - **Skills**: Self-extensible skill system — agent can create/load skills stored as `SKILL.md` files in `skills/` directory
 - **Paste System**: Text pastes use explicit prompt-toolkit paste events: bracketed-paste events carry their own payload, and Ctrl+V reads the clipboard only when that key is pressed. Alt+V pastes images from the clipboard. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. Clipboard changes from copying are never mistaken for paste actions.
 - **Chat Persistence**: Standard and Textual CLI sessions are saved by workspace to `~/.kairos/chats/<directory>--<stable-path-id>/chats.json`. The readable directory name plus deterministic absolute-path ID prevents collisions between workspaces with the same basename, while the JSON envelope records the absolute `workspace` path. Existing `<workspace>/chats/chats.json` files remain loadable for resume and are never deleted; their sessions are copied into the new store on the next save. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions. **Atomic writes** via temp-file + rename prevent corruption from interrupted saves. **Corruption recovery** auto-heals damaged files by parsing up to the last valid JSON boundary.
@@ -35,11 +35,14 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-For browser automation, also install Playwright browsers:
+For browser automation, also install Playwright and CloakBrowser's headed/humanized Chromium integration:
 
 ```bash
+pip install cloakbrowser
 playwright install chromium
 ```
+
+Kairos enforces headed, humanized browser launches and requires `cloakbrowser` for them; browser launch fails with an installation message if CloakBrowser is unavailable.
 
 ## Configuration
 
@@ -66,7 +69,6 @@ Any OpenAI-compatible endpoint works — just change `OPENAI_BASE_URL`. `KAIROS_
 ```bash
 python main.py                   # cwd as workspace
 python main.py /path/to/project  # specific workspace
-python temp.py "read and summarize /path/to/file.py"  # headless, no CLI
 ```
 
 `kairos_old.bat` is the PATH-safe legacy launcher. It invokes `main.py` from the batch file's own directory while preserving the current directory as the workspace, so running `cd Documents/Agent2Gateway; kairos_old` uses `Agent2Gateway` as workspace context but still executes the current Agent2 source.
@@ -74,23 +76,6 @@ python temp.py "read and summarize /path/to/file.py"  # headless, no CLI
 `kairos_cli_new.bat` launches the standard Rich/prompt-toolkit CLI (not the Textual frontend). It checks the configured gateway `/healthz` endpoint first and starts `python -m kairos.gateway_main` in a minimized window only when the gateway is unavailable. The caller's current directory remains the CLI workspace; an optional first argument can explicitly select the workspace, matching `python main.py /path/to/project`.
 
 The standard CLI resolves paste placeholders before command dispatch, so pasted aliases such as `/exit` work like typed commands. Its Escape listener also buffers ordinary terminal input captured during the response-to-prompt handoff; this prevents a quickly typed command from being consumed and forcing a second `/exit`.
-
-### Headless Usage (temp.py)
-
-For scripting or running agent tasks without the interactive REPL:
-
-```python
-from temp import run_agent, run_agents
-
-# Single agent
-response = run_agent("list all Python files in C:/Users/arjra/myproject")
-
-# Multiple agents running concurrently
-prompts = ["task 1", "task 2", "task 3"]
-responses = run_agents(prompts, max_workers=5)  # all run at once, returns in order
-```
-
-Workspace defaults to `C:\Users\arjra`. Edit the `tasks` list in `main()` and run `python temp.py` to execute the template loop, or pass a single prompt from CLI: `python temp.py "your prompt"`.
 
 ### REPL Commands
 
@@ -109,7 +94,7 @@ Workspace defaults to `C:\Users\arjra`. Edit the `tasks` list in `main()` and ru
 
 ### Resume behavior
 
-`kairos/resume.py` is shared by the standard and Textual frontends. It anchors the decision at the latest real user request, ignores/removes internally generated screenshot/compaction/background-notification messages, repairs partial or orphaned tool chains, automatically continues an interrupted turn, and saves the Textual continuation back to the selected session. Both frontends use the workspace-isolated `~/.kairos/chats/<directory>--<stable-path-id>/chats.json` store and also read legacy `<workspace>/chats/chats.json` sessions; the standard picker accepts `/resume` followed by a number or `/resume 1`, while the Textual picker keeps waiting on invalid selections and passes the selected metadata's string ID to the loader. The headless `temp.py` runner intentionally has no interactive `/resume` command.
+`kairos/resume.py` is shared by the standard and Textual frontends. It anchors the decision at the latest real user request, ignores/removes internally generated screenshot/compaction/background-notification messages, repairs partial or orphaned tool chains, automatically continues an interrupted turn, and saves the Textual continuation back to the selected session. Both frontends use the workspace-isolated `~/.kairos/chats/<directory>--<stable-path-id>/chats.json` store and also read legacy `<workspace>/chats/chats.json` sessions; the standard picker accepts `/resume` followed by a number or `/resume 1`, while the Textual picker keeps waiting on invalid selections and passes the selected metadata's string ID to the loader.
 
 The standard CLI synchronizes input handoff with its Escape listener: complete lines captured while an agent is finishing are consumed by the next prompt and by the session picker, and partial lines are prefilled for editing instead of dropped.
 
@@ -167,7 +152,7 @@ Skills are stored in `skills/<skill-name>/SKILL.md`. Only skill names are inject
 
 | Tool | Description |
 |------|-------------|
-| `browser_launch(profile?, proxy?, humanize?, chrome_profile?, connect_cdp?)` | Launch a browser (Playwright or CloakBrowser stealth) |
+| `browser_launch(profile?, proxy?, chrome_profile?, connect_cdp?)` | Launch an always-headed, humanized browser (Playwright or CloakBrowser stealth); legacy `headless`/`humanize` values are ignored |
 | `browser_navigate(url)` | Navigate to a URL. Always auto-screenshots + auto-snapshots (navigation = significant change). |
 | `browser_go_back()` | Navigate back in browser history. Auto-snapshots if page changed significantly. |
 | `browser_go_forward()` | Navigate forward in browser history. Auto-snapshots if page changed significantly. |
@@ -221,7 +206,6 @@ Browser features:
 
 ```
 main.py                     # Entry point
-temp.py                     # Headless agent runner — run_agent(prompt) with no CLI
 run_temp_cli.py              # Textual frontend launcher
 kairos/
 ├── main.py                 # CLI REPL loop, signal handlers, auto-save

@@ -11,7 +11,6 @@ Kairos is a minimal coding agent written in Python. It uses the OpenAI chat comp
 ```
 Agent2/
 ├── main.py                 # Root entry point (imports from kairos.main)
-├── temp.py                 # Headless agent runner — run_agent(prompt) with no CLI
 ├── run_temp_cli.py         # Textual frontend launcher
 ├── .env                    # Environment configuration (API keys)
 ├── .env.example            # Template for .env file
@@ -81,27 +80,6 @@ if __name__ == "__main__":
 ### `kairos/__init__.py`
 
 Exports: `Config`, `Agent`, `ToolResult`, `SessionManager`, `SkillManager`, `TerminalManager`, `BrowserManager`.
-
-### `temp.py` — Headless Agent Runner
-
-Run one or many agents without the CLI. Supports single runs and concurrent execution via `ThreadPoolExecutor`:
-
-```python
-from temp import run_agent, run_agents
-
-# Single agent
-response = run_agent("read and summarize /path/to/file.py")
-
-# Multiple agents running concurrently
-prompts = ["task 1", "task 2", "task 3"]
-responses = run_agents(prompts, max_workers=5)  # returns list in same order
-```
-
-**Functions**:
-- `run_agent(prompt, workspace=r"C:\Users\arjra") -> str` — single agent, blocks until done
-- `run_agents(prompts, max_workers=5) -> list[str]` — runs all prompts in parallel threads, returns responses in input order
-
-Each agent gets its own `Agent` instance (separate conversation history, terminal, browser). Can also be run directly: `python temp.py "your prompt"` or `python temp.py` to run the built-in template loop.
 
 ### `kairos/config.py` — Config
 
@@ -507,7 +485,7 @@ Low-level Chrome DevTools Protocol access via Playwright's CDP session API.
 
 **Class**: `BrowserManager`
 
-Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its entire lifetime (avoids greenlet errors).
+Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its entire lifetime (avoids greenlet errors). Browser launches are always headed and humanized: `launch()` forces `headless=False` and `humanize=True` even when compatibility callers pass different values. Ephemeral, named-profile, and copied Chrome-profile launches apply CloakBrowser's human interaction patch when CloakBrowser is available; CDP connections patch the discovered context as well. The tool-level `headless` and `humanize` inputs remain accepted only for backward compatibility and cannot disable this policy. CloakBrowser is required for browser automation because the always-humanized policy cannot be guaranteed by plain Playwright; launch fails with an installation message if CloakBrowser is unavailable.
 
 **Worker Thread** (`_WorkerThread`):
 - `start()` — spawns thread, initializes Playwright, signals `_started` event when ready
@@ -714,7 +692,7 @@ Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill n
 
 | Class | Method Called |
 |-------|-------------|
-| `BrowserLaunchTool` | `bm.launch(profile, headless, proxy, humanize, chrome_profile, connect_cdp)` |
+| `BrowserLaunchTool` | `bm.launch(profile, headless, proxy, humanize, chrome_profile, connect_cdp)` — policy forces headed + humanized mode |
 | `BrowserNavigateTool` | `bm.navigate(url)` |
 | `BrowserGoBackTool` | `bm.go_back()` |
 | `BrowserGoForwardTool` | `bm.go_forward()` |
@@ -745,7 +723,7 @@ Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill n
 | `BrowserDragXYTool` | `bm.drag_xy(x1, y1, x2, y2)` — coordinate-based drag |
 | `BrowserSwitchFrameTool` | `bm.switch_frame(frame_selector)` — switch into/out of iframes |
 
-Each returns `ToolResult`. `BrowserLaunchTool` catches `ImportError` specifically to give installation instructions. The `headless` parameter is exposed in the tool schema (default: `False`). `humanize` defaults to `True`. Skills directory (`skills/`) is gitignored — skills stay local and are never pushed to GitHub.
+Each returns `ToolResult`. `BrowserLaunchTool` catches `ImportError` specifically to give installation instructions. Browser launches are always headed and humanized; legacy `headless` and `humanize` values are ignored. Skills directory (`skills/`) is gitignored — skills stay local and are never pushed to GitHub.
 
 ### `kairos/tools/session.py` — SessionManager
 
