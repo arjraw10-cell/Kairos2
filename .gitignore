@@ -8,4 +8,5 @@ venv/
 chats/
 skills/
 kairos.bat
-kairoscli.battemp.py 
+kairoscli.bat 
+temp.py

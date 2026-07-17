@@ -89,7 +89,6 @@ The standard CLI resolves paste placeholders before command dispatch, so pasted 
 
 ### Resume behavior
 
-`kairos/resume.py` is shared by the standard and Textual frontends. It anchors the decision at the latest real user request, ignores/removes internally generated screenshot/compaction/background-notification messages, repairs partial or orphaned tool chains, automatically continues an interrupted turn, and saves the Textual continuation back to the selected session. Both frontends use `<workspace>/chats/chats.json`; the standard picker accepts `/resume` followed by a number or `/resume 1`, while the Textual picker keeps waiting on invalid selections and passes the selected metadata's string ID to the loader. The headless `temp.py` runner intentionally has no interactive `/resume` command.
 
 The standard CLI synchronizes input handoff with its Escape listener: complete lines captured while an agent is finishing are consumed by the next prompt and by the session picker, and partial lines are prefilled for editing instead of dropped.
 
@@ -201,7 +200,6 @@ Browser features:
 
 ```
 main.py                     # Entry point
-temp.py                     # Headless agent runner — run_agent(prompt) with no CLI
 run_temp_cli.py              # Textual frontend launcher
 kairos/
 ├── main.py                 # CLI REPL loop, signal handlers, auto-save
