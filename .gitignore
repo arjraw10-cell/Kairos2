@@ -14,3 +14,4 @@ kairoscli.bat
 ui/node_modules/
 ui/dist/
 ui/dist-electron/
+temp.py
