@@ -1,4 +1,4 @@
-# Kairos
+﻿# Kairos
 
 A minimal personal coding agent in Python.
 
@@ -66,29 +66,11 @@ Any OpenAI-compatible endpoint works — just change `OPENAI_BASE_URL`. `KAIROS_
 ```bash
 python main.py                   # cwd as workspace
 python main.py /path/to/project  # specific workspace
-python temp.py "read and summarize /path/to/file.py"  # headless, no CLI
 ```
 
 `kairos_old.bat` is the PATH-safe legacy launcher. It invokes `main.py` from the batch file's own directory while preserving the current directory as the workspace, so running `cd Documents/Agent2Gateway; kairos_old` uses `Agent2Gateway` as workspace context but still executes the current Agent2 source.
 
 The standard CLI resolves paste placeholders before command dispatch, so pasted aliases such as `/exit` work like typed commands. Its Escape listener also buffers ordinary terminal input captured during the response-to-prompt handoff; this prevents a quickly typed command from being consumed and forcing a second `/exit`.
-
-### Headless Usage (temp.py)
-
-For scripting or running agent tasks without the interactive REPL:
-
-```python
-from temp import run_agent, run_agents
-
-# Single agent
-response = run_agent("list all Python files in C:/Users/arjra/myproject")
-
-# Multiple agents running concurrently
-prompts = ["task 1", "task 2", "task 3"]
-responses = run_agents(prompts, max_workers=5)  # all run at once, returns in order
-```
-
-Workspace defaults to `C:\Users\arjra`. Edit the `tasks` list in `main()` and run `python temp.py` to execute the template loop, or pass a single prompt from CLI: `python temp.py "your prompt"`.
 
 ### REPL Commands
 
