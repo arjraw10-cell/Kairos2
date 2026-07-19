@@ -104,7 +104,7 @@ The standard CLI synchronizes input handoff with its Escape listener: complete l
 
 | Tool | Description |
 |------|-------------|
-| `read(path)` | Read file contents — supports images (png, jpg, gif, webp, bmp, tiff, svg) returned as vision data |
+| `read(path)` | Read UTF-8 text or supported images (png, jpg, jpeg, gif, webp, bmp, tiff, tif, svg); images are returned as vision data for visual analysis |
 | `write(path, content)` | Write or create a file (parent directories created automatically) |
 | `edit(path, oldText, newText)` | Strict find-and-replace — must match exactly once |
 

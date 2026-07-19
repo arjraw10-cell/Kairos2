@@ -261,7 +261,11 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "read",
-                    "description": "Read the contents of a file at the given absolute path.",
+                    "description": (
+                        "Read a file at the given absolute path. Supports UTF-8 text files and "
+                        "images (.png, .jpg, .jpeg, .gif, .webp, .bmp, .tiff, .tif, .svg). "
+                        "Images are returned as vision data for visual analysis."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {

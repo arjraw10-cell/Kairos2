@@ -572,6 +572,8 @@ class ReadTool:
     def __call__(self, path: str) -> ToolResult:
 ```
 
+The `read` function schema explicitly tells the model that it supports UTF-8 text files and images, and that supported images are returned as vision data for visual analysis.
+
 - **Text files**: UTF-8 decoded with `errors="replace"`, max 100KB
 - **Image files** (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.tif`, `.svg`): base64 data URL returned as `image_url` on ToolResult, max 20MB
 - Returns `ToolResult(False, "", "File not found: ...")` or `"Not a file: ..."` on errors
