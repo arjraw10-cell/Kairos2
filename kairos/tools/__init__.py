@@ -46,6 +46,12 @@ from .browser import (
     BrowserWaitForTool,
 )
 from .skills import SkillManager
+from .desktop import (
+    DesktopDoctorTool, DesktopListWindowsTool, DesktopWindowStateTool,
+    DesktopScreenshotTool, DesktopLaunchAppTool, DesktopClickTool,
+    DesktopTypeTool, DesktopPressKeyTool, DesktopHotkeyTool, DesktopScrollTool,
+    DesktopMoveTool, DesktopDragTool, DesktopWindowActionTool,
+)
 
 __all__ = [
     "ToolResult",
@@ -92,4 +98,8 @@ __all__ = [
     "BrowserDragXYTool",
     "BrowserWaitForTool",
     "SkillManager",
+    "DesktopDoctorTool", "DesktopListWindowsTool", "DesktopWindowStateTool",
+    "DesktopScreenshotTool", "DesktopLaunchAppTool", "DesktopClickTool",
+    "DesktopTypeTool", "DesktopPressKeyTool", "DesktopHotkeyTool", "DesktopScrollTool",
+    "DesktopMoveTool", "DesktopDragTool", "DesktopWindowActionTool",
 ]

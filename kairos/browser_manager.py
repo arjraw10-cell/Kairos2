@@ -5,8 +5,9 @@ Runs ALL Playwright operations in a dedicated worker thread with NO asyncio
 event loop, avoiding conflicts with the main thread's asyncio (from
 rich/prompt_toolkit).
 
-Uses CloakBrowser's stealth Chromium binary and fingerprint patches by default.
-Falls back to standard Playwright Chromium if CloakBrowser is not installed.
+Uses CloakBrowser's stealth Chromium binary, fingerprint patches, and human-like
+interaction layer for every browser session. Plain Playwright is rejected because
+it cannot guarantee the required humanized behavior.
 
 Supports:
   - CloakBrowser stealth Chromium (source-level fingerprint patches)
@@ -16,7 +17,8 @@ Supports:
   - Multi-tab management
   - Screenshot capture (returns file path)
   - Compact page snapshots (accessibility tree / DOM summary)
-  - CDP connection to running Chrome
+  - Headed, humanized browser sessions only (CDP attachment is rejected because
+    an already-running browser's headed state cannot be guaranteed)
   - Chrome profile copying
   - CDP-based DOM extraction (cross-origin iframes, a11y tree, layout data)
   - Auto new-tab detection after clicks
@@ -329,6 +331,36 @@ class BrowserManager:
     #  Launch
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _require_humanized_policy() -> None:
+        "Require CloakBrowser's human interaction layer for every session."
+        if not _CLOAKBROWSER_AVAILABLE or not _cloakbinary_path:
+            raise ImportError(
+                "CloakBrowser is required for Kairos browser automation. "
+                "Install it with: pip install cloakbrowser"
+            )
+        try:
+            from cloakbrowser.human import patch_context  # noqa: F401
+            from cloakbrowser.human.config import resolve_config  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "This CloakBrowser installation lacks its humanization layer. "
+                "Reinstall it with: pip install --upgrade cloakbrowser"
+            ) from exc
+
+    @classmethod
+    def _apply_humanization(cls, target) -> None:
+        "Patch a browser or context so supported interactions use human-like behavior."
+        cls._require_humanized_policy()
+        from cloakbrowser.human import patch_browser, patch_context
+        from cloakbrowser.human.config import resolve_config
+
+        config = resolve_config("default", None)
+        if hasattr(target, "contexts") and hasattr(target, "new_context"):
+            patch_browser(target, config)
+        else:
+            patch_context(target, config)
+
     def launch(
         self,
         profile=None,
@@ -344,9 +376,17 @@ class BrowserManager:
         with self._lock:
             if self._browser or self._context:
                 return "Browser is already running. Close it first with browser_close."
-        self._headless = headless
+        # These policy arguments remain in the API for compatibility, but cannot
+        # disable headed, humanized browser automation.
+        headless = False
+        humanize = True
+        self._require_humanized_policy()
+        self._headless = False
         if connect_cdp:
-            return self._launch_cdp(connect_cdp)
+            raise RuntimeError(
+                "CDP attachment is disabled: Kairos requires a browser it can "
+                "launch as headed and humanized."
+            )
         if chrome_profile:
             return self._launch_chrome_profile(
                 chrome_profile,
@@ -374,6 +414,10 @@ class BrowserManager:
         )
 
     def _do_launch(self, profile, headless, proxy, humanize, vw, vh, launch_args):
+        # Keep the invariant here too, so internal callers cannot bypass the
+        # public launch policy.
+        headless = False
+        humanize = True
         pw = self._worker._pw
         executable_path = None
         ignore_default_args = []
@@ -396,11 +440,12 @@ class BrowserManager:
             profile_dir = str(self.DEFAULT_PROFILES_DIR / profile)
             self._context = pw.chromium.launch_persistent_context(
                 profile_dir,
-                headless=headless,
+                headless=False,
                 viewport={"width": vw, "height": vh},
                 args=chrome_args,
                 **launch_kwargs,
             )
+            self._apply_humanization(self._context)
             self._browser = None
             self._pages = list(self._context.pages)
             if not self._pages:
@@ -412,41 +457,37 @@ class BrowserManager:
             )
         else:
             self._browser = pw.chromium.launch(
-                headless=headless, args=chrome_args, **launch_kwargs
+                headless=False, args=chrome_args, **launch_kwargs
             )
             ctx_kwargs = {"viewport": {"width": vw, "height": vh}}
             if proxy:
                 ctx_kwargs["proxy"] = {"server": proxy}
             self._context = self._browser.new_context(**ctx_kwargs)
+            self._apply_humanization(self._context)
             self._pages = []
             page = self._context.new_page()
             self._pages.append(page)
             self._current_idx = 0
             engine = "CloakBrowser" if _CLOAKBROWSER_AVAILABLE else "Playwright"
-            return f"Launched ephemeral {engine} browser (headed)"
+            return f"Launched headed, humanized ephemeral {engine} browser"
 
     def _launch_cdp(self, cdp_url: str) -> str:
-        self._worker.start()
-        self._profile_name = f"cdp:{cdp_url}"
-        return self._worker.dispatch(lambda: self._do_cdp_connect(cdp_url), timeout=30)
+        raise RuntimeError(
+            "CDP attachment is disabled: Kairos requires a browser it can "
+            "launch as headed and humanized."
+        )
 
     def _do_cdp_connect(self, cdp_url: str):
-        pw = self._worker._pw
-        try:
-            self._browser = pw.chromium.connect_over_cdp(cdp_url)
-        except Exception as e:
-            return (
-                f"Failed to connect to Chrome at {cdp_url}: {e}\n\n"
-                "Launch Chrome yourself with:  chrome.exe --remote-debugging-port=9222"
-            )
-        self._context = self._browser.contexts[0] if self._browser.contexts else None
-        self._pages = list(self._context.pages) if self._context else []
-        self._current_idx = 0
-        return f"Connected via CDP at {cdp_url}\nFound {len(self._pages)} tab(s). Active: {self._pages[0].url if self._pages else 'none'}"
+        raise RuntimeError(
+            "CDP attachment is disabled: Kairos requires a browser it can "
+            "launch as headed and humanized."
+        )
 
     def _launch_chrome_profile(
         self, chrome_profile, headless, proxy, humanize, vw, vh, extra_args
     ) -> str:
+        headless = False
+        humanize = True
         from shutil import copytree, rmtree
 
         src = Path(chrome_profile).expanduser().resolve()
@@ -473,6 +514,7 @@ class BrowserManager:
         return f"Copied Chrome profile '{src.name}' to {copy_dir}\n{result}"
 
     def _do_persistent_launch(self, profile_dir, headless, launch_args, proxy, vw, vh):
+        headless = False
         pw = self._worker._pw
         executable_path = None
         ignore_default_args = []
@@ -485,7 +527,7 @@ class BrowserManager:
             if _cloak_ignore_args:
                 ignore_default_args = list(_cloak_ignore_args)
         ctx_kwargs = {
-            "headless": headless,
+            "headless": False,
             "viewport": {"width": vw, "height": vh},
             "args": chrome_args,
         }
@@ -496,13 +538,14 @@ class BrowserManager:
         if proxy:
             ctx_kwargs["proxy"] = {"server": proxy}
         self._context = pw.chromium.launch_persistent_context(profile_dir, **ctx_kwargs)
+        self._apply_humanization(self._context)
         self._browser = None
         self._pages = list(self._context.pages)
         if not self._pages:
             self._pages.append(self._context.new_page())
         self._current_idx = 0
         engine = "CloakBrowser" if _CLOAKBROWSER_AVAILABLE else "Playwright"
-        return f"Launched {engine} browser with your Chrome data."
+        return f"Launched headed, humanized {engine} browser with your Chrome data."
 
     # ------------------------------------------------------------------
     #  Close

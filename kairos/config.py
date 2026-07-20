@@ -152,6 +152,14 @@ class Config:
         return value or None
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def KAIROS_CUA_DRIVER_PATH(cls) -> str | None:
+        """Optional path to the Cua Driver executable used by desktop tools."""
+        _ensure_dotenv()
+        value = os.getenv("KAIROS_CUA_DRIVER_PATH", "").strip()
+        return value or None
+
+    @classmethod
     def validate(cls):
         _ensure_dotenv()
         if not cls.OPENAI_API_KEY():
@@ -176,3 +184,4 @@ class Config:
         cls.KAIROS_RUNTIME_IDLE_SECONDS.cache_clear()
         cls.KAIROS_AUTH_TOKEN.cache_clear()
         cls.KAIROS_LEGACY_CHAT_FILE.cache_clear()
+        cls.KAIROS_CUA_DRIVER_PATH.cache_clear()

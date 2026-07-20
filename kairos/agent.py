@@ -9,6 +9,7 @@ from openai import APIStatusError, APIConnectionError, RateLimitError, Authentic
 from .config import Config
 from .terminal_manager import TerminalManager
 from .browser_manager import BrowserManager
+from .desktop_manager import DesktopManager
 from .tokens import TokenCounter
 from .tools import (
     ReadTool, WriteTool, EditTool,
@@ -22,6 +23,9 @@ from .tools import (
     BrowserGoBackTool, BrowserGoForwardTool, BrowserReloadTool, BrowserCloseTool,
     BrowserClickXYTool, BrowserSwitchFrameTool,
     BrowserHoverTool, BrowserHoverIndexTool, BrowserDragTool, BrowserDragXYTool, BrowserWaitForTool,
+    DesktopDoctorTool, DesktopListWindowsTool, DesktopWindowStateTool, DesktopScreenshotTool,
+    DesktopLaunchAppTool, DesktopClickTool, DesktopTypeTool, DesktopPressKeyTool,
+    DesktopHotkeyTool, DesktopScrollTool, DesktopMoveTool, DesktopDragTool, DesktopWindowActionTool,
 )
 from .tools.skills import SkillManager
 from .resume import _repair_trailing_tool_chain
@@ -120,6 +124,27 @@ class Agent:
         self.browser_drag_xy_tool = BrowserDragXYTool(self.browser_manager)
         self.browser_wait_for_tool = BrowserWaitForTool(self.browser_manager)
 
+        # Native desktop tools backed by Cua Driver. Desktop access is also
+        # intentionally available to sub-agents; each Agent owns its own Cua
+        # session while the driver daemon preserves platform state.
+        self.desktop_manager = DesktopManager()
+        self.desktop_doctor_tool = DesktopDoctorTool(self.desktop_manager)
+        self.desktop_list_windows_tool = DesktopListWindowsTool(self.desktop_manager)
+        self.desktop_window_state_tool = DesktopWindowStateTool(self.desktop_manager)
+        self.desktop_screenshot_tool = DesktopScreenshotTool(self.desktop_manager)
+        self.desktop_launch_app_tool = DesktopLaunchAppTool(self.desktop_manager)
+        self.desktop_click_tool = DesktopClickTool(self.desktop_manager)
+        self.desktop_type_tool = DesktopTypeTool(self.desktop_manager)
+        self.desktop_press_key_tool = DesktopPressKeyTool(self.desktop_manager)
+        self.desktop_hotkey_tool = DesktopHotkeyTool(self.desktop_manager)
+        self.desktop_scroll_tool = DesktopScrollTool(self.desktop_manager)
+        self.desktop_move_tool = DesktopMoveTool(self.desktop_manager)
+        self.desktop_drag_tool = DesktopDragTool(self.desktop_manager)
+        self.desktop_window_actions = {
+            action: DesktopWindowActionTool(self.desktop_manager, action)
+            for action in ("activate_window", "minimize_window", "maximize_window", "close_window")
+        }
+
         # Skills
         self.skill_manager = SkillManager(str(self.cwd / "skills"))
 
@@ -215,6 +240,8 @@ class Agent:
             "All interaction tools automatically detect significant page changes (popups, navigation, big DOM shifts) and snapshot+screen when needed.\n"
             "You can still use browser_snapshot and browser_screenshot explicitly when you want to observe the page.\n"
             "Use named profiles (e.g. profile=\"Kairos\") to keep logins and cookies across sessions.\n\n"
+            "## Native Desktop Tools\n"
+            "Native desktop tools use Cua Driver. Start with `desktop_doctor`, then `desktop_list_windows`, and use `desktop_window_state(pid, window_id)` before every interaction. Prefer `element_index` values from the latest accessibility snapshot for click/type/key/scroll actions. Use x/y coordinates only as a fallback when the accessibility tree is missing, degraded, stale, or the action did not land; never infer coordinates from the tree without checking the matching screenshot. Re-snapshot after every state-changing action to verify the result. Desktop state is session-scoped and available to sub-agents.\n\n"
             f"## Workspace\nYour current workspace is: {self.cwd}"
         )
 
@@ -459,14 +486,14 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "browser_launch",
-                    "description": "Launch a stealth browser.",
+                    "description": "Launch an always-headed, always-humanized stealth browser. Legacy headless and humanize arguments are ignored; CDP attachment is not supported because Kairos must enforce this policy.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "profile": {"type": "string", "description": "Named persistent profile (e.g. 'Arjun', 'work')."},
                             "proxy": {"type": "string", "description": "Proxy server URL"},
-                            "humanize": {"type": "boolean", "description": "Enable human-like mouse/keyboard behavior"},
-                            "headless": {"type": "boolean", "description": "Run in headless mode with no visible window (default: false)"},
+                            "humanize": {"type": "boolean", "description": "Legacy compatibility flag; always enabled"},
+                            "headless": {"type": "boolean", "description": "Legacy compatibility flag; always disabled (browser is always headed)"},
                             "chrome_profile": {"type": "string", "description": "Path to Chrome user data directory to copy"},
                             "connect_cdp": {"type": "string", "description": "Connect to running Chrome via CDP"},
                         },
@@ -864,6 +891,117 @@ class Agent:
                 },
             },
             # ---- Skill Tools ----
+            # Native desktop tools (Cua Driver). Accessibility element indices
+            # are the primary addressing mode; x/y coordinates are an explicit
+            # fallback for surfaces without a usable accessibility tree.
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_doctor",
+                    "description": "Check Cua Driver installation, daemon, desktop session, and platform permissions.",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_list_windows",
+                    "description": "List native desktop windows, optionally filtered by process ID.",
+                    "parameters": {"type": "object", "properties": {"pid": {"type": "integer"}}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_window_state",
+                    "description": "Get a native window accessibility tree and grounding screenshot. Use before desktop actions and again to verify them.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"pid": {"type": "integer"}, "window_id": {"type": "integer"}, "include_screenshot": {"type": "boolean"}},
+                        "required": ["pid", "window_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_screenshot",
+                    "description": "Capture a native desktop window screenshot for visual grounding. The current driver returns this through get_window_state.",
+                    "parameters": {"type": "object", "properties": {"pid": {"type": "integer"}, "window_id": {"type": "integer"}}, "required": ["pid", "window_id"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_launch_app",
+                    "description": "Launch or connect to a native desktop application. Arguments depend on the platform, such as name, bundle_id, or args.",
+                    "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "bundle_id": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_click",
+                    "description": "Click a native desktop element. Prefer pid, window_id, and element_index from the latest desktop_window_state; use x/y only as a fallback.",
+                    "parameters": {"type": "object", "properties": {"pid": {"type": "integer"}, "window_id": {"type": "integer"}, "element_index": {"type": "integer"}, "x": {"type": "number"}, "y": {"type": "number"}, "count": {"type": "integer"}, "modifier": {"type": "array", "items": {"type": "string"}}}, "required": ["pid"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_type",
+                    "description": "Type text into a native desktop element. Prefer element_index from the latest desktop_window_state; use x/y only as a fallback.",
+                    "parameters": {"type": "object", "properties": {"pid": {"type": "integer"}, "text": {"type": "string"}, "window_id": {"type": "integer"}, "element_index": {"type": "integer"}, "x": {"type": "number"}, "y": {"type": "number"}}, "required": ["pid", "text"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_press_key",
+                    "description": "Press a key in a native desktop application, optionally targeting an accessibility element or pixel coordinate.",
+                    "parameters": {"type": "object", "properties": {"pid": {"type": "integer"}, "key": {"type": "string"}, "window_id": {"type": "integer"}, "element_index": {"type": "integer"}, "x": {"type": "number"}, "y": {"type": "number"}, "modifiers": {"type": "array", "items": {"type": "string"}}}, "required": ["pid", "key"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_hotkey",
+                    "description": "Send a keyboard shortcut to a native desktop application.",
+                    "parameters": {"type": "object", "properties": {"pid": {"type": "integer"}, "keys": {"type": "array", "items": {"type": "string"}}, "window_id": {"type": "integer"}, "x": {"type": "number"}, "y": {"type": "number"}}, "required": ["pid", "keys"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_scroll",
+                    "description": "Scroll a native desktop window. Prefer a fresh accessibility window state first.",
+                    "parameters": {"type": "object", "properties": {"pid": {"type": "integer"}, "direction": {"type": "string", "enum": ["up", "down", "left", "right"]}, "window_id": {"type": "integer"}, "element_index": {"type": "integer"}, "amount": {"type": "integer"}}, "required": ["pid", "direction"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_move",
+                    "description": "Move the Cua agent cursor to native desktop pixel coordinates. This action is pixel-only; use desktop_window_state first to ground coordinates.",
+                    "parameters": {"type": "object", "properties": {"pid": {"type": "integer"}, "window_id": {"type": "integer"}, "x": {"type": "number"}, "y": {"type": "number"}}, "required": ["pid", "x", "y"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_drag",
+                    "description": "Drag in a native desktop window using grounded window-local pixel coordinates. Cua Driver requires x1/y1/x2/y2; use desktop_window_state screenshot coordinates.",
+                    "parameters": {"type": "object", "properties": {"pid": {"type": "integer"}, "window_id": {"type": "integer"}, "x1": {"type": "number"}, "y1": {"type": "number"}, "x2": {"type": "number"}, "y2": {"type": "number"}}, "required": ["pid", "x1", "y1", "x2", "y2"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "desktop_window_action",
+                    "description": "Activate a native window. The current Cua Driver supports activate_window through bring_to_front; minimize, maximize, and close are reported as unsupported until the driver exposes them.",
+                    "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["activate_window", "minimize_window", "maximize_window", "close_window"]}, "pid": {"type": "integer"}, "window_id": {"type": "integer"}}, "required": ["action", "pid"]},
+                },
+            },
             {
                 "type": "function",
                 "function": {
@@ -997,8 +1135,8 @@ class Agent:
             "get_subagent_result": lambda a: self.subagent_tool.get_result(a["subagent_id"]).to_dict(),
             # Browser tools
             "browser_launch": lambda a: self.browser_launch_tool(
-                profile=a.get("profile"), headless=a.get("headless", False), proxy=a.get("proxy"),
-                humanize=a.get("humanize", True), chrome_profile=a.get("chrome_profile"), connect_cdp=a.get("connect_cdp"),
+                profile=a.get("profile"), headless=False, proxy=a.get("proxy"),
+                humanize=True, chrome_profile=a.get("chrome_profile"), connect_cdp=None,
             ).to_dict(),
             "browser_navigate": lambda a: self.browser_navigate_tool(a["url"]).to_dict(),
             "browser_go_back": lambda a: self.browser_go_back_tool().to_dict(),
@@ -1031,6 +1169,20 @@ class Agent:
             "browser_hover_index": lambda a: self.browser_hover_index_tool(a["index"]).to_dict(),
             "browser_drag": lambda a: self.browser_drag_tool(a["selector_from"], a["selector_to"]).to_dict(),
             "browser_drag_xy": lambda a: self.browser_drag_xy_tool(a["x1"], a["y1"], a["x2"], a["y2"]).to_dict(),
+            # Native desktop tools
+            "desktop_doctor": lambda a: self.desktop_doctor_tool().to_dict(),
+            "desktop_list_windows": lambda a: self.desktop_list_windows_tool(a.get("pid")).to_dict(),
+            "desktop_window_state": lambda a: self.desktop_window_state_tool(a["pid"], a["window_id"], a.get("include_screenshot", True)).to_dict(),
+            "desktop_screenshot": lambda a: self.desktop_screenshot_tool(a["pid"], a["window_id"]).to_dict(),
+            "desktop_launch_app": lambda a: self.desktop_launch_app_tool(**a).to_dict(),
+            "desktop_click": lambda a: self.desktop_click_tool(**a).to_dict(),
+            "desktop_type": lambda a: self.desktop_type_tool(a["pid"], a["text"], **{k: v for k, v in a.items() if k not in ("pid", "text")}).to_dict(),
+            "desktop_press_key": lambda a: self.desktop_press_key_tool(a["pid"], a["key"], **{k: v for k, v in a.items() if k not in ("pid", "key")}).to_dict(),
+            "desktop_hotkey": lambda a: self.desktop_hotkey_tool(a["pid"], a["keys"], **{k: v for k, v in a.items() if k not in ("pid", "keys")}).to_dict(),
+            "desktop_scroll": lambda a: self.desktop_scroll_tool(a["pid"], a["direction"], **{k: v for k, v in a.items() if k not in ("pid", "direction")}).to_dict(),
+            "desktop_move": lambda a: self.desktop_move_tool(a["pid"], a["x"], a["y"], **{k: v for k, v in a.items() if k not in ("pid", "x", "y")}).to_dict(),
+            "desktop_drag": lambda a: self.desktop_drag_tool(a["pid"], **{k: v for k, v in a.items() if k != "pid"}).to_dict(),
+            "desktop_window_action": lambda a: self.desktop_window_actions[a["action"]](a["pid"], **{k: v for k, v in a.items() if k not in ("action", "pid")}).to_dict(),
             # Skill tools
             "list_skills": lambda a: self.skill_manager.list_skills().to_dict(),
             "load_skill": lambda a: self.skill_manager.load_skill(a["skill_name"]).to_dict(),
@@ -1085,6 +1237,19 @@ class Agent:
             return f"spawn {mode} subagent: {prompt_preview}"
         if name == "get_subagent_result": return f"get subagent result: {args.get('subagent_id', '?')}"
         # Browser tool summaries
+        if name == "desktop_doctor": return "check native desktop automation"
+        if name == "desktop_list_windows": return "list native desktop windows"
+        if name == "desktop_window_state": return f"inspect native window {args.get('pid', '?')}:{args.get('window_id', '?')}"
+        if name == "desktop_screenshot": return f"screenshot native window {args.get('pid', '?')}:{args.get('window_id', '?')}"
+        if name == "desktop_launch_app": return f"launch native app: {args.get('name') or args.get('bundle_id') or '?'}"
+        if name == "desktop_click": return "click native desktop element" if "element_index" in args else "click native desktop pixel"
+        if name == "desktop_type": return f"type into native desktop: {(args.get('text') or '')[:30]}"
+        if name == "desktop_press_key": return f"press native desktop key: {args.get('key', '?')}"
+        if name == "desktop_hotkey": return f"native desktop hotkey: {args.get('keys', '?')}"
+        if name == "desktop_scroll": return f"scroll native desktop {args.get('direction', '?')}"
+        if name == "desktop_move": return "move native desktop cursor"
+        if name == "desktop_drag": return "drag native desktop"
+        if name == "desktop_window_action": return f"{args.get('action', 'act')} native window"
         if name == "browser_launch":
             profile = args.get("profile")
             chrome = args.get("chrome_profile")
@@ -1613,6 +1778,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             self.browser_manager.cancel_active_operation()
         except Exception:
             pass
+        try:
+            self.desktop_manager.cancel_active_operation()
+        except Exception:
+            pass
 
     def _check_interrupt(self):
         if self._interrupt_event.is_set():
@@ -2024,6 +2193,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 self.browser_manager.close()
             except Exception:
                 pass
+        try:
+            self.desktop_manager.reset()
+        except Exception:
+            pass
 
     def get_history(self) -> List[Dict[str, Any]]:
         return list(self.conversation_history)

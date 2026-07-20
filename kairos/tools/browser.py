@@ -8,7 +8,11 @@ from .base import ToolResult
 
 
 class BrowserLaunchTool:
-    """Launch a browser with optional persistent profile."""
+    """Launch an always-headed, always-humanized browser with an optional profile.
+
+    ``headless`` and ``humanize`` remain accepted for API compatibility, but the
+    browser manager ignores them so callers cannot weaken the safety policy.
+    """
 
     def __init__(self, browser_manager):
         self.bm = browser_manager

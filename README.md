@@ -4,13 +4,14 @@ A minimal personal coding agent in Python.
 
 ## Features
 
-- **40 Tools**: File operations, terminal management, search, git, sub-agents, skills, and a comprehensive browser automation suite (30 browser tools including hover, drag, wait_for, select_index, scroll, wait, send_keys, search_page, find_elements, index-based click/type, go_back/go_forward/reload, and CDP cross-origin iframe support)
+- **58 Tools**: File operations, terminal management, search, git, sub-agents, skills, a comprehensive browser automation suite, and optional native desktop automation through Cua Driver
 - **Absolute Paths**: All file operations use absolute paths — no workspace restrictions
 - **Streaming First**: Tokens print as they arrive; no waiting for full responses
 - **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange. Estimates include message metadata, tool-call arguments, and function-tool schemas; uses ground-truth counts from the API when available (`stream_options={"include_usage": True}`), with tiktoken estimates as fallback
 - **Auto-Compaction**: Conversation history is automatically summarized when the configured context budget exceeds 80%; estimates include tool schemas and tool-call metadata, and compaction input is bounded so large results cannot cause a second breach
 - **Sub-Agents**: Spawn autonomous child agents to work on tasks in parallel
-- **Browser Automation**: Full Playwright/CloakBrowser integration with stealth mode, persistent profiles, multi-tab, and CDP support. Browser launches are always headed (visible) and humanized; legacy `headless`/`humanize` arguments are accepted but cannot disable this policy.
+- **Browser Automation**: CloakBrowser-backed stealth mode with persistent profiles, multi-tab, and DOM/CDP inspection support. Browser launches are always headed (visible) and always humanized; legacy `headless`/`humanize` arguments are accepted but cannot disable this policy. CDP attachment is rejected because Kairos cannot enforce the policy on an externally managed browser.
+- **Native Desktop Automation**: Optional Cua Driver integration exposes native window discovery, accessibility-tree snapshots, screenshots, app launching, clicking, typing, keyboard, scrolling, dragging, and window actions. Accessibility element indices are the primary addressing mode; pixel coordinates are available as a fallback. Desktop tools are available to sub-agents and are loaded lazily when Cua Driver is installed.
 - **Skills**: Self-extensible skill system — agent can create/load skills stored as `SKILL.md` files in `skills/` directory
 - **Paste System**: Text pastes use explicit prompt-toolkit paste events: bracketed-paste events carry their own payload, and Ctrl+V reads the clipboard only when that key is pressed. Alt+V pastes images from the clipboard. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. Clipboard changes from copying are never mistaken for paste actions.
 - **Chat Persistence**: Standard and Textual CLI sessions are saved by workspace to `~/.kairos/chats/<directory>--<stable-path-id>/chats.json`. The readable directory name plus deterministic absolute-path ID prevents collisions between workspaces with the same basename, while the JSON envelope records the absolute `workspace` path. Existing `<workspace>/chats/chats.json` files remain loadable for resume and are never deleted; their sessions are copied into the new store on the next save. Each session is tracked by a unique ID — no fuzzy matching that could clobber different sessions. **Atomic writes** via temp-file + rename prevent corruption from interrupted saves. **Corruption recovery** auto-heals damaged files by parsing up to the last valid JSON boundary.
@@ -20,6 +21,7 @@ A minimal personal coding agent in Python.
 - **Tool Summaries**: One-line display when tools are called (e.g., `read file: /path`)
 - **Immediate Stop**: Ctrl+C and Escape share one hard-stop path. They close the active stream, cancel running blocking terminal commands and cancellable browser waits, stop before the next tool/API step, and return control to the prompt as soon as cleanup is complete. Interrupted assistant/tool turns remain repairable so the next request can continue them rather than silently losing context. Input typed while a response is handing back to the prompt is buffered, so commands such as `/exit` are not silently lost.
 - **Responsive Terminals**: Blocking commands require a finite positive timeout capped at 20 seconds; background commands return immediately, preserve shell state, stay alive after completion, and notify the CLI/agent asynchronously with capped output
+- **Cua Driver Configuration**: Set `KAIROS_CUA_DRIVER_PATH` to an explicit `cua-driver` executable or installation directory, or leave it empty for PATH discovery. On Windows, Kairos also checks the official per-user install location under `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin` when a long-lived gateway has an older inherited PATH. Kairos starts the Cua daemon lazily when a desktop tool is first used.
 - **Bounded Tool Results**: Text returned by tools is capped before it enters history or the API (20,000 characters per result by default), preserving both the beginning and end with a truncation marker; image data is kept out of textual tool messages and re-injected as vision context with bounded token estimates; the limit can be configured with `KAIROS_MAX_TOOL_RESULT_CHARS`
 - **OpenAI Compatible**: Works with any OpenAI-compatible API (OpenRouter, local models, etc.)
 - **Gateway Retry & Clean Errors**: Transient API/gateway failures, including interrupted chunked streams, are retried twice with backoff; exhausted requests show concise API diagnostics without dumping a traceback
@@ -35,14 +37,14 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-For browser automation, also install Playwright and CloakBrowser's headed/humanized Chromium integration:
+For browser automation, install Playwright and CloakBrowser's headed/humanized Chromium integration:
 
 ```bash
 pip install cloakbrowser
 playwright install chromium
 ```
 
-Kairos enforces headed, humanized browser launches and requires `cloakbrowser` for them; browser launch fails with an installation message if CloakBrowser is unavailable.
+Kairos enforces headed, humanized browser launches, requires `cloakbrowser`, and rejects CDP attachment; launch fails with an installation message if CloakBrowser or its humanization layer is unavailable.
 
 ## Configuration
 
@@ -152,7 +154,7 @@ Skills are stored in `skills/<skill-name>/SKILL.md`. Only skill names are inject
 
 | Tool | Description |
 |------|-------------|
-| `browser_launch(profile?, proxy?, chrome_profile?, connect_cdp?)` | Launch an always-headed, humanized browser (Playwright or CloakBrowser stealth); legacy `headless`/`humanize` values are ignored |
+| `browser_launch(profile?, proxy?, chrome_profile?)` | Launch an always-headed, always-humanized CloakBrowser session; legacy `headless`/`humanize` values are ignored and CDP attachment is rejected |
 | `browser_navigate(url)` | Navigate to a URL. Always auto-screenshots + auto-snapshots (navigation = significant change). |
 | `browser_go_back()` | Navigate back in browser history. Auto-snapshots if page changed significantly. |
 | `browser_go_forward()` | Navigate forward in browser history. Auto-snapshots if page changed significantly. |
@@ -182,6 +184,25 @@ Skills are stored in `skills/<skill-name>/SKILL.md`. Only skill names are inject
 | `browser_drag(selector_from, selector_to)` | Drag an element to another element (for file uploads, sortable lists, Kanban boards). Smart auto-snapshot. |
 | `browser_drag_xy(x1, y1, x2, y2)` | Drag from one coordinate to another. Smart auto-snapshot. |
 | `browser_switch_frame(frame_selector?)` | Switch into an iframe (including cross-origin via CDP), or back to top-level |
+
+### Native desktop tools
+
+When `cua-driver` is installed, Kairos also exposes native desktop automation through Cua Driver. Use `desktop_window_state(pid, window_id)` before interacting with a window and again afterward to verify the result. Accessibility `element_index` values from the latest state are the primary interaction method for supported actions; pixel coordinates are required for cursor movement and dragging. If both addressing forms are accidentally supplied, Kairos prefers the accessibility address to match Cua's mutually exclusive contract. Kairos maps drag coordinates to Cua's `from_x/from_y/to_x/to_y` fields, supplies scroll defaults, maps `activate_window` to `bring_to_front`, and reports minimize/maximize/close as unsupported because the current driver does not expose those tools. Desktop tools are available to sub-agents. Set `KAIROS_CUA_DRIVER_PATH` to override PATH discovery.
+
+| Tool | Description |
+|------|-------------|
+| `desktop_doctor()` | Check Cua Driver and interactive desktop prerequisites |
+| `desktop_list_windows(pid?)` | List native windows |
+| `desktop_window_state(pid, window_id, include_screenshot?)` | Return accessibility state and grounding screenshot |
+| `desktop_screenshot(pid, window_id)` | Capture a native window screenshot through the driver's window-state response |
+| `desktop_launch_app(...)` | Launch/connect to a native application |
+| `desktop_click(...)` | Click by accessibility index, with coordinate fallback |
+| `desktop_type(pid, text, ...)` | Type by accessibility index, with coordinate fallback |
+| `desktop_press_key(pid, key, ...)` | Press a key |
+| `desktop_hotkey(pid, keys, ...)` | Send a shortcut |
+| `desktop_scroll(pid, direction, ...)` | Scroll a native window |
+| `desktop_move(...)` / `desktop_drag(...)` | Move or drag |
+| `desktop_window_action(action, pid, ...)` | Activate, minimize, maximize, or close a window |
 
 Browser features:
 - **Persistent profiles**: Cookies, localStorage, and cache survive across sessions (`~/.kairos/profiles/`)

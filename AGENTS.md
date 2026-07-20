@@ -4,7 +4,7 @@
 
 ## Overview
 
-Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 40 tools. All file operations use absolute paths — no workspace containment.
+Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 58 tools, including optional native desktop automation through Cua Driver. All file operations use absolute paths — no workspace containment.
 
 ## Project Structure
 
@@ -31,7 +31,7 @@ Agent2/
 │   ├── test_compaction.py  # Context accounting, compaction, and legacy-result tests
 │   └── test_sessions.py    # Workspace-isolated home chat storage and legacy loading tests
 └── kairos/
-    ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, SkillManager, TerminalManager, BrowserManager
+    ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, SkillManager, TerminalManager, BrowserManager, DesktopManager
     ├── main.py             # CLI REPL loop, signal handlers, auto-save, paste resolution
     ├── gateway_main.py     # `python -m kairos.gateway_main`
     ├── main_gateway.py     # Compatibility gateway entry point
@@ -232,7 +232,7 @@ This means the AGENTS.md content is injected directly into every API call's syst
 
 #### Tool Schema (`_get_tool_schema()`)
 
-Returns a list of 40 OpenAI function tool definitions. If `self._is_subagent` is True, removes browser tools (19) and sub-agent tools (2), leaving 13 tools (includes skill tools).
+Returns a list of 58 OpenAI function tool definitions. If `self._is_subagent` is True, removes browser tools and sub-agent tools while retaining native desktop tools, so sub-agents can operate desktop software with the same accessibility-first interaction model.
 
 #### Tool Execution (`_execute_tool(name, args)`)
 
@@ -485,7 +485,7 @@ Low-level Chrome DevTools Protocol access via Playwright's CDP session API.
 
 **Class**: `BrowserManager`
 
-Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its entire lifetime (avoids greenlet errors). Browser launches are always headed and humanized: `launch()` forces `headless=False` and `humanize=True` even when compatibility callers pass different values. Ephemeral, named-profile, and copied Chrome-profile launches apply CloakBrowser's human interaction patch when CloakBrowser is available; CDP connections patch the discovered context as well. The tool-level `headless` and `humanize` inputs remain accepted only for backward compatibility and cannot disable this policy. CloakBrowser is required for browser automation because the always-humanized policy cannot be guaranteed by plain Playwright; launch fails with an installation message if CloakBrowser is unavailable.
+Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its entire lifetime (avoids greenlet errors). Browser launches are always headed and always humanized: `launch()` forces `headless=False` and `humanize=True` even when compatibility callers pass different values. Ephemeral, named-profile, and copied Chrome-profile launches require CloakBrowser and apply its human interaction patch to every context, including pages created later. Plain Playwright is rejected because it cannot guarantee this policy. CDP connections are rejected because Kairos cannot guarantee that an externally managed browser is headed and humanized. The tool-level `headless` and `humanize` inputs remain accepted only for backward compatibility and cannot disable this policy.
 
 **Worker Thread** (`_WorkerThread`):
 - `start()` — spawns thread, initializes Playwright, signals `_started` event when ready
@@ -495,10 +495,10 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 **Launch modes**:
 1. **Ephemeral** (no profile): `pw.chromium.launch()` + `browser.new_context()`
 2. **Named profile**: `pw.chromium.launch_persistent_context(profile_dir)` — stores at `~/.kairos/profiles/<name>`
-3. **CDP**: `pw.chromium.connect_over_cdp(cdp_url)` — connects to running Chrome
+3. **CDP**: rejected by policy; Kairos cannot guarantee that an externally managed browser is headed and humanized
 4. **Chrome profile copy**: Copies real Chrome user data dir to `~/.kairos/profiles/_chrome_copy_<name>`, launches persistent context with copy
 
-**CloakBrowser integration**: When `pip install cloakbrowser` is available, uses its stealth Chromium binary and `build_args()` for fingerprint patches. Falls back to standard Playwright Chromium.
+**CloakBrowser integration**: Requires `cloakbrowser`, uses its stealth Chromium binary and `build_args()` for fingerprint patches, and applies its human interaction layer to every browser context. There is no plain Playwright fallback.
 
 **Key operations** (all dispatched to worker thread):
 - `navigate(url)` — `page.goto(url, wait_until="domcontentloaded")`, clears active frame; reports specific error types (DNS, connection, timeout) on failure. Auto-screenshots after navigate.
@@ -775,7 +775,7 @@ No fuzzy/prefix matching — each session is tracked by its ID. This prevents di
 
 ## Tests
 
-`tests/test_compaction.py` contains focused regression coverage for function-tool/schema accounting, message metadata, bounded vision estimates, pending-user preflight, safe tool-chain boundaries, compaction-prompt limits, and normalization of oversized legacy saved results. `tests/test_sessions.py` covers deterministic workspace IDs, home-directory storage, JSON workspace metadata, workspace isolation, and loading/migrating legacy workspace-local chats. Run the suite with `python -m unittest discover -s tests -v`.
+`tests/test_compaction.py` contains focused regression coverage for function-tool/schema accounting, message metadata, bounded vision estimates, pending-user preflight, safe tool-chain boundaries, compaction-prompt limits, and normalization of oversized legacy saved results. `tests/test_sessions.py` covers deterministic workspace IDs, home-directory storage, JSON workspace metadata, workspace isolation, and loading/migrating legacy workspace-local chats. `tests/test_desktop_manager.py` covers Cua Driver response/image extraction and lazy lifecycle behavior without requiring a native desktop. Run the suite with `python -m unittest discover -s tests -v`.
 
 ## Design Principles
 
@@ -811,3 +811,7 @@ The gateway repository stores workspaces, conversations, messages, runs, and mon
 Blocking terminal commands require a finite positive timeout and clamp it to 20 seconds; background terminals remain persistent and report asynchronous completion events with bounded notifications while retaining full logs. Timeout validation is case-insensitive in the regression checks.
 
 Dependency-light gateway validation is available with `python tests/run_gateway_tests.py`; compile checks use `python -m compileall -q kairos gateway_main.py tests`. Full pytest tests require installing `pytest`. Every code change must update this file and `README.md`.
+
+### Native Desktop / Cua Driver Integration
+
+Kairos optionally integrates the Cua Driver through `kairos/desktop_manager.py` and `kairos/tools/desktop.py`. `DesktopManager` accepts an executable or directory in `KAIROS_CUA_DRIVER_PATH`, then lazily discovers `cua-driver` using PATH or the official Windows per-user location under `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin`, starts its persistent daemon, invokes daemon-backed CLI tools, extracts screenshots into `ToolResult.image_url`, supports cancellation, and closes the daemon on reset. Native desktop tools include doctor, window listing/state, screenshots (implemented through the current driver's `get_window_state` response), application launching, clicking, typing, keyboard shortcuts, scrolling, moving, dragging, and window actions. Accessibility indices are primary for supported actions; pixel coordinates are required for cursor movement and dragging. Wrappers map Kairos drag coordinates to Cua's `from_x/from_y/to_x/to_y` fields, add scroll defaults, and map `activate_window` to `bring_to_front`. The current driver does not expose minimize/maximize/close tools, so those actions return explicit unsupported results. Desktop wrappers normalize accidental simultaneous accessibility-index and pixel arguments by preferring the semantic address. Desktop tools are available to sub-agents. Regression coverage is in `tests/test_desktop_manager.py` and uses mocked/fake transport behavior without requiring a native desktop.

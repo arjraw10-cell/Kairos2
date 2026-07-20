@@ -5,5 +5,6 @@ from kairos.tools import SessionManager
 from kairos.tools import SkillManager
 from kairos.terminal_manager import TerminalManager
 from kairos.browser_manager import BrowserManager
+from kairos.desktop_manager import DesktopManager
 
-__all__ = ["Config", "Agent", "ToolResult", "SessionManager", "SkillManager", "TerminalManager", "BrowserManager"]
+__all__ = ["Config", "Agent", "ToolResult", "SessionManager", "SkillManager", "TerminalManager", "BrowserManager", "DesktopManager"]
