@@ -23,6 +23,8 @@ from .tools import (
     BrowserGoBackTool, BrowserGoForwardTool, BrowserReloadTool, BrowserCloseTool,
     BrowserClickXYTool, BrowserSwitchFrameTool,
     BrowserHoverTool, BrowserHoverIndexTool, BrowserDragTool, BrowserDragXYTool, BrowserWaitForTool,
+    BrowserListConsoleMessagesTool, BrowserGetConsoleMessageTool,
+    BrowserListNetworkRequestsTool, BrowserGetNetworkRequestTool,
     DesktopDoctorTool, DesktopListWindowsTool, DesktopWindowStateTool, DesktopScreenshotTool,
     DesktopLaunchAppTool, DesktopClickTool, DesktopTypeTool, DesktopPressKeyTool,
     DesktopHotkeyTool, DesktopScrollTool, DesktopMoveTool, DesktopDragTool, DesktopWindowActionTool,
@@ -123,6 +125,12 @@ class Agent:
         self.browser_drag_tool = BrowserDragTool(self.browser_manager)
         self.browser_drag_xy_tool = BrowserDragXYTool(self.browser_manager)
         self.browser_wait_for_tool = BrowserWaitForTool(self.browser_manager)
+
+        # Console & network monitoring tools
+        self.browser_list_console_messages_tool = BrowserListConsoleMessagesTool(self.browser_manager)
+        self.browser_get_console_message_tool = BrowserGetConsoleMessageTool(self.browser_manager)
+        self.browser_list_network_requests_tool = BrowserListNetworkRequestsTool(self.browser_manager)
+        self.browser_get_network_request_tool = BrowserGetNetworkRequestTool(self.browser_manager)
 
         # Native desktop tools backed by Cua Driver. Desktop access is also
         # intentionally available to sub-agents; each Agent owns its own Cua
@@ -890,6 +898,63 @@ class Agent:
                     },
                 },
             },
+            # ---- Console & Network Monitoring ----
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_list_console_messages",
+                    "description": "List captured console messages from the current page. Enables CDP Runtime console capture on first call. Returns index, level, text preview, and source location.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "max_results": {"type": "integer", "description": "Max messages to return (default 50)"}
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_get_console_message",
+                    "description": "Inspect a single console message by its index from browser_list_console_messages. Returns full details: level, text, source, URL, line, column, timestamp.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer", "description": "Message index from browser_list_console_messages"}
+                        },
+                        "required": ["index"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_list_network_requests",
+                    "description": "List captured network requests from the current page. Enables CDP Network capture on first call. Returns index, HTTP method, status, URL, and duration.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "max_results": {"type": "integer", "description": "Max requests to return (default 50)"}
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_get_network_request",
+                    "description": "Inspect a single network request by its index from browser_list_network_requests. Returns full details: method, URL, status, headers, duration.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer", "description": "Request index from browser_list_network_requests"}
+                        },
+                        "required": ["index"],
+                    },
+                },
+            },
             # ---- Skill Tools ----
             # Native desktop tools (Cua Driver). Accessibility element indices
             # are the primary addressing mode; x/y coordinates are an explicit
@@ -1054,6 +1119,8 @@ class Agent:
                 "browser_switch_frame", "browser_go_back", "browser_go_forward", "browser_reload",
                 "browser_hover", "browser_hover_index",
                 "browser_drag", "browser_drag_xy",
+                "browser_list_console_messages", "browser_get_console_message",
+                "browser_list_network_requests", "browser_get_network_request",
             )]
         return tools
 
@@ -1169,6 +1236,11 @@ class Agent:
             "browser_hover_index": lambda a: self.browser_hover_index_tool(a["index"]).to_dict(),
             "browser_drag": lambda a: self.browser_drag_tool(a["selector_from"], a["selector_to"]).to_dict(),
             "browser_drag_xy": lambda a: self.browser_drag_xy_tool(a["x1"], a["y1"], a["x2"], a["y2"]).to_dict(),
+            # Console & network monitoring
+            "browser_list_console_messages": lambda a: self.browser_list_console_messages_tool(max_results=a.get("max_results", 50)).to_dict(),
+            "browser_get_console_message": lambda a: self.browser_get_console_message_tool(a["index"]).to_dict(),
+            "browser_list_network_requests": lambda a: self.browser_list_network_requests_tool(max_results=a.get("max_results", 50)).to_dict(),
+            "browser_get_network_request": lambda a: self.browser_get_network_request_tool(a["index"]).to_dict(),
             # Native desktop tools
             "desktop_doctor": lambda a: self.desktop_doctor_tool().to_dict(),
             "desktop_list_windows": lambda a: self.desktop_list_windows_tool(a.get("pid")).to_dict(),
@@ -1307,6 +1379,10 @@ class Agent:
         if name == "browser_hover_index": return f"hover element [{args.get('index', '?')}]"
         if name == "browser_drag": return f"drag '{args.get('selector_from', '?')}' -> '{args.get('selector_to', '?')}'"
         if name == "browser_drag_xy": return f"drag ({args.get('x1', '?')}, {args.get('y1', '?')}) -> ({args.get('x2', '?')}, {args.get('y2', '?')})"
+        if name == "browser_list_console_messages": return f"list console messages (max {args.get('max_results', 50)})"
+        if name == "browser_get_console_message": return f"inspect console message [{args.get('index', '?')}]"
+        if name == "browser_list_network_requests": return f"list network requests (max {args.get('max_results', 50)})"
+        if name == "browser_get_network_request": return f"inspect network request [{args.get('index', '?')}]"
         # Skill tool summaries
         if name == "list_skills": return "list skills"
         if name == "load_skill": return f"load skill: {args.get('skill_name', '?')}"

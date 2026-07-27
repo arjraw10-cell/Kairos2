@@ -9,11 +9,14 @@ enabling features that go beyond Playwright's high-level abstractions:
   - Accessibility.getFullAXTree: semantic accessibility tree per frame
   - Page.getFrameTree: frame hierarchy for cross-origin iframe detection
   - Page.getLayoutMetrics: viewport size, device pixel ratio
+  - Runtime.consoleAPICalled: live console message capture (log, warn, error...)
+  - Network.requestWillBeSent / Network.responseReceived: live network monitoring
 
 All CDP operations run synchronously via Playwright's sync API and must be
 dispatched through the BrowserManager's worker thread.
 """
 
+import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,6 +43,14 @@ class CDPManager:
 
     def __init__(self):
         self._sessions: Dict[int, Any] = {}  # id(page) -> cdp_session
+        # Console & network event buffers (appended by CDP callbacks, read by BrowserManager)
+        self._console_messages: List[Dict[str, Any]] = []
+        self._network_requests: List[Dict[str, Any]] = []
+        self._console_enabled = False
+        self._network_enabled = False
+        self._console_handler = None  # Bound callback for cleanup
+        self._network_request_handler = None
+        self._network_response_handler = None
 
     # ------------------------------------------------------------------
     #  Session management
@@ -304,6 +315,133 @@ class CDPManager:
             elements.append(element)
 
         return elements[:50]  # Cap at 50 elements per iframe
+
+    # ------------------------------------------------------------------
+    #  Console monitoring (Runtime.consoleAPICalled events)
+    # ------------------------------------------------------------------
+
+    def enable_console(self, page) -> None:
+        """Enable console event capture via Runtime.consoleAPICalled.
+
+        Callbacks run on Playwright's internal thread and append directly to
+        the thread-safe buffer — no dispatch to the worker thread needed.
+        """
+        if self._console_enabled:
+            return
+        cdp = self.get_session(page)
+        cdp.send("Runtime.enable")
+
+        def _on_console(params):
+            args = params.get("args", [])
+            text_parts = []
+            for arg in args:
+                if isinstance(arg, dict):
+                    if arg.get("type") == "string":
+                        text_parts.append(arg.get("value", ""))
+                    else:
+                        text_parts.append(json.dumps(arg.get("value", "")))
+                else:
+                    text_parts.append(str(arg))
+            self._console_messages.append({
+                "level": params.get("level", "info"),
+                "text": " ".join(text_parts),
+                "source": params.get("source", ""),
+                "url": params.get("url", ""),
+                "line": params.get("line", 0),
+                "column": params.get("column", 0),
+                "timestamp": params.get("timestamp", 0),
+            })
+            # Cap buffer
+            if len(self._console_messages) > 500:
+                self._console_messages = self._console_messages[-500:]
+
+        self._console_handler = _on_console
+        cdp.on("Runtime.consoleAPICalled", _on_console)
+        self._console_enabled = True
+
+    def disable_console(self, page) -> None:
+        """Disable console event capture and clear the buffer."""
+        if not self._console_enabled:
+            return
+        try:
+            cdp = self.get_session(page)
+            if self._console_handler:
+                cdp.remove_listener("Runtime.consoleAPICalled", self._console_handler)
+            cdp.send("Runtime.disable")
+        except Exception:
+            pass
+        self._console_handler = None
+        self._console_messages.clear()
+        self._console_enabled = False
+
+    def clear_console_buffer(self) -> None:
+        """Clear console messages without disabling capture."""
+        self._console_messages.clear()
+
+    # ------------------------------------------------------------------
+    #  Network monitoring (Network.requestWillBeSent / responseReceived)
+    # ------------------------------------------------------------------
+
+    def enable_network(self, page) -> None:
+        """Enable network event capture via CDP Network domain."""
+        if self._network_enabled:
+            return
+        cdp = self.get_session(page)
+        cdp.send("Network.enable")
+
+        def _on_request(params):
+            req = params.get("request", {})
+            self._network_requests.append({
+                "url": req.get("url", ""),
+                "method": req.get("method", "GET"),
+                "status": None,
+                "request_headers": req.get("headers", {}),
+                "response_headers": None,
+                "timestamp": params.get("timestamp", 0),
+                "duration_ms": None,
+            })
+
+        def _on_response(params):
+            resp = params.get("response", {})
+            url = resp.get("url", "")
+            for req in reversed(self._network_requests):
+                if req["url"] == url and req["status"] is None:
+                    req["status"] = resp.get("status", 0)
+                    req["response_headers"] = resp.get("headers", {})
+                    break
+
+        self._network_request_handler = _on_request
+        self._network_response_handler = _on_response
+        cdp.on("Network.requestWillBeSent", _on_request)
+        cdp.on("Network.responseReceived", _on_response)
+        self._network_enabled = True
+
+    def disable_network(self, page) -> None:
+        """Disable network event capture and clear the buffer."""
+        if not self._network_enabled:
+            return
+        try:
+            cdp = self.get_session(page)
+            if self._network_request_handler:
+                cdp.remove_listener("Network.requestWillBeSent", self._network_request_handler)
+            if self._network_response_handler:
+                cdp.remove_listener("Network.responseReceived", self._network_response_handler)
+            cdp.send("Network.disable")
+        except Exception:
+            pass
+        self._network_request_handler = None
+        self._network_response_handler = None
+        self._network_requests.clear()
+        self._network_enabled = False
+
+    def clear_network_buffer(self) -> None:
+        """Clear network requests without disabling capture."""
+        self._network_requests.clear()
+
+    def disable_all(self, page) -> None:
+        """Disable all monitoring and clear all buffers."""
+        self.disable_console(page)
+        self.disable_network(page)
 
     # ------------------------------------------------------------------
     #  JS execution via CDP (for same-origin frames only)

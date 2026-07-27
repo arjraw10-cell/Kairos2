@@ -44,6 +44,10 @@ from .browser import (
     BrowserDragTool,
     BrowserDragXYTool,
     BrowserWaitForTool,
+    BrowserListConsoleMessagesTool,
+    BrowserGetConsoleMessageTool,
+    BrowserListNetworkRequestsTool,
+    BrowserGetNetworkRequestTool,
 )
 from .skills import SkillManager
 from .desktop import (
@@ -97,6 +101,10 @@ __all__ = [
     "BrowserDragTool",
     "BrowserDragXYTool",
     "BrowserWaitForTool",
+    "BrowserListConsoleMessagesTool",
+    "BrowserGetConsoleMessageTool",
+    "BrowserListNetworkRequestsTool",
+    "BrowserGetNetworkRequestTool",
     "SkillManager",
     "DesktopDoctorTool", "DesktopListWindowsTool", "DesktopWindowStateTool",
     "DesktopScreenshotTool", "DesktopLaunchAppTool", "DesktopClickTool",

@@ -413,3 +413,63 @@ class BrowserSwitchFrameTool:
             return ToolResult(True, self.bm.switch_frame(frame_selector))
         except Exception as e:
             return ToolResult(False, "", f"Frame switch failed: {e}")
+
+
+class BrowserListConsoleMessagesTool:
+    """List captured console messages from the current page.
+
+    Enables CDP Runtime console capture on first call. Returns a compact
+    list with index, level, text preview, and source location.
+    """
+
+    def __init__(self, browser_manager):
+        self.bm = browser_manager
+
+    def __call__(self, max_results=50) -> ToolResult:
+        try:
+            return ToolResult(True, self.bm.list_console_messages(max_results=max_results))
+        except Exception as e:
+            return ToolResult(False, "", f"List console messages failed: {e}")
+
+
+class BrowserGetConsoleMessageTool:
+    """Inspect a single console message by its index from list_console_messages."""
+
+    def __init__(self, browser_manager):
+        self.bm = browser_manager
+
+    def __call__(self, index: int) -> ToolResult:
+        try:
+            return ToolResult(True, self.bm.get_console_message(index))
+        except Exception as e:
+            return ToolResult(False, "", f"Get console message failed: {e}")
+
+
+class BrowserListNetworkRequestsTool:
+    """List captured network requests from the current page.
+
+    Enables CDP Network capture on first call. Returns a compact list with
+    index, HTTP method, status, URL, and duration.
+    """
+
+    def __init__(self, browser_manager):
+        self.bm = browser_manager
+
+    def __call__(self, max_results=50) -> ToolResult:
+        try:
+            return ToolResult(True, self.bm.list_network_requests(max_results=max_results))
+        except Exception as e:
+            return ToolResult(False, "", f"List network requests failed: {e}")
+
+
+class BrowserGetNetworkRequestTool:
+    """Inspect a single network request by its index from list_network_requests."""
+
+    def __init__(self, browser_manager):
+        self.bm = browser_manager
+
+    def __call__(self, index: int) -> ToolResult:
+        try:
+            return ToolResult(True, self.bm.get_network_request(index))
+        except Exception as e:
+            return ToolResult(False, "", f"Get network request failed: {e}")

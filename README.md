@@ -4,7 +4,7 @@ A minimal personal coding agent in Python.
 
 ## Features
 
-- **58 Tools**: File operations, terminal management, search, git, sub-agents, skills, a comprehensive browser automation suite, and optional native desktop automation through Cua Driver
+- **62 Tools**: File operations, terminal management, search, git, sub-agents, skills, a comprehensive browser automation suite (including console/network monitoring), and optional native desktop automation through Cua Driver
 - **Absolute Paths**: All file operations use absolute paths — no workspace restrictions
 - **Streaming First**: Tokens print as they arrive; no waiting for full responses
 - **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange. Estimates include message metadata, tool-call arguments, and function-tool schemas; uses ground-truth counts from the API when available (`stream_options={"include_usage": True}`), with tiktoken estimates as fallback
@@ -184,6 +184,10 @@ Skills are stored in `skills/<skill-name>/SKILL.md`. Only skill names are inject
 | `browser_drag(selector_from, selector_to)` | Drag an element to another element (for file uploads, sortable lists, Kanban boards). Smart auto-snapshot. |
 | `browser_drag_xy(x1, y1, x2, y2)` | Drag from one coordinate to another. Smart auto-snapshot. |
 | `browser_switch_frame(frame_selector?)` | Switch into an iframe (including cross-origin via CDP), or back to top-level |
+| `browser_list_console_messages(max_results?)` | List CDP-captured console messages (enables capture on first call). Zero LLM cost. |
+| `browser_get_console_message(index)` | Inspect a single console message by index — full details: level, text, source, URL, line, column |
+| `browser_list_network_requests(max_results?)` | List CDP-captured network requests (enables capture on first call). Zero LLM cost. |
+| `browser_get_network_request(index)` | Inspect a single network request by index — full details: method, URL, status, headers, duration |
 
 ### Native desktop tools
 
@@ -238,7 +242,7 @@ kairos/
 ├── tokens.py               # Token counting with tiktoken (metadata/tools/session/context/turn)
 ├── terminal_manager.py     # Terminal lifecycle (background shells, blocking subprocesses)
 ├── browser_manager.py      # Playwright/CloakBrowser lifecycle in a dedicated worker thread + CDP cross-origin iframe support + smart auto-snapshot
-├── cdp_manager.py          # CDPManager — low-level Chrome DevTools Protocol access (a11y tree, frame detection)
+├── cdp_manager.py          # CDPManager — low-level Chrome DevTools Protocol access (a11y tree, frame detection, console/network monitoring)
 ├── tests/
 │   └── test_compaction.py  # Context accounting and compaction regression tests
 └── tools/
@@ -250,7 +254,7 @@ kairos/
     ├── git.py              # Git subcommand dispatcher
     ├── terminal.py         # Terminal tool wrappers
     ├── subagent.py         # Sub-agent spawn and tracking
-    ├── browser.py          # Browser tool wrappers (30 tools, smart auto-snapshot)
+    ├── browser.py          # Browser tool wrappers (34 tools, smart auto-snapshot, console/network monitoring)
     ├── skills.py           # Skill manager (list, load, write skills)
     └── session.py          # Chat save/load manager
 ```

@@ -55,7 +55,7 @@ Agent2/
         ├── git.py          # GitTool — status, diff, log, commit, branch
         ├── terminal.py     # 5 terminal tool wrappers
         ├── subagent.py     # SubAgentTool — spawn/track child agents
-        ├── browser.py      # 26 browser tool wrappers (scroll, wait, send_keys, search, find, think, index-based, etc.)
+        ├── browser.py      # 34 browser tool wrappers (scroll, wait, send_keys, search, find, think, index-based, console/network monitoring, etc.)
         ├── skills.py       # SkillManager — list, load, write skills
         └── session.py      # SessionManager — isolated ~/.kairos chat stores with legacy fallback loading
 ```
@@ -478,8 +478,15 @@ Low-level Chrome DevTools Protocol access via Playwright's CDP session API.
 | `get_device_pixel_ratio(page)` | `float` | DPR value |
 | `get_cross_origin_iframe_content(page, main_url?)` | `List[Dict]` | A11y content for cross-origin iframes |
 | `evaluate_js(page, expression, frame_id?)` | `Any` | JS evaluation via CDP `Runtime.evaluate` |
+| `enable_console(page)` | `None` | Enable live console capture via `Runtime.consoleAPICalled` |
+| `disable_console(page)` | `None` | Disable console capture and clear buffer |
+| `clear_console_buffer()` | `None` | Clear console messages without disabling capture |
+| `enable_network(page)` | `None` | Enable live network capture via `Network.requestWillBeSent` / `responseReceived` |
+| `disable_network(page)` | `None` | Disable network capture and clear buffer |
+| `clear_network_buffer()` | `None` | Clear network requests without disabling capture |
+| `disable_all(page)` | `None` | Disable all monitoring and clear all buffers |
 
-**CDP session management**: Sessions are cached per-page and reused across operations. A session is tied to the page target, not the URL — navigation does not invalidate it.
+**CDP session management**: Sessions are cached per-page and reused across operations. A session is tied to the page target, not the URL — navigation does not invalidate it. Console and network event callbacks run on Playwright's internal thread and append directly to thread-safe buffers; `BrowserManager` reads them without worker dispatch.
 
 ### `kairos/browser_manager.py` — BrowserManager
 
@@ -524,11 +531,15 @@ Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its en
 - `find_elements(selector, max_results?)` — CSS selector query returning matching elements with index, tag, text, attributes. Zero LLM cost.
 - Tab management: `open_new_tab()`, `switch_tab()`, `list_tabs()`, `close_tab()` (invalidates CDP session on close)
 - `evaluate(expression)` — tries expression directly first, wraps in arrow function on `SyntaxError` fallback; returns JSON-stringified result
+- `list_console_messages(max_results?)` — returns formatted list of CDP-captured console messages (enables Runtime capture on first call)
+- `get_console_message(index)` — returns full details of a single console message
+- `list_network_requests(max_results?)` — returns formatted list of CDP-captured network requests (enables Network capture on first call)
+- `get_network_request(index)` — returns full details of a single network request
 - Frame management: `switch_frame(frame_selector?)` — uses CDP `get_all_frame_ids()` as fallback for cross-origin iframes, stores CDP frame info in `_active_frame_type="cdp"`
 
 **Internal**:
 - `_target()` — returns `_active_frame` if set and is a Playwright Frame; if `_active_frame_type == "cdp"`, falls back to `current_page` (cross-origin content handled by `_get_cross_origin_snapshot_section()`). Returns `current_page` if no frame active.
-- Frame references are cleared on `navigate()`, `go_back()`, `go_forward()`, and `reload()` (both `_active_frame` and `_active_frame_type`).
+- Frame references are cleared on `navigate()`, `go_back()`, `go_forward()`, and `reload()` (both `_active_frame` and `_active_frame_type`). Console and network event buffers are also cleared on these navigation actions.
 - `_post_action(result, pre_fingerprint?, is_navigation?)` — common post-action hook; optionally takes screenshot+snapshot after any interaction.
 - `_detect_new_tab(tabs_before_count)` — compares `len(self._pages)` before/after an action.
 - Snapshot elements are cached in `_last_snapshot_elements` after each `snapshot()` call. Cache is invalidated on `navigate()`, `go_back()`, `go_forward()`, `reload()`, and `switch_tab()` to prevent stale element references across page changes.
@@ -665,7 +676,7 @@ Child token reports use the child's independent `TokenCounter`; they include ses
 
 **Sub-agent restrictions** (enforced in `Agent._get_tool_schema()`):
 - No `spawn_subagent` / `get_subagent_result`
-- No browser tools (19 tools removed)
+- No browser tools (23 tools removed)
 - Has: read, write, edit, search, git, all 5 terminal tools, and 3 skill tools (13 total)
 
 ### `kairos/tools/skills.py` — SkillManager
@@ -724,6 +735,10 @@ Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill n
 | `BrowserDragTool` | `bm.drag(selector_from, selector_to)` — drag-and-drop |
 | `BrowserDragXYTool` | `bm.drag_xy(x1, y1, x2, y2)` — coordinate-based drag |
 | `BrowserSwitchFrameTool` | `bm.switch_frame(frame_selector)` — switch into/out of iframes |
+| `BrowserListConsoleMessagesTool` | `bm.list_console_messages(max_results)` — list CDP-captured console messages |
+| `BrowserGetConsoleMessageTool` | `bm.get_console_message(index)` — inspect a single console message |
+| `BrowserListNetworkRequestsTool` | `bm.list_network_requests(max_results)` — list CDP-captured network requests |
+| `BrowserGetNetworkRequestTool` | `bm.get_network_request(index)` — inspect a single network request |
 
 Each returns `ToolResult`. `BrowserLaunchTool` catches `ImportError` specifically to give installation instructions. Browser launches are always headed and humanized; legacy `headless` and `humanize` values are ignored. Skills directory (`skills/`) is gitignored — skills stay local and are never pushed to GitHub.
 

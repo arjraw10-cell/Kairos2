@@ -576,6 +576,10 @@ class BrowserManager:
             self._current_idx = 0
             self._profile_name = None
             self._cdp.invalidate_all()
+            self._cdp._console_messages.clear()
+            self._cdp._console_enabled = False
+            self._cdp._network_requests.clear()
+            self._cdp._network_enabled = False
             self._last_snapshot_elements = []
             self._worker.stop()
             return "Browser closed."
@@ -603,6 +607,8 @@ class BrowserManager:
         self._active_frame = None
         self._active_frame_type = None
         self._last_snapshot_elements = []
+        self._cdp.clear_console_buffer()
+        self._cdp.clear_network_buffer()
 
         def _do():
             resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -632,6 +638,8 @@ class BrowserManager:
         self._active_frame = None
         self._active_frame_type = None
         self._last_snapshot_elements = []
+        self._cdp.clear_console_buffer()
+        self._cdp.clear_network_buffer()
         try:
             url = self._worker.dispatch(
                 lambda: (page.go_back(wait_until="domcontentloaded"), page.url)[1],
@@ -649,6 +657,8 @@ class BrowserManager:
         self._active_frame = None
         self._active_frame_type = None
         self._last_snapshot_elements = []
+        self._cdp.clear_console_buffer()
+        self._cdp.clear_network_buffer()
         try:
             url = self._worker.dispatch(
                 lambda: (page.go_forward(wait_until="domcontentloaded"), page.url)[1],
@@ -665,6 +675,8 @@ class BrowserManager:
             return "No active page."
         self._active_frame = None
         self._last_snapshot_elements = []
+        self._cdp.clear_console_buffer()
+        self._cdp.clear_network_buffer()
         try:
             url = self._worker.dispatch(
                 lambda: (page.reload(wait_until="domcontentloaded"), page.url)[1],
@@ -1926,6 +1938,102 @@ class BrowserManager:
             return f"Title: {title}\nURL: {url}\nTab: {self._current_idx} of {len(self._pages)}\nProfile: {self._profile_name or '(ephemeral)'}"
         except Exception as e:
             return f"Error: {e}"
+
+    # ------------------------------------------------------------------
+    #  Console & network monitoring (CDP events)
+    # ------------------------------------------------------------------
+
+    def list_console_messages(self, max_results: int = 50) -> str:
+        """Return a formatted list of captured console messages.
+
+        Enables CDP Runtime console capture on first call.
+        """
+        page = self.current_page
+        if not page:
+            return "No active page. Launch the browser first."
+        self._cdp.enable_console(page)
+        msgs = self._cdp._console_messages
+        if not msgs:
+            return "No console messages captured yet."
+        items = msgs[-max_results:]
+        lines = []
+        for i, m in enumerate(msgs):
+            level = m["level"].upper()
+            text = m["text"][:120] + ("..." if len(m["text"]) > 120 else "")
+            url_short = m["url"].split("/")[-1] if m["url"] else ""
+            loc = f" {url_short}:{m['line']}" if m["line"] else ""
+            lines.append(f"[{i}] {level}: {text}{loc}")
+        return "\n".join(lines)
+
+    def get_console_message(self, index: int) -> str:
+        """Return full details of a single console message."""
+        page = self.current_page
+        if not page:
+            return "No active page. Launch the browser first."
+        self._cdp.enable_console(page)
+        msgs = self._cdp._console_messages
+        if index < 0 or index >= len(msgs):
+            return f"Invalid index {index}. Use list_console_messages to see available indices (0–{len(msgs) - 1})."
+        m = msgs[index]
+        lines = [
+            f"Level:  {m['level'].upper()}",
+            f"Text:   {m['text']}",
+            f"Source: {m['source']}",
+            f"URL:    {m['url']}",
+            f"Line:   {m['line']}",
+            f"Column: {m['column']}",
+            f"Time:   {m['timestamp']}",
+        ]
+        return "\n".join(lines)
+
+    def list_network_requests(self, max_results: int = 50) -> str:
+        """Return a formatted list of captured network requests.
+
+        Enables CDP Network capture on first call.
+        """
+        page = self.current_page
+        if not page:
+            return "No active page. Launch the browser first."
+        self._cdp.enable_network(page)
+        reqs = self._cdp._network_requests
+        if not reqs:
+            return "No network requests captured yet."
+        items = reqs[-max_results:]
+        lines = []
+        for i, r in enumerate(reqs):
+            status = str(r["status"]) if r["status"] is not None else "pending"
+            url_short = r["url"][:80] + ("..." if len(r["url"]) > 80 else "")
+            dur = f" {r['duration_ms']}ms" if r["duration_ms"] is not None else ""
+            lines.append(f"[{i}] {r['method']} {status} {url_short}{dur}")
+        return "\n".join(lines)
+
+    def get_network_request(self, index: int) -> str:
+        """Return full details of a single network request."""
+        page = self.current_page
+        if not page:
+            return "No active page. Launch the browser first."
+        self._cdp.enable_network(page)
+        reqs = self._cdp._network_requests
+        if index < 0 or index >= len(reqs):
+            return f"Invalid index {index}. Use list_network_requests to see available indices (0–{len(reqs) - 1})."
+        r = reqs[index]
+        lines = [
+            f"Method:   {r['method']}",
+            f"URL:      {r['url']}",
+            f"Status:   {r['status'] if r['status'] is not None else 'pending'}",
+        ]
+        if r["request_headers"]:
+            lines.append("Request Headers:")
+            for k, v in r["request_headers"].items():
+                lines.append(f"  {k}: {v}")
+        if r["response_headers"]:
+            lines.append("Response Headers:")
+            for k, v in r["response_headers"].items():
+                lines.append(f"  {k}: {v}")
+        if r["duration_ms"] is not None:
+            lines.append(f"Duration: {r['duration_ms']}ms")
+        lines.append(f"Time:     {r['timestamp']}")
+        return "\n".join(lines)
 
 
 # ------------------------------------------------------------------
