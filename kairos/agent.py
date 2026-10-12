@@ -1525,6 +1525,14 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             return None
         return self.compact()
 
+    def clear_stop(self) -> None:
+        """Drop a stop that arrived after the run it targeted had finished.
+
+        Only for hosts that know no run is executing (the gateway calls it
+        between runs); a stop meant for a running request must stay set.
+        """
+        self._interrupt_event.clear()
+
     def interrupt(self):
         """Request an immediate hard stop of the current request.
 
@@ -1955,11 +1963,12 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         self.drain_background_events()
         self._setup_system_prompt()
         self.tokens = TokenCounter(self.model, self.spec.context_window, self.spec.pricing)
-        if self.browser_manager.is_open:
-            try:
-                self.browser_manager.close()
-            except Exception:
-                pass
+        # Unconditionally: the browser worker can be alive without an open
+        # window (failed launch, window closed by hand).
+        try:
+            self.browser_manager.close()
+        except Exception:
+            pass
         try:
             self.desktop_manager.reset()
         except Exception:

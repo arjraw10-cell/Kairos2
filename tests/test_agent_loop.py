@@ -262,3 +262,23 @@ class ToolErrorTests(ProviderConfigMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostStopAndResetTests(ProviderConfigMixin, unittest.TestCase):
+    def test_clear_stop_drops_a_stale_stop(self):
+        # The gateway calls clear_stop() when a stop arrives after its run ended,
+        # so the next run is not cancelled by it.
+        agent = Agent(self.workspace)
+        agent.interrupt()
+        self.assertTrue(agent._interrupt_event.is_set())
+        agent.clear_stop()
+        self.assertFalse(agent._interrupt_event.is_set())
+
+    def test_reset_closes_the_browser_even_without_an_open_window(self):
+        # The browser worker can be alive with no window (failed launch, window closed by hand).
+        agent = Agent(self.workspace)
+        closed = []
+        agent.browser_manager.close = lambda: closed.append(True)
+        self.assertFalse(agent.browser_manager.is_open)
+        agent.reset()
+        self.assertEqual(closed, [True])

@@ -846,13 +846,10 @@ class GatewayManager:
 
     @staticmethod
     def _clear_stale_stop(agent: Agent) -> None:
-        # Agent has no public way to drop a pending stop; this mirrors the
-        # reset at the end of Agent.run.
-        event = getattr(agent, "_interrupt_event", None)
-        if event is not None:
-            event.clear()
-        if hasattr(agent, "_stop_requested"):
-            agent._stop_requested = False
+        # Minimal test agents may not implement clear_stop().
+        clear = getattr(agent, "clear_stop", None)
+        if clear is not None:
+            clear()
 
     async def cancel_run(self, run_id: str) -> bool:
         run = self.repository.get_run(run_id)
