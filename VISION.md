@@ -47,7 +47,7 @@ Folders: `Documents\Kairos` is `v4-claude-standby` and is on PATH (`kairos`, `ka
 | Browser | Done |
 | Computer use (Cua Driver) | Done |
 | Gateway | Done; owns conversations, runtimes, per-conversation model settings and wake runs |
-| Terminal CLI | Done: a client of the gateway by default, `--offline` runs the agent in-process. Rich frontend (`cli.py`); the old Textual frontend (`temp_cli.py`) is still in the repo but unused. |
+| Terminal CLI | Done: a client of the gateway by default, `--offline` runs the agent in-process. Rich frontend (`cli.py`); the old Textual frontend was removed. |
 | Models | Done: direct OpenAI (Responses), OpenRouter (Chat Completions) and Anthropic (Messages) formats in `provider.json`, key rotation, per-conversation model and effort. Anthropic is unit-tested only, never called live; no prompt caching yet. |
 | Web search | Done (Tavily; falls back to the browser) |
 | Workspaces | Done: no path means a fresh folder in `Documents\kairos_workspace` |
@@ -55,6 +55,8 @@ Folders: `Documents\Kairos` is `v4-claude-standby` and is on PATH (`kairos`, `ka
 | Desktop app | Exists for gateway v1 (old `main`); not ported to v2 |
 | Phone app | Not started |
 | Long-term memory | Not started |
+
+An audit of `v4-claude-standby` by three independent reviewers found about 50 issues, including a critical one: any web page could drive the loopback gateway (cross-site requests, DNS rebinding). All were fixed, each with a regression test; the gateway now refuses cross-site and rebinding requests and will not listen beyond loopback without `KAIROS_AUTH_TOKEN`.
 
 A dedicated chatbot mode is no longer planned: the agent already answers everyday questions with `web_search` and the browser, and a conversation without a workspace gets its own fresh folder.
 
@@ -64,7 +66,7 @@ A dedicated chatbot mode is no longer planned: the agent already answers everyda
 2. **Desktop app on gateway v2.** Port the Electron + React app from old `main` to the v2 API, using `ui/index.html` as the design reference.
 3. **Phone access.** Expose the gateway over Tailscale (already used between my machines) with `KAIROS_AUTH_TOKEN`, and build the phone client. The simplest option is a mobile web app (PWA) served by the gateway itself; a native app can come later.
 4. **Anthropic live testing.** Run the Anthropic format against the real API once there is a key, then consider prompt caching to stretch the API credits.
-5. **Polish.** One install guide that works on any of my machines, a test run before merging, removing the unused Textual frontend, and retiring `kairos_old` once the new CLI has fully replaced it.
+5. **Polish.** One install guide that works on any of my machines, a test run before merging, and retiring `kairos_old` once the new CLI has fully replaced it.
 
 ## Open decisions
 

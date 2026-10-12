@@ -10,7 +10,7 @@ Read `VISION.md` for the full vision, the branch map, current status, and the or
 
 ## Overview
 
-Kairos is a minimal coding agent written in Python. It talks to models directly through provider adapters (OpenAI Responses, OpenAI-compatible Chat Completions, Anthropic Messages) configured in `provider.json`, with streaming and function calling, and works through 52 tools (28 for sub-agents), including web search, a stealth browser and optional native desktop automation through Cua Driver. A FastAPI gateway owns conversations and Agent runtimes; the CLI is a WebSocket client of it by default, and `--offline` runs the Agent in the CLI process. Sub-agents and background terminal commands run in the background and wake the agent when they finish; the agent never polls. All file operations use absolute paths — no workspace containment.
+Kairos is a minimal coding agent written in Python. It talks to models directly through provider adapters (OpenAI Responses, OpenAI-compatible Chat Completions, Anthropic Messages) configured in `provider.json`, with streaming and function calling, and works through 52 tools (28 for sub-agents), including web search, a stealth browser and optional native desktop automation through Cua Driver. A FastAPI gateway owns conversations and Agent runtimes; the CLI is a WebSocket client of it by default, and `--offline` runs the Agent in the CLI process. Sub-agents and background terminal commands run in the background and wake the agent when they finish; the agent never polls. Relative paths in the file tools resolve against the conversation's workspace and terminals start there; absolute paths reach anywhere — there is no workspace containment.
 
 ## Project Structure
 
@@ -18,7 +18,6 @@ Kairos is a minimal coding agent written in Python. It talks to models directly 
 Kairos/
 ├── main.py                 # Root entry point (kairos.main.main)
 ├── gateway_main.py         # Gateway shim (kairos.gateway_main.main)
-├── run_temp_cli.py         # Textual frontend launcher (legacy, in-process Agent)
 ├── kairos.bat              # CLI on the gateway; starts the gateway when /healthz does not answer
 ├── kairos_offline.bat      # CLI with the Agent in-process (--offline)
 ├── provider.example.json   # Template for provider.json
@@ -43,7 +42,7 @@ Kairos/
     ├── gateway/            # SQLite-backed runtime manager and FastAPI REST/WebSocket protocol
     │   ├── protocol.py     # Command names, ack/error/event envelopes
     │   ├── models.py       # Conversation, Run, StoredMessage
-    │   ├── repository.py   # SQLite persistence (schema v4)
+    │   ├── repository.py   # SQLite persistence (schema v4), DataDirLock
     │   ├── manager.py      # GatewayManager: runtimes, runs, wake scheduling, model settings
     │   ├── server.py       # FastAPI app: REST routes + /api/v1/ws
     │   └── history.py      # Gateway history repair for load/continue
@@ -58,14 +57,13 @@ Kairos/
     ├── resume.py           # Shared saved-history repair and mid-execution resume logic
     ├── config.py           # Environment settings (cached)
     ├── agent.py            # Core agent: streaming, tool dispatch, background events, compaction, model selection
-    ├── temp_cli.py         # Textual frontend (legacy)
     ├── tokens.py           # TokenCounter using tiktoken
     ├── terminal_manager.py # Blocking and persistent background terminals, `until` matches, stop_command
     ├── browser_manager.py  # CloakBrowser via async Playwright on a worker thread: AI snapshots, refs, diff snapshots, dialogs, profiles
     ├── desktop_manager.py  # Cua Driver daemon/CLI wrapper
     └── tools/
         ├── __init__.py     # Imports and re-exports all tools
-        ├── base.py         # ToolResult(success, output, error?, image_url?)
+        ├── base.py         # ToolResult(success, output, error?, image_url?), resolve_path
         ├── read.py         # ReadTool — text + image files
         ├── write.py        # WriteTool — create/overwrite files
         ├── edit.py         # EditTool — strict find-and-replace (must match exactly once)
@@ -88,7 +86,7 @@ Kairos/
 
 `main.py` calls `kairos.main.main()`; `gateway_main.py` calls `kairos.gateway_main.main()`.
 
-`kairos.bat` is the standard launcher (its folder is on PATH). It keeps the caller's current folder and passes all arguments through (`kairos`, `kairos .`, `kairos <path>`). It reads `KAIROS_GATEWAY_HOST`/`KAIROS_GATEWAY_PORT` from the environment (defaults `127.0.0.1:8765`; `0.0.0.0`/`::` are probed as `127.0.0.1`), probes `/healthz` with `curl.exe`, and when that fails starts `py -m kairos.gateway_main` in a minimized "Kairos Gateway" window from the repository folder and waits for health (curl retries, about 40 s at most). It then runs `py main.py %*`.
+`kairos.bat` is the standard launcher (its folder is on PATH). It keeps the caller's current folder and passes all arguments through (`kairos`, `kairos .`, `kairos <path>`). It reads `KAIROS_GATEWAY_HOST`/`KAIROS_GATEWAY_PORT` from the environment (defaults `127.0.0.1:8765`; `0.0.0.0`/`::` are probed as `127.0.0.1`), probes `/healthz` with `curl.exe`, and when that fails starts `cmd /k py -m kairos.gateway_main` in a minimized "Kairos Gateway" window from the repository folder (`cmd /k` keeps the window, and its error, open when the gateway exits) and waits for health (30 curl retries a second apart, about 30 s). It then runs `py main.py %*`.
 
 `kairos_offline.bat` runs `py main.py --offline %*` (no gateway).
 
@@ -124,7 +122,7 @@ Kairos keeps its conversation history in Chat Completions shape. An adapter tran
 
 - `("text", delta)`
 - `("tool_call", index, call_id, name, arguments_delta)` — id/name may be empty on continuation deltas
-- `("usage", prompt_tokens, completion_tokens)`
+- `("usage", prompt_tokens, completion_tokens, cached_tokens)` — `cached_tokens` is the part of the prompt served from the provider's cache
 - `("message_extra", key, value)` — provider state kept on the assistant message under a private `_` key
 
 Each adapter has `stream(messages, tools, effort) -> EventStream`; `EventStream.close()` closes the HTTP stream from another thread (hard stop). `create_adapter(spec)` picks the adapter by `spec.format`.
@@ -163,7 +161,7 @@ Setups in `provider.example.json` and their verified efforts:
 
 **`responses.py`**: `ResponsesAdapter` translates history to Responses input items (tool calls become `function_call` items whose `call_id` is the Chat `tool_call_id`, tool results become `function_call_output`, `text`/`image_url` parts become `input_text`/`input_image`), flattens tool definitions, sends effort as `reasoning={"effort": ...}`, and normalizes `response.*` stream events. `response.failed` and `error` events raise `ProviderError`.
 
-**`anthropic.py`**: `AnthropicAdapter` posts to `<base_url>/v1/messages` with raw `httpx` (no SDK; `anthropic-version: 2023-06-01`, `max_tokens` 32,000). System messages move to `system`, tool results become `tool_result` blocks, consecutive same-role turns are merged, data-URL images become base64 image blocks. With an effort it sends `thinking={"type": "adaptive"}` and `output_config={"effort": ...}`; thinking blocks (with signatures) are returned as `message_extra` under `_thinking` and echoed back on the next request. `overloaded_error` maps to status 529. This adapter is unit-tested against recorded streams but has not been called against the live API.
+**`anthropic.py`**: `AnthropicAdapter` posts to `<base_url>/v1/messages` with raw `httpx` (no SDK; `anthropic-version: 2023-06-01`, `max_tokens` 32,000) through one process-wide `httpx.Client` shared by every adapter (a test transport gets its own); closing the streamed response releases a blocked read on hard stop. System messages move to `system`, tool results become `tool_result` blocks, consecutive same-role turns are merged, data-URL images become base64 image blocks. With an effort it sends `thinking={"type": "adaptive"}` and `output_config={"effort": ...}`; thinking blocks (with signatures) are returned as `message_extra` under `_thinking` and echoed back on the next request. `overloaded_error` maps to status 529. This adapter is unit-tested against recorded streams but has not been called against the live API.
 
 ### `kairos/main.py` — CLI Entry Point
 
@@ -174,7 +172,7 @@ Setups in `provider.example.json` and their verified efforts:
 **Commands** (`COMMANDS`): `/quit /clear /reset /compact /resume /model /effort /stop`. `parse_command()` treats only a first word made of letters as a command, so `/etc/hosts ...` goes to the agent; unknown commands are reported instead of being sent. Paste tokens are resolved before command dispatch (`_resolve_paste_input`), so a pasted `/quit` works. A message that is only an image is sent as "Describe this image."
 
 - `/reset`: new conversation (same workspace if one was given, otherwise a new fresh folder); `/model`/`/effort` choices carry over.
-- `/resume [N]`: numbered picker. With an explicit workspace it lists that workspace's conversations; without one it lists conversations in all fresh folders (they are siblings). If the chosen conversation ended mid-turn, it continues with `Continue where you left off. Pick up the next step.`
+- `/resume [N]`: numbered picker. With an explicit workspace it lists that workspace's conversations; without one it lists conversations in all fresh folders (they are siblings), and the chosen one continues in its own folder (offline: read from the saved system prompt's `Your current workspace is: ...` line). If the chosen conversation ended mid-turn, it continues with `Continue where you left off. Pick up the next step.`
 - `/model`: lists setups and asks for a number or name; `/model <N|name>` picks directly; `/model <model-id> <openai|anthropic|openrouter>` uses an ad-hoc model on that provider. Effort resets to the new model's default.
 - `/effort`: shows the current effort and allowed values; `/effort <level>` sets it (validated against the setup).
 - `/stop`: terminates all running sub-agents.
@@ -183,12 +181,10 @@ Setups in `provider.example.json` and their verified efforts:
 
 **Backends** (same interface; both feed the same event names to `CLI.handle_event`):
 
-- `GatewayBackend` (default): connects a `GatewayClient`, creates a conversation (`conversation.create` with or without `workspace`) and subscribes to its events. A message is `message.send` (source `cli`); its run's events are rendered until a `run.*` end event. Esc sends `run.cancel` and abandons the run; control commands (`/compact`, `/reset`, `/resume`, `/model`, `/effort`) first wait up to 30 s for abandoned runs to end (`_settle`). `/resume` uses `conversation.load` and its `needs_continue` flag, then `conversation.continue`. `/model` uses `model.list` and `conversation.configure`; `/stop` uses `subagent.stop_all`. A pump thread reads events while the CLI is not waiting on its own run: `background.notification` events (not marked `in_run`) are collected for the next wake header, a `run.started` with origin `wake` starts a wake turn, `subagent.status` and `wake.paused` are rendered. Esc at the prompt during a wake turn sends `run.interrupt` (`stop_wake`).
-- `OfflineBackend` (`--offline`): builds `Agent(workspace)` in-process and maps its callbacks to the gateway's event names. Chats are saved with `SessionManager` (store keyed to the workspace, or to `~/Documents/kairos_workspace` when no path was given); auto-save every 60 s and on SIGTERM/SIGHUP. One agent run at a time (`_agent_lock`). It runs its own `WakeScheduler`: idle background events start a wake turn whose input is `wake.format_notifications(events)` (the same as gateway wake runs); a user message calls `user_message_sent()` and hands the scheduler's pending events to `agent.add_background_events()`. `/reset` and `/resume` drop pending results of the old conversation. On exit it stops sub-agents, closes terminals and the browser.
+- `GatewayBackend` (default): connects a `GatewayClient`, creates a conversation (`conversation.create` with or without `workspace`) and subscribes to its events. A message is `message.send` (source `cli`); its run's events are rendered until a `run.*` end event. The starting command (`message.send`, `conversation.continue`) is sent from a helper thread (`_start`), so Ctrl+C at any point of a run, also while sending or while an event renders, sets `stop`. Esc or Ctrl+C sends `run.cancel` and abandons the run; control commands (`/compact`, `/reset`, `/resume`, `/model`, `/effort`) first wait up to 30 s for abandoned runs to end (`_settle`). `/resume` uses `conversation.load` and its `needs_continue` flag, then `conversation.continue`. `/model` uses `model.list` and `conversation.configure`; `/stop` uses `subagent.stop_all`. A pump thread reads events while the CLI is not waiting on its own run: `background.notification` events (not marked `in_run`) are collected for the next wake header, a `run.started` with origin `wake` starts a wake turn, `subagent.status` and `wake.paused` are rendered. Esc at the prompt during a wake turn sends `run.interrupt` (`stop_wake`).
+- `OfflineBackend` (`--offline`): builds `Agent(workspace)` in-process and maps its callbacks to the gateway's event names. Chats are saved with `SessionManager` (store keyed to the workspace, or to `~/Documents/kairos_workspace` when no path was given); auto-save every 60 s (a failed save is logged and auto-saving continues), on SIGTERM/SIGHUP, and on Windows when the console window closes, at logoff or shutdown (`SetConsoleCtrlHandler`). One agent run at a time (`_agent_lock`). It runs its own `WakeScheduler`: idle background events start a wake turn whose input is `wake.format_notifications(events)` (the same as gateway wake runs); a user message calls `user_message_sent()` and hands the scheduler's pending events to `agent.add_background_events()`. `/reset` and `/resume` drop pending results of the old conversation. On exit, and when a `/reset` without a path or a `/resume` moves to another folder (a new Agent), `_close_agent` stops sub-agents, closes terminals, the browser (also when no window is open) and the desktop manager.
 
 `_status_text()` shows `model · effort` at the right of the prompt (empty if the gateway lacks `conversation.configure`). In gateway mode a lost connection ends the REPL; failing to connect at startup suggests `kairos.bat` or `kairos_offline.bat`. Ctrl+C or Ctrl+D at the prompt exits.
-
-`kairos.main._sanitize_history_for_resume` remains a compatibility alias of `kairos.resume.sanitize_history_for_resume`.
 
 ### `kairos/gateway_client.py` — GatewayClient
 
@@ -202,13 +198,13 @@ Synchronous WebSocket client built on `websockets.sync.client`. `gateway_url()` 
 
 **Output**: `print_banner(workspace, mode)` prints one line (`KAIROS  <mode>  <workspace>`). Info lines are dim; error text is printed as `Text` (not markup), in a red panel when multi-line. Tool calls print `→ <summary>`; `print_token_status(data)` prints `kairos.tokens.format_status_line(data)`: `Context Z% · N / W tokens · this call: O out · session: I in / O out · $cost` (`cost n/a` when the setup has no pricing).
 
-**Streaming**: `start_stream()` opens a Rich `Live` with a `_StreamView`, which renders the grey panel from the CLI's text at render time and, while streaming, shows only the bottom lines that fit the terminal (long replies keep scrolling; text wraps at word boundaries). `finish_stream()` leaves the grey trace (tool-call preamble); `finalize_stream_as_response()` turns the panel into a green `KairosMarkdown` panel. `finish_turn(outcome, payload)` prints the response, an error, or "Interrupted."
+**Streaming**: `start_stream()` opens a Rich `Live` with a `_StreamView`, which renders the grey panel from the CLI's text at render time and, while streaming, shows only the bottom lines that fit the terminal (long replies keep scrolling; text wraps at word boundaries). `finish_stream()` leaves the grey trace (tool-call preamble); `finalize_stream_as_response()` turns the panel into a green `KairosMarkdown` panel. `finish_turn(outcome, payload, wake=False)` prints the response (unless the stream already printed it), an error, or "Interrupted."; user turns and wake turns keep separate "already printed" flags, so a wake turn starting right after a streamed reply cannot make that reply print twice.
 
 **`handle_event(event, data)`** (thread-safe, shared by both modes): `assistant.stream_started`, `assistant.token`, `assistant.stream_ended`, `tool.started`, `token.updated`, `conversation.compacted`, `wake.started`, `wake.ended`, `wake.paused`, `subagent.status`, `subagent.list`.
 
 **Background rendering while the prompt is open**: while a prompt is open, `console.file` is an `_AbovePrompt`, which prints each flush above the prompt with prompt_toolkit's `run_in_terminal`, so the user's half-typed text stays. A wake turn prints a header such as `» woke: sub-agent a3f2 finished` (`describe_notification`), streams its reply in a preview above the input (up to `PREVIEW_HEIGHT` lines) and ends with the usual green panel. Esc at the prompt during a wake turn calls `on_prompt_escape` (the backend's `stop_wake`). Running sub-agents are listed in the bottom toolbar, one line each (`● <id>  running  <current tool>  <elapsed>`, refreshed every second); finished ones drop off. `wake.paused` prints `paused auto-wake: N background results will be sent with your next message`.
 
-**Prompt**: `get_user_input(prefix="kairos> ", status="")` shows `status` right-aligned (`rprompt`). `ask(label)` and `pick_session(sessions, initial_choice)` (the `/resume` picker; re-prompts on invalid input) take complete lines typed during the response-to-prompt handoff.
+**Prompt**: `get_user_input(prefix="kairos> ", status="")` shows `status` right-aligned (`rprompt`). `ask(label)` and `pick_session(sessions, initial_choice)` (the `/resume` picker; re-prompts on invalid input) prompt the same way. Every prompt is pre-filled with text typed while the last turn ran (`_take_pending_input()`); it is never sent on its own, and several typed lines become one message when the user presses Enter.
 
 **Paste system** (module-level):
 - `_paste_registry: Dict[str, dict]` — maps tokens to `{type: "text"|"image", ...}`; `_make_text_token()` / `_make_image_token()` create `(Pasted Text #N)` / `(Pasted Image #N)`; counters reset per prompt
@@ -220,7 +216,7 @@ Synchronous WebSocket client built on `websockets.sync.client`. `gateway_url()` 
 
 **Clipboard helpers**: `_read_system_clipboard()` (Windows: `CF_UNICODETEXT` through the Win32 API via `ctypes`; macOS `pbpaste`; Linux `xclip`), `_check_clipboard_has_image()` (Windows: PowerShell + `System.Windows.Forms.Clipboard`; macOS `pngpaste`; Linux `xclip`), `_detect_mime()`, `_image_data_to_url()`.
 
-**Escape listener** (during a turn): `start_escape_listener(on_escape)` / `stop_escape_listener()` (joins the thread before the prompt owns stdin). Ordinary characters typed meanwhile are buffered (`_take_pending_input_for_prompt()` returns a complete line or pre-fills a partial one). Windows: `msvcrt.kbhit()`/`getwch()`; Unix: `tty.setcbreak()` + `select` + `os.read()`.
+**Escape listener** (during a turn): `start_escape_listener(on_escape)` / `stop_escape_listener()` (joins the thread before the prompt owns stdin). Ordinary characters typed meanwhile are buffered for the next prompt: Backspace removes the last buffered character, and on Windows arrow/function keys (a `\x00`/`\xe0` prefix plus a code) are dropped. Windows: `msvcrt.kbhit()`/`getwch()`; Unix: `tty.setcbreak()` + `select` + `os.read()`.
 
 ### `kairos/wake.py` — Wake Scheduling
 
@@ -238,7 +234,9 @@ Synchronous WebSocket client built on `websockets.sync.client`. `gateway_url()` 
 
 ### `kairos/resume.py` — Saved-history Repair
 
-`sanitize_history_for_resume(history)` returns `(history_or_none, last_agent_content, is_mid_execution)`. It anchors the decision at the latest real user request, ignoring agent-generated user messages (screenshot injections, `[Conversation compacted`, `[Background notification]`, and the older `Background terminal notifications arrived` prefix), so an older clean response cannot hide a newer interrupted request. A clean assistant reply after that request is the resume point; otherwise trailing screenshot injections are removed and `_repair_trailing_tool_chain()` keeps matching tool results in call order, adds synthetic failed results for missing calls and removes orphans. Used by the offline CLI and the Textual frontend; the gateway has its own variant in `kairos/gateway/history.py`.
+`sanitize_history_for_resume(history)` returns `(history_or_none, last_agent_content, is_mid_execution)`. It anchors the decision at the latest real user request, ignoring agent-generated user messages (screenshot injections, `[Conversation compacted`, `[Background notification]`, and the older `Background terminal notifications arrived` prefix), so an older clean response cannot hide a newer interrupted request. A clean assistant reply after that request is the resume point; otherwise trailing screenshot injections are removed and `_repair_trailing_tool_chain()` keeps matching tool results in call order, adds synthetic failed results for missing calls and removes orphans. Used by the offline CLI; the gateway has its own variant in `kairos/gateway/history.py`.
+
+`repair_tool_chains(history)` applies the same repair to every chain in the history, in place: each assistant `tool_calls` message is followed by exactly one result per call in call order (missing ones synthesized), and tool messages that answer no preceding call are removed. It returns the number of fixes (0 when the history was valid). The Agent runs it before every request.
 
 ### `kairos/agent.py` — Agent (Core)
 
@@ -247,23 +245,24 @@ Synchronous WebSocket client built on `websockets.sync.client`. `gateway_url()` 
 **Constructor**: `Agent(workspace: str, setup: Optional[str] = None)`
 - Resolves `setup` (the default setup when None) to `self.spec`, creates `self.adapter`, sets `self.model` and `self.effort = spec.default_effort`
 - `self.tokens = TokenCounter(model, spec.context_window, spec.pricing)` (`set_model` updates both); `self.cwd = Path(workspace).resolve()`
-- Creates the tool instances, `SubAgentTool`, `BrowserManager` and the 19 `BrowserTool`s plus `BrowserScreenshotTool`, `DesktopManager` and the desktop tools, and `SkillManager(<workspace>/skills)`
+- Creates the tool instances (`ReadTool`, `WriteTool`, `EditTool` and `SearchTool` get the workspace; `TerminalManager(cwd=workspace)`), `SubAgentTool`, `BrowserManager` and the 19 `BrowserTool`s plus `BrowserScreenshotTool`, `DesktopManager` and the desktop tools, and `SkillManager(<workspace>/skills)`
 - Sets itself as the terminal manager's completion callback and builds the system prompt
 
 **Key attributes**:
 - `spec`, `adapter`, `model`, `effort` — model access (replaced by `set_model()`)
 - `cwd` — workspace path (`Path`); `tokens` — `TokenCounter`; `conversation_history` — `List[Dict]` (starts with the system prompt)
 - `max_tool_result_chars` — `Config.MAX_TOOL_RESULT_CHARS()`
-- `_interrupt_event` — hard-stop `threading.Event`; `_stop_requested` — retained for compatibility
+- `_interrupt_event` — hard-stop `threading.Event`
 - `_is_processing` — True while `run()` is active (guarded by `_processing_lock`)
 - `_background_events` — background events held by the Agent (see below)
+- `_api_context` — `(prompt_tokens, history length)` of the last request that reported usage (None after compaction or reset)
 - `_is_subagent` — True for sub-agents (no browser or sub-agent tools)
 - `terminal_manager`, `browser_manager`, `desktop_manager`, `skill_manager`
 - `subagent_tool` — `SubAgentTool` (None in a sub-agent)
 
 **Callbacks** (set by the host; all optional):
 - `on_stream_start()`, `on_stream_token(token)`, `on_stream_end(content, has_tool_calls)`
-- `on_tool_call(name, args)`, `on_tool_result(name, result_dict, result_json)`
+- `on_tool_call(name, args)`, `on_tool_result(name, result_dict, result_json)` — exceptions they raise are swallowed, so an observer cannot break tool execution
 - `on_token_update(counter)` — after each completed API turn
 - `on_compact(message)` — compaction and history-repair notices, empty-response retries
 - `on_background_event(event)` — fires whether or not a run is active; event: `{"id", "kind", "subagent_id"?, "terminal_id"?, "text", "created_at", "in_run"?}`; kinds `subagent_finished`, `subagent_failed`, `terminal_finished`, `terminal_matched`
@@ -277,16 +276,19 @@ Sub-agent results (`SubAgentTool` `on_event`) and terminal events (`_on_terminal
 - **During a run** (`_is_processing`) the event is appended to `_background_events` and passed to `on_background_event` with `in_run: True`. `step()` drains the queue before each API request and appends one `[Background notification]` user message (after the real user message when there is one).
 - **While idle** with a host callback, only the host receives it (gateway/offline `WakeScheduler`: wake run, or the next user message). Without a host callback, it waits in `_background_events` for the next run.
 - `_finish_run_unless_background()` checks the queue and clears `_is_processing` under one lock, so an event arriving during the final step either continues the same run (one more step) or goes to the host — never both, never lost.
+- When a run ends by error, stop or empty response, `_end_run()` hands the events it did not show the model back to `on_background_event` (the host ignored them while they were `in_run`, so they now wake the agent); without a host callback they stay queued for the next run. `reset()` clears the queue.
 
 Host API: `add_background_events(events)` (hand events to the next run), `drain_background_events()`, `has_background_work()` (running sub-agents or background commands), `stop_subagents()` (the user's `/stop`), `subagent_statuses()`, `is_processing`.
 
 #### Immediate stop
 
-`interrupt()` / `request_stop()` set the hard-stop event, close the active provider stream, kill blocking terminal commands (`TerminalManager.cancel_active_commands()`), and cancel the in-flight browser and desktop calls. The worker checks the event before/during streaming and between tools. Tool results are checkpointed one by one, so completed calls survive. It does not stop sub-agents. After an interrupt, `run()` returns `[Interrupted]` and the next request is wrapped as "The previous request was interrupted before it finished. Continue that work, taking this new instruction into account: ...", with the trailing tool chain repaired first.
+`interrupt()` sets the hard-stop event, closes the active provider stream (also the compaction summary stream), kills blocking terminal commands (`TerminalManager.cancel_active_commands()`), and cancels the in-flight browser and desktop calls. The worker checks the event before/during streaming, while opening a stream, and between tools. Tool results are checkpointed one by one, so completed calls survive. It does not stop sub-agents. A stop already pending when `run()` starts makes it return `[Stopped — waiting for your input]`; any later stop returns `[Interrupted]`, and the next request is wrapped as "The previous request was interrupted before it finished. Continue that work, taking this new instruction into account: ...", with the trailing tool chain repaired first. `clear_stop()` drops a stop that arrived after its run finished; it is only for hosts that know no run is executing (the gateway calls it between runs).
 
 #### System Prompt (`_setup_system_prompt`)
 
-Sections: base instructions (role, absolute paths, tool failures, AGENTS.md handling), Terminal Tools, Background Work (notifications arrive as `[Background notification]`; never poll, sleep or wait), Tool Result Limits, Web Search, Browser Tools, Native Desktop Tools, and the workspace path. Then the workspace's `AGENTS.md` (if present) under `## AGENTS.md (Architecture Documentation)`, and the skill names from `skills/` (or a note that none exist).
+Sections: base instructions (role, filesystem access — the text still says all paths must be absolute, although relative paths now resolve against the workspace — tool failures, AGENTS.md handling), Terminal Tools, Background Work (notifications arrive as `[Background notification]`; never poll, sleep or wait), Tool Result Limits, Web Search, Browser Tools, Native Desktop Tools, and the workspace path. Then the workspace's `AGENTS.md` (if present) under `## AGENTS.md (Architecture Documentation)`, and the skill names from `skills/` (or a note that none exist).
+
+Sub-agents get their own variant (`_is_subagent`; `SubAgentTool._create_sub_agent` rebuilds the prompt after marking the Agent): no browser section or browser mention, no sub-agent notifications, its final message is its result for the parent agent, and background notifications reach it only while it is still working.
 
 #### Tool Schema (`_get_tool_schema()`)
 
@@ -294,31 +296,31 @@ Sections: base instructions (role, absolute paths, tool failures, AGENTS.md hand
 
 #### Tool Execution (`_execute_tool(name, args)`)
 
-A dispatch dict maps names to lambdas. Unknown tools return an error. Sub-agent tools called from a sub-agent are refused ("Sub-agents cannot spawn, message, terminate or list sub-agents."). A missing required argument (a `KeyError` from the lambda) returns `Missing required argument 'x' for tool y. Call it again with that argument.` Other exceptions return their text. Every result is capped by `_cap_tool_result()`: text `output`/`error` are limited to 20,000 characters by default (error to 4,000), oversized text keeps its beginning and end with a marker giving the original length, and `image_url` is not counted.
+A dispatch dict maps names to lambdas. Unknown tools return an error. Sub-agent tools called from a sub-agent are refused ("Sub-agents cannot spawn, message, terminate or list sub-agents."). A `KeyError` from the lambda for a parameter the tool's schema declares and the call omitted returns `Missing required argument 'x' for tool y. Call it again with that argument.`; any other `KeyError` (e.g. a bad value) returns `KeyError: 'x'`. Other exceptions return their text. Every result is capped by `_cap_tool_result()`: text `output`/`error` are limited to 20,000 characters by default (error to 4,000), oversized text keeps its beginning and end with a marker giving the original length, and `image_url` is not counted.
 
 #### Tool Summaries (`_tool_summary(name, args)`)
 
-Static method returning a one-line summary per tool call (CLI display, gateway `tool.started`, sub-agent `recent_actions`).
+Static method returning a one-line summary per tool call (CLI display, gateway `tool.started`, sub-agent `recent_actions`). It wraps the module-level `_summarize_tool_call()` and never raises: non-dict arguments count as `{}`, and any failure returns the tool name.
 
 #### Streaming (`_stream_response()`)
 
-Returns `(content, tool_calls, api_usage)`. Calls `adapter.stream(messages, tools, effort)` and consumes the normalized events: text deltas go to `on_stream_token`, tool-call deltas are accumulated by index, `usage` becomes `api_usage`, `message_extra` values are attached to the assistant message by `step()`. Arguments are parsed as JSON (`{}` on failure).
+Returns `(content, tool_calls, api_usage)`. `_with_retries(_stream_once)`: each attempt opens the stream with `_open_stream()` (registers it so `interrupt()` can close it) and closes it with `_close_stream()`, and consumes the normalized events: text deltas go to `on_stream_token`, tool-call deltas are accumulated by index, `usage` becomes `api_usage`, `message_extra` values are attached to the assistant message by `step()`. Arguments are parsed as JSON (`{}` on failure).
 
-**Retries**: an initial attempt plus two retries (`API_MAX_RETRIES = 2`) with exponential backoff for retryable errors: `RateLimitError`, `APIConnectionError`, `httpx.TransportError`, status 429/500/502/503/504/529 (OpenAI SDK or `ProviderError`), and timeout/connection/network/`RemoteProtocolError`/incomplete-chunk messages. Retries cover opening and iterating the stream; a partial stream is closed in the UI and discarded. When attempts are exhausted it raises `APIRequestError` with `_format_api_error()` text: `API Error: <type>`, message, status/request ID when present, a hint (keys in `provider.json`, rate limit, connection), and the setup, provider, format, model and base URL. No traceback.
+**Retries**: an initial attempt plus two retries (`API_MAX_RETRIES = 2`) with exponential backoff for retryable errors: `RateLimitError`, `APIConnectionError`, `httpx.TransportError`, status 429/500/502/503/504/529 (OpenAI SDK or `ProviderError`), and timeout/connection/network/`RemoteProtocolError`/incomplete-chunk messages. Retries cover opening and iterating the stream; a partial stream is closed in the UI and discarded. `_with_retries` is shared with the compaction summary request. When attempts are exhausted it raises `APIRequestError` with `_format_api_error()` text: `API Error: <type>`, message, status/request ID when present, a hint (keys in `provider.json` for `AuthenticationError` or status 401, rate limit for `RateLimitError` or 429 — including `ProviderError`s — or connection), and the setup, provider, format, model and base URL. No traceback.
 
 #### Step (`step(user_message?, image_url?)`)
 
 Returns `(response_text | None, tool_calls_made)`.
 1. Drains background events; appends the user message (vision content when `image_url` is given) and then any `[Background notification]` message
-2. Normalizes legacy tool results and validates history (`on_compact` reports repairs)
-3. `tokens.start_turn()` (history + tool schema), `_stream_response()`, then `set_turn_from_api()` with API usage or tiktoken estimates
+2. Normalizes legacy tool results and validates history (`on_compact` reports repairs); there is no stop check before the user message is appended, so a stop arriving now finds the message in history
+3. `tokens.start_turn()` (history + tool schema), `_stream_response()`, then `set_turn_from_api()` with API usage (also stored in `_api_context`) or tiktoken estimates
 4. Appends the assistant message (with `tool_calls` and provider extras) and calls `on_stream_end()`
 5. Without tool calls: `finish_turn()`, `on_token_update`, return the content
 6. With tool calls: for each, `on_tool_call`, `_execute_tool`, `on_tool_result`, then append the tool message immediately (checkpoint). Images are removed from tool messages and re-injected as one user vision message starting with `[Screenshot captured`. Tool results become input tokens of the next turn.
 
 #### Run (`run(user_message, image_url?)`)
 
-Marks the Agent processing, then loops: stop check; recount context with the pending user message and the tool schema; auto-compact above 80%; `step()`. A step with neither content nor tool calls is removed and retried up to twice (`on_compact` reports it). A step with content and no tool calls ends the run unless background events arrived meanwhile (then one more step shows them to the model). Returns the response, `[Stopped — waiting for your input]` if a stop was already pending, or `[Interrupted]`. The `finally` block clears processing and the stop event (the stable hand-off point).
+Marks the Agent processing, then loops: stop check; recount context with the pending user message and the tool schema; auto-compact above 80%; `step()`. If a stop or error happens before `step()` appended the user's message (e.g. during auto-compaction), the message is appended anyway so the next request continues it. A step with neither content nor tool calls is removed and retried up to twice (`on_compact` reports it). A step with content and no tool calls ends the run unless background events arrived meanwhile (then one more step shows them to the model). Returns the response, `[Stopped — waiting for your input]` if a stop was pending before the run started, or `[Interrupted]`. Any other exception repairs the trailing tool chain (`_repair_trailing_tool_chain`) before it propagates, so a failed run never leaves a tool call without its result. The `finally` block runs `_end_run()` and clears the stop event (the stable hand-off point).
 
 #### Compaction
 
@@ -327,22 +329,21 @@ Marks the Agent processing, then loops: stop check; recount context with the pen
 **`compact()`**:
 1. `_find_compact_boundary()` — walks back from the end with the same field-aware message counting as preflight and chooses a safe user boundary or complete assistant/tool-call chain while keeping 20% of the context window
 2. `_serialize_messages_for_summary()` — readable text (tool results cut to 500 characters)
-3. `_generate_summary()` — a streamed request through the same adapter and effort with a structured prompt; an existing summary is passed as `<previous-summary>` for an incremental update; the input is bounded by `_cap_compaction_prompt()` (context window minus the reserve and a 1,024-token margin, keeping head and tail)
+3. `_generate_summary()` — a streamed request through the same adapter and effort with a structured prompt, retried like a normal request (`_with_retries`); a stop closes its stream at once. An existing summary is passed once, as `<previous-summary>`, for an incremental update (it is not also in the summarized messages); the input is bounded by `_cap_compaction_prompt()` (context window minus the reserve and a 1,024-token margin, keeping head and tail)
 4. Rebuilds history as `[system, "[Conversation compacted — summary of prior history]" user message, recent messages]` and recounts context (session totals are not inflated)
 
-`auto_compact_if_needed()` runs before every API step in `run()`, including inside tool-call loops, because API usage from the previous step does not include the tool results just appended.
+`auto_compact_if_needed()` runs before every API step in `run()`, including inside tool-call loops, because API usage from the previous step does not include the tool results just appended. The context it measures (`_refresh_context_tokens`) is the larger of the full tiktoken estimate and the last request's provider-reported prompt tokens plus an estimate of the messages added since (`_api_context`), since tiktoken can undercount screenshots and provider framing.
 
 **Summary format**: `## Goal`, `## Constraints & Preferences`, `## Progress` (Done / In Progress), `## Key Decisions`, `## Next Steps`, `## Critical Context`, `## User Messages & Agent-to-User Messages` (`### User Messages`, `### Agent-to-User Messages`). The last two subsections keep a chronological record of every user message and substantive assistant reply (tool-call-only messages and tool results excluded); incremental compaction preserves and extends them.
 
 #### History maintenance
 
-- `_validate_history_before_api()` — before every request: no user message triggers `compact()`; trailing tool messages without a preceding assistant tool-call message are trimmed. A trailing user message (including a background notification) is valid.
+- `_validate_history_before_api()` — before every request: no user message triggers `compact()`; otherwise `resume.repair_tool_chains()` makes every tool-call chain in the whole history valid (a failed tool loop can leave a gap before a later user message). A trailing user message (including a background notification) is valid.
 - `_normalize_history_for_context()` — caps legacy saved tool results and replaces embedded `image_url` data with an omission marker.
-- `_truncate_history_if_needed()` — message-count truncation at 10,000,000 (effectively disabled; keeps a user message in the tail).
 
 #### Reset (`reset()`)
 
-Clears stop state, rebuilds the system prompt and history, creates a new `TokenCounter`, closes the browser if open and resets the desktop manager.
+Clears stop state, `_api_context` and queued background events, rebuilds the system prompt and history, creates a new `TokenCounter`, always closes the browser (its worker can be alive without an open window) and resets the desktop manager.
 
 ### `kairos/tokens.py` — TokenCounter
 
@@ -362,20 +363,22 @@ Clears stop state, rebuilds the system prompt and history, creates a new `TokenC
 - `status_data()` — the `token.updated` payload (`context_pct`, `context_tokens`, `context_window`, `turn_input`, `turn_output`, `session_input`, `session_output`, `session_cost` or `None`); `kairos.tokens.status_payload(counter)` also accepts minimal test stand-ins
 - `format_status()` — `format_status_line(status_data())`
 
-Images in vision content are estimated at 85 (low detail) or 765 (high detail) tokens, never from base64 length.
+Images in vision content are estimated at 765 tokens unless their `detail` is `"low"` (85), never from base64 length (Kairos sets no detail, which providers treat like high detail).
 
 ### `kairos/terminal_manager.py` — TerminalManager
+
+`TerminalManager(cwd=None)`: every terminal (background shell and blocking command) starts in `cwd`, the Agent's workspace (None = the process CWD).
 
 **`create_terminal(background) -> int`**:
 - Background: persistent shell (`cmd /Q /k` on Windows, `/bin/bash --login` elsewhere) with a reader thread; shell state survives between commands
 - Blocking: no persistent process; each command gets its own subprocess
 
 **`execute_command(terminal_id, command, timeout?, is_background?, until?)`**:
-- Blocking: requires a finite positive timeout, capped at 20 s (`MAX_BLOCKING_TIMEOUT`), validated before spawning; non-zero exit is a failure; on timeout the process tree is killed and partial output returned. Running blocking processes are registered so `cancel_active_commands()` can kill them on hard stop.
-- Background: writes the command plus a unique completion marker that carries the exit code (Windows: `echo <marker>:%errorlevel%` then `ver >nul`; Unix: `printf`) and returns at once; timeout is ignored. `until` (background only, a regex) produces one `terminal_matched` event for the first matching output line while the command keeps running; invalid regexes and `until` on blocking terminals are rejected.
+- Blocking: requires a finite positive timeout, capped at 20 s (`MAX_BLOCKING_TIMEOUT`), validated before spawning; non-zero exit is a failure; on timeout the process tree is killed and partial output returned. Running blocking processes are registered so `cancel_active_commands()` can kill them on hard stop. Blocking commands, `taskkill` and `pgrep` run with `stdin=DEVNULL` (the host's stdin can be invalid under pythonw or a detached gateway).
+- Background: writes the command inside a block whose stdin is `NUL` / `/dev/null` (`( ... ) <nul` on Windows, `{ ... } </dev/null` on Unix), so a command that reads stdin cannot swallow the marker line while shell state (cd, set, export) still persists, plus a unique completion marker that carries the exit code (Windows: `echo <marker>:%errorlevel%` then `ver >nul`; Unix: `printf`), and returns at once; timeout is ignored. On Windows the `More? ` prompts cmd prints for the block's continuation lines are stripped from the output. `until` (background only, a regex) produces one `terminal_matched` event for the first matching output line while the command keeps running; invalid regexes and `until` on blocking terminals are rejected.
 - `is_background`, when given, must match the terminal type.
 
-**Events**: the reader turns markers into `terminal_finished` events (`completion_id`, `terminal_id`, command, success, `stopped`, exit code, output, duration, optional error); `until` matches produce `terminal_matched` events (matched line and the last 20 output lines). With a consumer set by `set_completion_callback()` (the Agent sets one) every event is delivered to it exactly once, outside the lock; without one, events queue for `drain_completed_background_commands()` and are handed over when a consumer is set. A shell that exits or is closed before a marker produces failed completions for its pending commands. `format_background_completion(event)` renders an event as notification text, with output capped at 12,000 characters (`read_logs` keeps everything).
+**Events**: the reader turns markers into `terminal_finished` events (`completion_id`, `terminal_id`, command, success, `stopped`, exit code, output, duration, optional error); `until` matches produce `terminal_matched` events (matched line and the last 20 output lines). With a consumer set by `set_completion_callback()` (the Agent sets one) every event is delivered to it exactly once, outside the lock; without one, events queue and are handed over when a consumer is set. The reader matches the marker of any pending command: when a later marker appears, earlier queued commands whose markers never appeared complete as failed ("The command's completion marker was lost."), so one lost marker cannot stall the terminal. A shell that exits or is closed before a marker produces failed completions for its pending commands. `format_background_completion(event)` renders an event as notification text, with output capped at 12,000 characters (`read_logs` keeps everything).
 
 **`stop_command(terminal_id)`**: kills the process trees of the background shell's child processes (Windows: Toolhelp snapshot, skipping `conhost.exe`, then `taskkill /T /F`; Unix: `pgrep -P` and SIGTERM). The shell stays open and reports the command finished with `stopped: True`. A shell built-in has no child process; then it fails and suggests `close_terminal`.
 
@@ -389,7 +392,7 @@ Images in vision content are estimated at 85 (low detail) or 765 (high detail) t
 
 **Threading**: `_Worker` runs a dedicated thread with its own asyncio loop and an async Playwright instance, so the browser never touches the main thread's loop (rich/prompt_toolkit). Public methods are synchronous: `_run(coro_fn, timeout)` submits a coroutine with `asyncio.run_coroutine_threadsafe` under a lock and waits. `cancel_active_operation()` cancels the in-flight future (agent hard stop). Async is required so actions can be raced against dialogs.
 
-**Launch**: lazy. The first browser call runs `_ensure()`, which launches CloakBrowser's binary (`ensure_binary()`, `build_args(stealth_args=True, headless=False)`, `IGNORE_DEFAULT_ARGS`) headed with a 1280x720 viewport and applies `cloakbrowser.human.patch_context_async`. There is no headless or non-humanized path. Closing the window by hand fires the context `close` event, which resets state so the next call relaunches.
+**Launch**: lazy. The first browser call runs `_ensure()`, which launches CloakBrowser's binary (`ensure_binary()`, `build_args(stealth_args=True, headless=False)`, `IGNORE_DEFAULT_ARGS`) headed with a 1280x720 viewport and applies `cloakbrowser.human.patch_context_async`. There is no headless or non-humanized path. Closing the window by hand fires the context `close` event, which resets state so the next call relaunches. A launch that fails, or whose call is cancelled (Esc, call timeout), releases the profile lock and closes whatever it opened; a launch that finishes after its call was cancelled is closed in the background (`_launch`, `_close_later`).
 
 **Profiles** (`profile(action, name?, proxy?)`): `list`, `use <name>` (persistent context in `~/.kairos/profiles/<name>`), `ephemeral`. Switching closes and relaunches. Each profile pins a fingerprint seed in `<profile>/.kairos-browser.json` (created randomly on first use) passed as `--fingerprint=<seed>`. A module-level `_open_profiles` set refuses opening a profile that another BrowserManager in the same process (another gateway conversation) has open.
 
@@ -411,20 +414,24 @@ Images in vision content are estimated at 85 (low detail) or 765 (high detail) t
 | `evaluate(expression, ref?)` | `page.evaluate` (expressions or functions) or element-handle evaluate; no snapshot |
 | `handle_dialog(accept, prompt_text?)` | Answers the pending dialog, then returns the diff state |
 | `tabs(action, index?, url?)` | list / new / select / close |
-| `screenshot(full_page, ref?)` | Returns `(png, message, data_url)`; saves to `~/.kairos/screenshots/` |
+| `screenshot(full_page, ref?)` | Returns `(png, message, data_url)`; saves to `~/.kairos/screenshots/screenshot_YYYYmmdd_HHMMSS_ffffff.png` (microseconds, so screenshots in one second do not overwrite each other) |
 | `search_page(pattern, regex, case_sensitive, max_results)` | Regex/text search over `document.body.innerText` with context |
 | `console(index?, errors_only, max_results)` | See below |
-| `network(index?, filter?, max_results)` | Requests captured from tab creation via Playwright `request` / `response` / `requestfinished` / `requestfailed` events: method, URL, type, status, duration, headers |
+| `network(index?, filter?, max_results)` | Requests captured from tab creation via Playwright `request` / `response` / `requestfinished` / `requestfailed` events: method, URL, type, status, duration, headers; URLs over 100 characters are elided in the middle in the list, keeping the tail |
 
 **Console**: CloakBrowser's binary suppresses Playwright's live console stream (enabling the CDP Runtime domain is a bot signal). `_console_replay()` opens a CDP session, sends `Runtime.enable` (Chrome replays the current document's `consoleAPICalled` and `exceptionThrown` events), waits 0.2 s, sends `Runtime.disable` and detaches. Messages therefore cover the current document since it loaded.
 
 ### `kairos/tools/base.py` — ToolResult
 
 ```python
+def resolve_path(path: str, workspace: Optional[str] = None) -> Path: ...
+
 class ToolResult:
     def __init__(self, success: bool, output: str, error: Optional[str] = None,
-                 workspace_changed: Optional[str] = None, image_url: Optional[str] = None):
+                 image_url: Optional[str] = None):
 ```
+
+`resolve_path()` resolves a relative path against `workspace` (the process CWD without one); absolute paths are used as given. `ReadTool`, `WriteTool`, `EditTool` and `SearchTool` take the workspace in their constructor.
 
 `to_dict()` returns `{"success", "output", "error"}` plus `image_url` when present (used by `ReadTool`, browser and desktop screenshots); image data is kept out of the textual tool message and re-injected as a user vision message.
 
@@ -432,34 +439,42 @@ class ToolResult:
 
 ```python
 class ReadTool:
+    def __init__(self, workspace: Optional[str] = None): ...
     def __call__(self, path: str) -> ToolResult:
 ```
 
-The `read` schema tells the model that it supports UTF-8 text files and images, returned as vision data.
+The `read` schema tells the model that it supports UTF-8 text files and images, returned as vision data (its text still lists `.bmp`, `.tiff`, `.tif` and `.svg` among the image types).
 
-- **Text files**: UTF-8 decoded with `errors="replace"`, max 100KB
-- **Image files** (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.tif`, `.svg`): base64 data URL returned as `image_url`, max 20MB
+- **Images**: PNG, JPEG, GIF and WebP only (the formats OpenAI and Anthropic both accept), detected from the file's content, not its extension; returned as a base64 data URL in `image_url`. Max 3,932,160 bytes (`MAX_IMAGE_BYTES`), so the base64 data stays under Anthropic's 5 MB limit.
+- A file with an image extension (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.tif`) whose content is not a supported format is refused with a conversion hint
+- **Text files** (including SVG): UTF-8 decoded with `errors="replace"`, max 100KB
 - Returns `ToolResult(False, "", "File not found: ...")` or `"Not a file: ..."` on errors
 
 ### `kairos/tools/write.py` — WriteTool
 
 ```python
 class WriteTool:
+    def __init__(self, workspace: Optional[str] = None): ...
     def __call__(self, path: str, content: str) -> ToolResult:
 ```
 
-Creates parent directories automatically (`mkdir(parents=True, exist_ok=True)`). Writes UTF-8.
+Creates parent directories automatically (`mkdir(parents=True, exist_ok=True)`). Writes the content as UTF-8 bytes, exactly as given (no newline translation on Windows).
 
 ### `kairos/tools/edit.py` — EditTool
 
 ```python
 class EditTool:
+    MAX_REPORTED_MATCHES = 20
+
+    def __init__(self, workspace: Optional[str] = None): ...
     def __call__(self, path: str, oldText: str, newText: str) -> ToolResult:
 ```
 
+- Edits the file as raw UTF-8: line endings and every byte outside the replaced span are kept. Files that are not valid UTF-8 are refused (rewriting them would corrupt bytes); an empty `oldText` is refused.
+- In a file whose line endings are mostly CRLF, `oldText` and `newText` are converted to CRLF before matching
 - Finds ALL occurrences of `oldText` via `str.find()` loop
 - **0 matches**: Error with line count + similar text locations (checks first 20 chars of `oldText` against each line)
-- **Multiple matches**: Error with line numbers of each occurrence
+- **Multiple matches**: Error with the match count and the line numbers of at most 20 of them
 - **1 match**: Replaces, writes file, reports line number
 
 ### `kairos/tools/search.py` — SearchTool
@@ -470,14 +485,16 @@ class SearchTool:
     SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox",
                  ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs"}
 
+    def __init__(self, workspace: Optional[str] = None): ...
     def __call__(self, pattern: str, path: Optional[str] = None,
                  include: Optional[str] = None, max_results: int = 50,
                  timeout: Optional[float] = DEFAULT_TIMEOUT) -> ToolResult:
 ```
 
-- Compiles `pattern` as `re.IGNORECASE` regex; `os.walk` with `SKIP_DIRS` pruning; `include` glob via `fnmatch.translate()`
+- Searches `path` (relative paths resolve against the workspace), or the workspace when `path` is omitted
+- Compiles `pattern` with the `regex` module (`IGNORECASE`; installed with `tiktoken`); `os.walk` with `SKIP_DIRS` pruning; `include` glob via `fnmatch.translate()`
 - Skips binary files (a `\x00` in the first 512 bytes)
-- Enforces a finite, non-negative timeout (default 10 s) with a monotonic deadline; a timed-out search fails with the partial matches found so far
+- Enforces a finite, non-negative timeout (default 10 s) with a monotonic deadline; each line match gets the remaining time as its own `regex` timeout, so a catastrophic pattern cannot run past the deadline; a timed-out search fails with the partial matches found so far
 - Validates `max_results` as a positive integer; returns `"file:line: text"` lines
 
 ### `kairos/tools/web_search.py` — WebSearchTool
@@ -497,7 +514,7 @@ class GitTool:
     def __call__(self, command: str, **kwargs) -> ToolResult:
 ```
 
-Sub-commands: `status` (`git status --porcelain`), `diff` (`git diff [-- path]`), `log` (`git log --oneline -n N`, default 10), `commit` (`git add -A` + `git commit -m message`), `branch` (`git branch --list`). All run with `cwd` set to the workspace.
+Sub-commands: `status` (`git status --porcelain`), `diff` (`git diff [-- path]`), `log` (`git log --oneline -n N`, default 10), `commit` (`git add -A` + `git commit -m message`), `branch` (`git branch --list`). All run with `cwd` set to the workspace and `stdin=DEVNULL`; output is decoded as UTF-8 (`errors="replace"`), not the Windows code page.
 
 ### `kairos/tools/terminal.py` — Terminal Tools
 
@@ -509,6 +526,7 @@ Six wrappers around `TerminalManager`: `NewTerminalTool`, `ExecuteCommandTool` (
 class SubAgentTool:
     MAX_RUNNING = 5
     MAX_RESULT_CHARS = 12_000
+    STOP_WAIT_SECONDS = 2.0
 
     def __init__(self, workspace, model_config, on_event, on_status): ...
     def spawn(self, prompt: str) -> ToolResult: ...
@@ -518,8 +536,8 @@ class SubAgentTool:
 ```
 
 Sub-agents always run in the background, each on its own thread; every tool returns at once.
-- **`spawn(prompt)`**: refuses when 5 are running; creates a child `Agent(workspace)` switched to the parent's current spec and effort (`model_config()` is read at spawn time), with `_is_subagent = True` and no `subagent_tool`. IDs are 12 hex characters.
-- **`message(id, message)`**: continues an idle, failed or terminated sub-agent with its previous context; refused while it runs or when 5 are running.
+- **`spawn(prompt)`**: refuses when 5 are running; creates a child `Agent(workspace)` switched to the parent's current spec and effort (`model_config()` is read at spawn time), with `_is_subagent = True` and no `subagent_tool`, then rebuilds its system prompt as the sub-agent variant (`_create_sub_agent`). IDs are 12 hex characters.
+- **`message(id, message)`**: continues an idle, failed or terminated sub-agent with its previous context; refused while it runs or when 5 are running. After `terminate` the old run may still be finishing a tool call: `message` waits up to `STOP_WAIT_SECONDS` for its thread, then refuses with "still stopping ... Message it again in a moment" rather than run two threads on one Agent.
 - **`terminate(id)`**: interrupts a running sub-agent; its context is kept for `message`.
 - **`list()`**: one line per sub-agent: ID, state, elapsed time, current tool, task (first 100 characters) and `recent_actions` (the last 3 tool summaries, oldest first).
 - States: `running`, `idle` (finished, context kept), `failed`, `terminated`, `lost`.
@@ -542,7 +560,7 @@ class SkillManager:
     def write_skill(self, skill_name: str, content: str, overwrite: bool = False) -> ToolResult: ...
 ```
 
-Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill names are loaded into the system prompt; full content is fetched on demand. `write_skill` validates the name (no `..`, `/`, `\`, special characters) and refuses to overwrite unless `overwrite=true`. The `skills/` directory is gitignored.
+Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill names are loaded into the system prompt; full content is fetched on demand. `write_skill` validates the name (no `..`, `/`, `\`, special characters) and refuses to overwrite unless `overwrite=true`. The `skills/` directory is created only when a skill is written (not when an Agent starts) and is gitignored.
 
 ### `kairos/tools/browser.py` — Browser Tools
 
@@ -553,7 +571,7 @@ Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill n
 
 ### `kairos/tools/session.py` — SessionManager
 
-Chat store of the offline CLI and the Textual frontend (gateway conversations live in SQLite). Each workspace has an isolated store at `~/.kairos/chats/<directory>--<stable-path-id>/chats.json`: the directory basename stays readable and a deterministic SHA-256 path prefix prevents collisions between workspaces with the same basename. The JSON envelope stores the absolute workspace path in `workspace`. Direct callers that omit a workspace use the current working directory. The offline CLI passes `~/Documents/kairos_workspace` when no path was given, so all fresh folders share one list.
+Chat store of the offline CLI (gateway conversations live in SQLite). Each workspace has an isolated store at `~/.kairos/chats/<directory>--<stable-path-id>/chats.json`: the directory basename stays readable and a deterministic SHA-256 path prefix prevents collisions between workspaces with the same basename. The JSON envelope stores the absolute workspace path in `workspace`. Direct callers that omit a workspace use the current working directory. The offline CLI passes `~/Documents/kairos_workspace` when no path was given, so all fresh folders share one list.
 
 `<workspace>/chats/chats.json` remains a read-compatible legacy source. Legacy-only sessions appear in the picker and are saved into the canonical store on the next save; the legacy file is never modified.
 
@@ -567,9 +585,9 @@ class SessionManager:
     def load_session(self, session_id: str) -> Optional[List[Dict]]: ...
 ```
 
-- `_load_all()` loads canonical sessions first (canonical IDs win), then merges legacy sessions; accepts the envelope and the old flat format and recovers damaged JSON by parsing valid JSON boundaries.
+- `_load_all()` loads canonical sessions first (canonical IDs win), then merges legacy sessions; accepts the envelope and the old flat format and recovers damaged JSON by parsing valid JSON boundaries. A recovered canonical store is rewritten; a corrupt legacy file never is.
 - `_save_all()` writes atomically (temp file, `fsync()`, `os.replace()` with 5 attempts), falling back to a direct write on persistent Windows locks.
-- `save_chat()` updates `_current_session_id` when it exists, otherwise creates `chat_<timestamp>`. No fuzzy matching.
+- `save_chat()` updates `_current_session_id` when it exists, otherwise creates `chat_<timestamp>` (`chat_<timestamp>_2`, `_3`, ... for chats saved in the same second). No fuzzy matching.
 
 ```json
 {
@@ -580,41 +598,39 @@ class SessionManager:
 }
 ```
 
-### `kairos/temp_cli.py` — Textual Frontend (legacy)
-
-A Textual app (`python run_temp_cli.py [workspace]`; `textual` is not in `requirements.txt`) that runs `Agent(workspace)` in-process with `SessionManager(agent.cwd)` and the shared resume logic. No launcher uses it. It does not host a `WakeScheduler`, so background results are delivered with the next message instead of waking the agent.
-
 ---
 
 ## Tests
 
-Run the unittest suites with `python -m unittest discover -s tests -v`; the pytest-style files (`test_gateway_*.py`, `test_terminal_manager.py`) need `pytest`; `python tests/run_gateway_tests.py` is a dependency-light gateway check. Tests that construct a real Agent point `config_path()` at a temporary `provider.json`; no test calls a live model.
+Run the unittest suites with `python -m unittest discover -s tests -v`; the pytest-style files (`test_gateway_*.py`, `test_terminal_manager.py`) need `pytest`; `python tests/run_gateway_tests.py` is a dependency-light gateway check. Tests that construct a real Agent (gateway tests included) point `config_path()` at a temporary `provider.json`; gateway tests use a loopback base URL (`http://127.0.0.1:8765`), since the gateway refuses other Hosts without a token. No test calls a live model. With `KAIROS_SKIP_BROWSER_TESTS=1`, `python -m unittest discover -s tests` runs 177 tests (18 skipped).
 
 | File | Covers |
 |------|--------|
-| `test_providers.py` | Setup resolution, ad-hoc models, effort validation, key rotation/cooldown, the three adapters (request translation, recorded streams, errors), Agent streaming and model selection |
-| `test_background.py` | Background sub-agents (events, failures, recent actions, cap, terminate, stop_all, lost), sub-agent tool exclusion and refusal, in-run notification injection, parent hard stop leaving sub-agents running, terminal `until`/`stop_command`/`read_logs` tail, event hand-over, missing-argument errors |
+| `test_providers.py` | Setup resolution, ad-hoc models, effort validation, key rotation/cooldown, the three adapters (request translation, recorded streams, errors, cached-token usage), one shared Anthropic HTTP client, API-key/rate-limit error hints (incl. `ProviderError` 401/429), context cap and session cost, Agent streaming and model selection |
+| `test_agent_loop.py` | Agent loop robustness: `_tool_summary` never raises, null arguments and failing observers, tool-chain repair after any exception and across the whole history, background events handed back after a failed or interrupted run, `reset()` dropping old events, stop during auto-compaction (immediate, keeps the prompt), summary retries, previous summary sent once, provider-reported prompt tokens for auto-compaction, image estimates, `KeyError` vs missing argument, `clear_stop()`, `reset()` closing the browser |
+| `test_file_tools.py` | Relative paths and the default search root resolve against the workspace (tools and terminals), edit keeps CRLF/LF and refuses non-UTF-8 files and empty `oldText`, bounded multi-match report, byte-exact writes, image formats detected from content, SVG as text, image size limit, regex timeout on a catastrophic pattern, UTF-8 git output, `skills/` created only when writing |
+| `test_background.py` | Background sub-agents (events, failures, recent actions, cap, terminate, stop_all, lost), `message_subagent` waiting for a terminated run, the sub-agent system prompt, sub-agent tool exclusion and refusal, in-run notification injection, parent hard stop leaving sub-agents running, terminal `until`/`stop_command`/`read_logs` tail, event hand-over, missing-argument errors |
 | `test_wake.py` | WakeScheduler debounce, in-run events, busy host, cap/pause/reset, exactly-once delivery under concurrency, close, `format_notifications` |
-| `test_cli_gateway.py` | Command and argument parsing, rendering (word wrap, latest lines, one-line banner), GatewayBackend against a real local gateway with a fake agent, `/model`/`/effort`, OfflineBackend, wake rendering, sub-agent toolbar, `/stop`, offline and gateway wake turns, output above an open prompt |
+| `test_cli_gateway.py` | Command and argument parsing, rendering (word wrap, latest lines, one-line banner), GatewayBackend against a real local gateway with a fake agent, `/model`/`/effort`, OfflineBackend, wake rendering, sub-agent toolbar, `/stop`, offline and gateway wake turns, output above an open prompt, offline `/resume` in the chat's own folder, reset/exit closing browser and desktop, console-close save, auto-save after a failure, Ctrl+C while sending or rendering, typed-ahead pre-fill (arrows dropped, Backspace applied), a reply printed once when a wake turn follows |
 | `test_web_search.py` | Result formatting, missing key, out of credits, 429 retry, errors, schema for agents and sub-agents |
 | `test_workspaces.py` | Fresh folder naming and collisions |
 | `test_compaction.py` | Tool/schema accounting, vision estimates, pending-user preflight, compaction prompt bounds, safe boundaries, legacy result normalization |
-| `test_sessions.py` | Workspace-isolated `~/.kairos` chat stores and legacy loading |
-| `test_browser.py` | Real headed CloakBrowser against `tests/fixtures/` (refs, diffs, forms, dialogs, stale refs, iframes, console/network, tabs, hard stop, profiles) and schema/signature parity; `KAIROS_SKIP_BROWSER_TESTS=1` skips the browser part |
-| `test_desktop_manager.py` | Cua Driver response parsing and lifecycle without a native desktop |
-| `test_gateway_api.py`, `test_gateway_manager.py`, `test_gateway_repository.py`, `test_gateway_history.py`, `test_gateway_config.py`, `test_terminal_manager.py` | Gateway routes and fresh workspaces, manager runs/unload/concurrent loads, repository, history repair, port validation, blocking timeouts (pytest) |
-| `run_gateway_tests.py` | Gateway end-to-end with fake agents: runs, replay, interrupts, model settings, wake runs, pending notifications, lost sub-agents |
+| `test_sessions.py` | Workspace-isolated `~/.kairos` chat stores, legacy loading, separate IDs for chats saved in the same second, a corrupt legacy store recovered without being modified |
+| `test_browser.py` | Real headed CloakBrowser against `tests/fixtures/` (refs, diffs, forms, dialogs, stale refs, iframes, console/network, tabs, hard stop, profiles) and schema/signature parity; `KAIROS_SKIP_BROWSER_TESTS=1` skips the browser part. `BrowserManagerUnitTests` need no browser: profile lock released and late context closed after a cancelled or failed launch, unique screenshot names, middle-elided network URLs |
+| `test_desktop_manager.py` | Cua Driver response parsing and lifecycle without a native desktop; daemon stderr goes to a log file |
+| `test_gateway_api.py`, `test_gateway_manager.py`, `test_gateway_repository.py`, `test_gateway_history.py`, `test_gateway_config.py`, `test_terminal_manager.py` | Gateway routes and fresh workspaces, manager runs/unload/concurrent loads, repository, history repair, port validation; terminals: blocking timeouts, start in the given `cwd`, a stdin-reading background command keeps its marker, a lost marker does not stall later commands, `stop_command` (pytest) |
+| `run_gateway_tests.py` | Gateway end-to-end with fake agents: runs, replay, interrupts, model settings, wake runs, pending notifications, lost sub-agents; cross-site Origin and DNS-rebinding refusal, no non-loopback bind without a token, `?token=` redaction, live event order, late interrupts, reload keeping an interrupted turn, the data-dir lock, queued runs whose status changed, unload off the event loop, wake/unload race, configure during a run, malformed frames |
 
 ## Design Principles
 
 1. **Streaming First** — Tokens print as they arrive; no waiting for full response
-2. **Absolute Paths** — No workspace containment
+2. **Workspace-relative, not contained** — Relative paths resolve against the workspace; absolute paths reach anywhere
 3. **One Tool Per File** — Easy to add new tools
 4. **Interruptible** — Esc and Ctrl+C hard-stop the main agent and return to the prompt at once; `/stop` stops sub-agents
 5. **Never Poll** — Background work reports back through notifications and wakes
 6. **Token Aware** — Session, context, and turn token counts displayed
 7. **Config in Two Places** — Models and keys in `provider.json`; everything else in environment variables, read on first access
-8. **Minimal Dependencies** — `openai`, `rich`, `prompt_toolkit`, `tiktoken`, `fastapi`, `uvicorn`, `websockets`, `playwright`, `cloakbrowser` (`httpx` comes with `openai`)
+8. **Minimal Dependencies** — `openai`, `rich`, `prompt_toolkit`, `tiktoken`, `fastapi`, `uvicorn`, `websockets`, `playwright`, `cloakbrowser` (`httpx` comes with `openai`; `regex`, used by `search`, comes with `tiktoken`)
 
 ## Adding New Tools
 
@@ -623,7 +639,7 @@ Run the unittest suites with `python -m unittest discover -s tests -v`; the pyte
 3. Import in `kairos/agent.py` (top-level imports block) and create the instance in `Agent.__init__`
 4. Add the tool schema to `Agent._get_tool_schema()` (OpenAI function definition)
 5. Add a dispatch entry to `Agent._execute_tool()`; read required arguments as `a["x"]` so a missing one is reported by name
-6. Add a summary case to `Agent._tool_summary()`
+6. Add a summary case to `_summarize_tool_call()` in `kairos/agent.py` (behind `Agent._tool_summary()`)
 7. If sub-agents must not have it, add its name to `SUBAGENT_TOOL_NAMES` (browser tools are excluded by their `browser_` prefix)
 8. **Update this AGENTS.md and README.md**
 
@@ -631,21 +647,26 @@ Run the unittest suites with `python -m unittest discover -s tests -v`; the pyte
 
 The gateway under `kairos/gateway/` owns durable SQLite-backed conversations, Agent runtimes, runs, wake scheduling and event replay. Start it with `python -m kairos.gateway_main [workspace]`, `python gateway_main.py` or `python -m kairos.main_gateway`; `kairos.bat` starts it when needed. It validates `provider.json` at startup. The optional workspace argument (or `KAIROS_DEFAULT_WORKSPACE`) is used only as the target of the legacy-chat import (`KAIROS_LEGACY_CHAT_FILE`). Workspace paths are context, not a security boundary.
 
-**Configuration**: `KAIROS_GATEWAY_HOST`, `KAIROS_GATEWAY_PORT`, `KAIROS_DATA_DIR` (database `kairos.sqlite3`, default `~/.kairos`), `KAIROS_MAX_CONCURRENT_RUNS`, `KAIROS_RUNTIME_IDLE_SECONDS`, `KAIROS_AUTH_TOKEN` (Bearer token for HTTP and WebSocket; `/healthz` and `/readyz` stay public; the WebSocket also accepts `?token=`), `KAIROS_LEGACY_CHAT_FILE`, `KAIROS_DEFAULT_WORKSPACE`.
+**Configuration**: `KAIROS_GATEWAY_HOST`, `KAIROS_GATEWAY_PORT`, `KAIROS_DATA_DIR` (database `kairos.sqlite3`, default `~/.kairos`), `KAIROS_MAX_CONCURRENT_RUNS`, `KAIROS_RUNTIME_IDLE_SECONDS`, `KAIROS_AUTH_TOKEN` (Bearer token for HTTP and WebSocket, compared in constant time; the WebSocket also accepts `?token=`, which is redacted from uvicorn's log lines), `KAIROS_LEGACY_CHAT_FILE`, `KAIROS_DEFAULT_WORKSPACE`.
+
+**Access control** (`server.py`, `_untrusted_request`): any web page can reach a loopback gateway, so HTTP requests and WebSocket handshakes whose `Origin` is not loopback (`127.0.0.1`, `localhost`, `[::1]`, any port) are refused (HTTP 403, WebSocket close 1008); clients that send no `Origin`, such as the CLI, are allowed. Without a token, a non-loopback `Host` is refused as well (DNS rebinding). With `KAIROS_AUTH_TOKEN` set, the token is the gate and any `Host` is accepted. `/healthz` and `/readyz` need no token, so they are public only from loopback, or from any host when a token is set. `gateway_main` refuses to bind a non-loopback host without a token (prints why and exits 1).
+
+**One gateway per data dir**: `GatewayManager` takes an exclusive lock on `<data_dir>/gateway.lock` (`DataDirLock`) before startup recovery, because that recovery would mark a live gateway's runs interrupted; a second gateway on the same data dir prints an error and exits 1. The lock is released at shutdown.
 
 **Repository** (`repository.py`, schema version 4, WAL mode): tables `workspaces`, `conversations`, `runs`, `messages`, `events`, `schema_meta`. Columns added by idempotent migrations: `conversations.active_run_id`, `conversations.model_settings` (JSON `{setup, model, provider, effort}`; NULL = default setup), `conversations.pending_notifications` (JSON list of background events saved at unload), `runs.request_content`, `runs.request_image_url`, `runs.origin` (`user` or `wake`). Events have monotonic per-conversation IDs. Runs left `queued`/`running` by a previous process are marked interrupted at startup.
 
 **Manager** (`manager.py`, `GatewayManager`):
 - Conversations created without a workspace get a fresh folder (`workspaces.new_workspace()`).
-- A runtime (`AgentRuntime`) is created on demand: `agent_factory(workspace)` (injectable for tests), stored model settings applied (invalid stored settings fall back to the default setup), history restored through `history.sanitize_for_resume`, pending notifications taken from the database and handed to `agent.add_background_events()`.
-- Runs are serialized per conversation (FIFO queue, asyncio lock) and run in a thread pool of `KAIROS_MAX_CONCURRENT_RUNS` workers across conversations. After each run the full history is persisted (`replace_messages`). Control operations (compaction, continuation) reserve the runtime first.
-- Model settings: `list_models()` and `configure_conversation(id, setup?, model?, provider?, effort?)` validate against `provider.json`, persist the choice and apply it to a loaded runtime (effective at its next API step); with no changes it returns the current model info.
-- Wake: each runtime has a `WakeScheduler` (`wake_debounce=2.0`, `wake_cap=10`). The Agent's `on_background_event` emits `background.notification` and pushes the event; an idle runtime gets a wake run (origin `wake`, source `wake`, input `format_notifications(events)`); a run that starts while notifications are pending takes them; a user message or continuation resets the wake count. `on_subagent_status` emits `subagent.status` (running updates live-only, final states persisted). `list_subagents()` and `stop_subagents()` back the WebSocket commands.
-- Idle unloading (`cleanup_idle`, every 60 s) skips runtimes that are running or have background work (sub-agents or background commands). Unload closes the scheduler, marks running sub-agents lost (with notifications), persists history, closes browser/terminal resources (also of child agents), and saves undelivered notifications to `pending_notifications`. Shutdown cancels queued runs, interrupts running ones, waits for them, then force-unloads every runtime.
+- A runtime (`AgentRuntime`) is created on demand: `agent_factory(workspace)` (injectable for tests), stored model settings applied (invalid stored settings fall back to the default setup), history restored through `history.sanitize_for_resume(..., prefer_incomplete=True)` (an interrupted tail is repaired with synthetic failed results, not cut back to the last clean reply, which the next save would make permanent), pending notifications taken from the database and handed to `agent.add_background_events()`.
+- Runs are serialized per conversation (FIFO queue, asyncio lock) and run in a thread pool of `KAIROS_MAX_CONCURRENT_RUNS` workers across conversations. After each run the full history is persisted (`replace_messages`). Control operations (compaction, continuation) reserve the runtime first. A queued run whose status changed before it started (e.g. marked interrupted) emits `run.interrupted`, `run.cancelled` or `run.failed` with an `error` field, so a waiting client always gets an end event.
+- Stops: `run.interrupt` and `run.cancel` of a running run stop the Agent only while that run's `Agent.run` executes (`AgentRuntime.agent_active`, checked under the state lock); a stop that lands after it returned is dropped with `Agent.clear_stop()` so it cannot hit the next run. `run.cancel` of a queued run removes it from the queue.
+- Model settings: `list_models()` and `configure_conversation(id, setup?, model?, provider?, effort?)` validate against `provider.json`, persist the choice and apply it to a loaded runtime between runs: at once when idle, otherwise (`pending_model_settings`) before its next run or compaction. With no changes it returns the current model info.
+- Wake: each runtime has a `WakeScheduler` (`wake_debounce=2.0`, `wake_cap=10`). The Agent's `on_background_event` emits `background.notification` and pushes the event; an idle runtime gets a wake run (origin `wake`, source `wake`, input `format_notifications(events)`); a run that starts while notifications are pending takes them; a user message or continuation resets the wake count. Wake events that cannot be handed back because the runtime is already gone (a wake racing an unload) go to `pending_notifications`. `on_subagent_status` emits `subagent.status` (running updates live-only, final states persisted). `list_subagents()` and `stop_subagents()` back the WebSocket commands.
+- Idle unloading (`cleanup_idle`, every 60 s) skips runtimes that are running or have background work (sub-agents or background commands). Unload closes the scheduler; its teardown runs off the event loop (`_teardown_runtime` in a thread): it marks running sub-agents lost (with notifications), persists history, closes the browser (always, also without an open window), the desktop manager and terminals (also of child agents), and saves undelivered notifications to `pending_notifications`. Shutdown cancels queued runs, interrupts running ones, waits for them, then force-unloads every runtime.
 
-**Events** (envelope `{"type": "event", "event_id", "event", "conversation_id", "run_id", "created_at", "data"}`): `conversation.loaded`, `conversation.unloaded`, `run.queued`, `run.started`, `run.completed`, `run.interrupted`, `run.failed`, `run.cancelled` (run events carry `origin`), `assistant.stream_started`, `assistant.token` (live-only, not persisted; `assistant.stream_ended` carries the full text), `assistant.stream_ended`, `tool.started`, `tool.finished`, `token.updated`, `conversation.compacted`, `background.notification`, `subagent.status`, `wake.paused`.
+**Events** (envelope `{"type": "event", "event_id", "event", "conversation_id", "run_id", "created_at", "data"}`): `conversation.loaded`, `conversation.unloaded`, `run.queued`, `run.started`, `run.completed`, `run.interrupted`, `run.failed`, `run.cancelled` (run events carry `origin` and the run dict, which has no `input_message_id`), `assistant.stream_started`, `assistant.token` (live-only, not persisted; `assistant.stream_ended` carries the full text), `assistant.stream_ended`, `tool.started`, `tool.finished`, `token.updated`, `conversation.compacted`, `background.notification`, `subagent.status`, `wake.paused`. `emit()` assigns the event ID and schedules live delivery under one per-conversation lock, so live delivery follows event-ID order (a subscriber drops IDs at or below the last one it sent).
 
-**WebSocket** `/api/v1/ws` (commands `{"type": "command", "command", "request_id", "conversation_id"?, "payload"}`, answered with `ack` or `error`): `gateway.hello`, `conversation.list`, `conversation.create`, `conversation.load` (returns `conversation`, visible `history` and `needs_continue`), `conversation.unload`, `conversation.subscribe` (`after_event_id`; replay then live, deduplicated by event ID), `conversation.unsubscribe`, `conversation.messages`, `message.send`, `conversation.compact`, `conversation.continue`, `run.interrupt`, `run.cancel`, `model.list`, `conversation.configure`, `subagent.list`, `subagent.stop_all`, `ping`.
+**WebSocket** `/api/v1/ws` (commands `{"type": "command", "command", "request_id", "conversation_id"?, "payload"}`, answered with `ack` or `error`): `gateway.hello`, `conversation.list`, `conversation.create`, `conversation.load` (returns `conversation`, visible `history` and `needs_continue`), `conversation.unload`, `conversation.subscribe` (`after_event_id`; replay then live, deduplicated by event ID), `conversation.unsubscribe`, `conversation.messages`, `message.send`, `conversation.compact`, `conversation.continue`, `run.interrupt`, `run.cancel`, `model.list`, `conversation.configure`, `subagent.list`, `subagent.stop_all`, `ping`. A frame that is not JSON or not a command envelope gets an `invalid_message` error and the connection stays open.
 
 **REST**: `GET /healthz`, `GET /readyz`, `GET /api/v1/capabilities`, `GET|POST /api/v1/workspaces`, `GET /api/v1/workspaces/{id}`, `GET|POST /api/v1/conversations`, `GET|PATCH|DELETE /api/v1/conversations/{id}`, `POST .../runtime/load`, `POST .../runtime/unload`, `GET|POST .../messages`, `POST .../continue`, `POST .../compact`, `GET /api/v1/runs/{id}`, `POST /api/v1/runs/{id}/interrupt`, `POST /api/v1/runs/{id}/cancel`. Model settings and sub-agent commands are WebSocket-only.
 
@@ -653,4 +674,4 @@ Compile check: `python -m compileall -q kairos gateway_main.py tests`. Every cod
 
 ### Native Desktop / Cua Driver Integration
 
-Kairos optionally integrates the Cua Driver through `kairos/desktop_manager.py` and `kairos/tools/desktop.py`. `DesktopManager` accepts an executable or directory in `KAIROS_CUA_DRIVER_PATH`, then lazily discovers `cua-driver` using PATH or the official Windows per-user location under `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin`, starts its persistent daemon, invokes daemon-backed CLI tools, extracts screenshots into `ToolResult.image_url`, supports cancellation, and closes the daemon on reset. Native desktop tools include doctor, window listing/state, screenshots (implemented through the current driver's `get_window_state` response), application launching, clicking, typing, keyboard shortcuts, scrolling, moving, dragging, and window actions. Accessibility indices are primary for supported actions; pixel coordinates are required for cursor movement and dragging. Wrappers map Kairos drag coordinates to Cua's `from_x/from_y/to_x/to_y` fields, add scroll defaults, and map `activate_window` to `bring_to_front`. The current driver does not expose minimize/maximize/close tools, so those actions return explicit unsupported results. Desktop wrappers normalize accidental simultaneous accessibility-index and pixel arguments by preferring the semantic address. Desktop tools are available to sub-agents. Regression coverage is in `tests/test_desktop_manager.py` and uses mocked/fake transport behavior without requiring a native desktop.
+Kairos optionally integrates the Cua Driver through `kairos/desktop_manager.py` and `kairos/tools/desktop.py`. `DesktopManager` accepts an executable or directory in `KAIROS_CUA_DRIVER_PATH`, then lazily discovers `cua-driver` using PATH or the official Windows per-user location under `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin`, starts its persistent daemon (its stderr goes to `~/.kairos/cua-driver.log`, rewritten at each start and quoted when the daemon exits during startup), invokes daemon-backed CLI tools, extracts screenshots into `ToolResult.image_url`, supports cancellation, and closes the daemon on reset. Native desktop tools include doctor, window listing/state, screenshots (implemented through the current driver's `get_window_state` response), application launching, clicking, typing, keyboard shortcuts, scrolling, moving, dragging, and window actions. Accessibility indices are primary for supported actions; pixel coordinates are required for cursor movement and dragging. Wrappers map Kairos drag coordinates to Cua's `from_x/from_y/to_x/to_y` fields, add scroll defaults, and map `activate_window` to `bring_to_front`. The current driver does not expose minimize/maximize/close tools, so those actions return explicit unsupported results. Desktop wrappers normalize accidental simultaneous accessibility-index and pixel arguments by preferring the semantic address. Desktop tools are available to sub-agents. Regression coverage is in `tests/test_desktop_manager.py` and uses mocked/fake transport behavior without requiring a native desktop.
