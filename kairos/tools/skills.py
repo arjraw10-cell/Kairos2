@@ -19,8 +19,8 @@ class SkillManager:
     _UNSAFE_PATTERN = re.compile(r"[\\/:*?\"<>|\x00]")
 
     def __init__(self, skills_dir: str):
+        # Created by write_skill when the first skill is written.
         self.skills_dir = Path(skills_dir).resolve()
-        self.skills_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     #  Public API

@@ -50,7 +50,8 @@ class Agent:
         self.model = self.spec.model
         self.effort = self.spec.default_effort
         self.max_tool_result_chars = Config.MAX_TOOL_RESULT_CHARS()
-        self.terminal_manager = TerminalManager()
+        # Terminals start in the workspace (not the gateway's CWD).
+        self.terminal_manager = TerminalManager(cwd=str(Path(workspace).resolve()))
         # A hard interrupt is shared by the UI thread and the worker running
         # the request.  It stays set until ``run`` reaches its cleanup so a
         # stop cannot be lost between API steps.
@@ -75,16 +76,17 @@ class Agent:
         self.cwd = Path(workspace).resolve()
 
         # Individual tools
-        self.read_tool = ReadTool()
-        self.write_tool = WriteTool()
-        self.edit_tool = EditTool()
+        # Relative paths resolve against the workspace.
+        self.read_tool = ReadTool(str(self.cwd))
+        self.write_tool = WriteTool(str(self.cwd))
+        self.edit_tool = EditTool(str(self.cwd))
         self.new_terminal_tool = NewTerminalTool(self.terminal_manager)
         self.execute_command_tool = ExecuteCommandTool(self.terminal_manager)
         self.read_logs_tool = ReadLogsTool(self.terminal_manager)
         self.close_terminal_tool = CloseTerminalTool(self.terminal_manager)
         self.get_terminal_info_tool = GetTerminalInfoTool(self.terminal_manager)
         self.stop_command_tool = StopCommandTool(self.terminal_manager)
-        self.search_tool = SearchTool()
+        self.search_tool = SearchTool(str(self.cwd))
         self.web_search_tool = WebSearchTool()
         self.git_tool = GitTool()
         self.git_tool.set_workspace(str(self.cwd))

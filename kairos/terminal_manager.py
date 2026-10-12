@@ -52,7 +52,14 @@ class TerminalManager:
     MATCH_TAIL_LINES = 20
     DEFAULT_LOG_TAIL = 100
 
-    def __init__(self):
+    # cmd prints "More? " for each continuation line of the stdin-isolating
+    # block (see execute_command), after the prompt and before the output.
+    _CMD_MORE_PROMPTS = re.compile(r"^([^>\r\n]*>)?(?:More\? )+")
+
+    def __init__(self, cwd: Optional[str] = None):
+        # Working directory of every terminal (the Agent's workspace); None
+        # means the process CWD.
+        self.cwd = cwd
         self.terminals: Dict[int, Terminal] = {}
         self.next_id = 1
         self._lock = threading.Lock()
@@ -67,8 +74,7 @@ class TerminalManager:
 
         With a callback, every event (completion or ``until`` match) is
         delivered to it exactly once; events queued before it was set are
-        handed over immediately. Without one, events wait in the queue for
-        ``drain_completed_background_commands()``.
+        handed over immediately. Without one, events wait in the queue.
         """
         with self._lock:
             self._completion_callback = callback
@@ -103,6 +109,7 @@ class TerminalManager:
                 "encoding": "utf-8",
                 "errors": "replace",
                 "bufsize": 1,
+                "cwd": self.cwd,
             }
             if sys.platform == "win32":
                 # Helps close/timeout cleanup target the shell process. The
@@ -165,6 +172,7 @@ class TerminalManager:
                 # child process holding stdout/stderr open indefinitely.
                 subprocess.run(
                     ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=1,
@@ -267,15 +275,34 @@ class TerminalManager:
         try:
             if term.process and term.process.stdout:
                 for line in iter(term.process.stdout.readline, ""):
-                    delivery = None
+                    if sys.platform == "win32":
+                        line = self._CMD_MORE_PROMPTS.sub(r"\1", line, count=1)
+                    deliveries = []
                     is_internal_marker = False
                     with self._lock:
                         if term.pending_commands:
                             command = term.pending_commands[0]
-                            is_marker, exit_code = self._parse_completion_marker(
-                                line, command.marker
-                            )
-                            if is_marker:
+                            # Match any pending command's marker, so one lost
+                            # marker cannot stall every later command.
+                            index, exit_code = None, None
+                            for i, candidate in enumerate(term.pending_commands):
+                                is_marker, code = self._parse_completion_marker(
+                                    line, candidate.marker
+                                )
+                                if is_marker:
+                                    index, exit_code = i, code
+                                    break
+                            if index is not None:
+                                # Commands queued before it have finished too,
+                                # but their markers never appeared.
+                                for _ in range(index):
+                                    deliveries.append(self._queue_background_completion_locked(
+                                        term,
+                                        term.pending_commands.popleft(),
+                                        None,
+                                        error="The command's completion marker was lost.",
+                                    ))
+                                command = term.pending_commands.popleft()
                                 marker_pos = line.find(command.marker)
                                 # Preserve output written without a trailing
                                 # newline before the marker. The marker itself
@@ -284,11 +311,10 @@ class TerminalManager:
                                     prefix = line[:marker_pos]
                                     command.output += prefix
                                     term.output_buffer += prefix
-                                term.pending_commands.popleft()
                                 is_internal_marker = True
-                                delivery = self._queue_background_completion_locked(
+                                deliveries.append(self._queue_background_completion_locked(
                                     term, command, exit_code
-                                )
+                                ))
                             else:
                                 command.output += line
                                 if (
@@ -296,15 +322,16 @@ class TerminalManager:
                                     and not command.matched
                                     and command.until.search(line)
                                 ):
-                                    delivery = self._queue_match_locked(term, command, line)
+                                    deliveries.append(self._queue_match_locked(term, command, line))
 
                         if not is_internal_marker:
                             # Keep complete terminal output while excluding
                             # the internal completion marker.
                             term.output_buffer += line
 
-                    if delivery is not None:
-                        self._emit_completion(delivery)
+                    for delivery in deliveries:
+                        if delivery is not None:
+                            self._emit_completion(delivery)
         finally:
             # If the shell exits before emitting a marker, do not leave the
             # agent waiting forever for a completion that can never arrive.
@@ -357,7 +384,7 @@ class TerminalManager:
         Background terminals submit commands immediately; their timeout is
         intentionally ignored because the persistent shell may run commands
         for an arbitrary length of time. Completion is returned later through
-        the configured callback or drain_completed_background_commands().
+        the configured completion callback.
         ``until`` (background only) is a regex: the first output line that
         matches produces a one-time ``terminal_matched`` event.
         """
@@ -411,15 +438,17 @@ class TerminalManager:
                 started_at=time.monotonic(),
                 until=until_pattern,
             )
+            # The shell reads its commands from the stdin pipe, so a command
+            # that reads stdin would swallow the marker line and never
+            # complete. The command therefore runs in a block whose stdin is
+            # NUL (/dev/null); the block keeps shell state (cd, set, export).
             if sys.platform == "win32":
-                # `cmd /Q` suppresses command echo. Keep the user's command
-                # in the persistent shell so its quoting and shell state are
-                # unchanged; the marker is emitted on the following line
-                # while ERRORLEVEL still belongs to that command. `ver`
-                # resets ERRORLEVEL for the next queued command (built-ins
-                # such as `echo` do not reliably do so).
+                # `cmd /Q` suppresses command echo. The marker is emitted on
+                # the following line while ERRORLEVEL still belongs to that
+                # command. `ver` resets ERRORLEVEL for the next queued
+                # command (built-ins such as `echo` do not reliably do so).
                 wrapped_command = (
-                    f"{command}\n"
+                    f"(\n{command}\n) <nul\n"
                     f"echo {marker}:%errorlevel%\n"
                     f"ver >nul 2>nul\n"
                 )
@@ -427,7 +456,7 @@ class TerminalManager:
                 # Print a leading newline for the same no-trailing-newline
                 # case, then report the command's status from the same shell.
                 wrapped_command = (
-                    f"{command}\n"
+                    f"{{\n{command}\n}} </dev/null\n"
                     f"printf '\\n{marker}:%s\\n' \"$?\"\n"
                 )
 
@@ -469,6 +498,10 @@ class TerminalManager:
             "text": True,
             "encoding": "utf-8",
             "errors": "replace",
+            # Never inherit the host's stdin: under pythonw, a detached
+            # gateway or pytest capture it is invalid ([WinError 6]).
+            "stdin": subprocess.DEVNULL,
+            "cwd": self.cwd,
         }
         if sys.platform == "win32":
             process_kwargs["creationflags"] = getattr(
@@ -572,7 +605,8 @@ class TerminalManager:
         if sys.platform != "win32":
             try:
                 out = subprocess.run(
-                    ["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=2
+                    ["pgrep", "-P", str(pid)], stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, timeout=2,
                 ).stdout
             except Exception:
                 return []
@@ -623,6 +657,7 @@ class TerminalManager:
         if sys.platform == "win32":
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=5,
@@ -635,13 +670,6 @@ class TerminalManager:
             os.kill(pid, signal.SIGTERM)
         except Exception:
             pass
-
-    def drain_completed_background_commands(self) -> List[dict]:
-        """Return and remove background completions in finish order."""
-        with self._lock:
-            completions = list(self._completed_background_commands)
-            self._completed_background_commands.clear()
-        return completions
 
     @classmethod
     def format_background_completion(cls, event: dict) -> str:

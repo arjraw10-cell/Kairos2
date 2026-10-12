@@ -59,6 +59,37 @@ class SessionStorageTests(unittest.TestCase):
                 self.assertIn("chat_legacy", saved["sessions"])
                 self.assertTrue(legacy_file.exists())
 
+    def test_chats_saved_in_the_same_second_keep_separate_ids(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            workspace = Path(temp) / "project"
+            workspace.mkdir()
+            with patch("kairos.tools.session.Path.home", return_value=home), \
+                    patch("kairos.tools.session.time.strftime", return_value="2024-01-01 00:00:00"):
+                manager = SessionManager(workspace)
+                manager.save_chat([{"role": "system", "content": "s"}, {"role": "user", "content": "first"}])
+                manager.new_session()
+                manager.save_chat([{"role": "system", "content": "s"}, {"role": "user", "content": "second"}])
+
+                previews = sorted(s["preview"] for s in manager.list_sessions())
+                self.assertEqual(previews, ["first", "second"])
+
+    def test_corrupt_legacy_store_is_recovered_without_modifying_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            workspace = Path(temp) / "project"
+            legacy_file = workspace / "chats" / "chats.json"
+            legacy_file.parent.mkdir(parents=True)
+            session = {"timestamp": "t", "preview": "old", "messages": [{"role": "user", "content": "old"}]}
+            corrupt = json.dumps({"chat_legacy": session}) + "\n{trailing garbage"
+            legacy_file.write_text(corrupt, encoding="utf-8")
+
+            with patch("kairos.tools.session.Path.home", return_value=home):
+                manager = SessionManager(workspace)
+                self.assertEqual(manager.load_session("chat_legacy"), session["messages"])
+
+            self.assertEqual(legacy_file.read_text(encoding="utf-8"), corrupt)
+
 
 if __name__ == "__main__":
     unittest.main()

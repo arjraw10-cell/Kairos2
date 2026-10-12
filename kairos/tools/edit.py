@@ -1,19 +1,47 @@
-from pathlib import Path
 from typing import Optional
-from .base import ToolResult
+from .base import ToolResult, resolve_path
+
+
+def _to_crlf(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\n", "\r\n")
 
 
 class EditTool:
-    """Strict find-and-replace edit using absolute paths."""
+    """Strict find-and-replace edit. Relative paths resolve against ``workspace``.
+
+    The file is edited as raw UTF-8 text: its existing line endings and every
+    byte outside the replaced span are preserved. Files that are not valid
+    UTF-8 are refused rather than rewritten with replacement characters.
+    """
+
+    MAX_REPORTED_MATCHES = 20
+
+    def __init__(self, workspace: Optional[str] = None):
+        self.workspace = workspace
 
     def __call__(self, path: str, oldText: str, newText: str) -> ToolResult:
         try:
-            resolved = Path(path).resolve()
+            resolved = resolve_path(path, self.workspace)
 
             if not resolved.exists():
                 return ToolResult(False, "", f"File not found: {path}")
+            if not oldText:
+                return ToolResult(False, "", "oldText must not be empty.")
 
-            content = resolved.read_text(encoding="utf-8", errors="replace")
+            try:
+                content = resolved.read_bytes().decode("utf-8")
+            except UnicodeDecodeError as e:
+                return ToolResult(
+                    False, "",
+                    f"{path} is not valid UTF-8 ({e.reason} at byte {e.start}); "
+                    "edit refuses to rewrite it because that would corrupt its bytes.",
+                )
+
+            # The model writes "\n"; in a file that mostly uses CRLF, match and
+            # insert CRLF so the file keeps its line endings.
+            crlf = content.count("\r\n")
+            if crlf > content.count("\n") - crlf:
+                oldText, newText = _to_crlf(oldText), _to_crlf(newText)
 
             # Find all occurrences
             matches = []
@@ -40,7 +68,7 @@ class EditTool:
 
             if len(matches) > 1:
                 line_positions = []
-                for match_idx in matches:
+                for match_idx in matches[: self.MAX_REPORTED_MATCHES]:
                     line_num = content[:match_idx].count("\n") + 1
                     line_positions.append(line_num)
 
@@ -57,7 +85,7 @@ class EditTool:
                 + newText
                 + content[matches[0] + len(oldText) :]
             )
-            resolved.write_text(new_content, encoding="utf-8", errors="replace")
+            resolved.write_bytes(new_content.encode("utf-8"))
 
             line_num = content[: matches[0]].count("\n") + 1
             return ToolResult(True, f"Successfully edited {path} at line {line_num}")

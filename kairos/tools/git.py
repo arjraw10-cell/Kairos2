@@ -19,6 +19,11 @@ class GitTool:
                 cwd=self._workspace,
                 capture_output=True,
                 text=True,
+                # git writes UTF-8; the Windows code page would fail to
+                # decode it and leave stdout as None.
+                encoding="utf-8",
+                errors="replace",
+                stdin=subprocess.DEVNULL,
                 timeout=timeout,
             )
             output = (result.stdout + result.stderr).strip()
