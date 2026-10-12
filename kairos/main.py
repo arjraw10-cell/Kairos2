@@ -6,6 +6,7 @@ same agent events (``assistant.token``, ``tool.started``, ...) to
 ``CLI.handle_event``, so they look the same.
 """
 import argparse
+import logging
 import os
 import re
 import signal
@@ -22,10 +23,6 @@ from kairos.cli import CLI, _paste_registry
 from kairos.gateway_client import GatewayClient, GatewayError
 from kairos.resume import sanitize_history_for_resume
 from kairos.wake import format_notifications
-
-# Backwards-compatible private name for callers that imported the original
-# helper from kairos.main before the shared resume module was introduced.
-_sanitize_history_for_resume = sanitize_history_for_resume
 
 COMMANDS = ("/quit", "/clear", "/reset", "/compact", "/resume", "/model", "/effort", "/stop")
 PROVIDERS = ("openai", "anthropic", "openrouter")
@@ -136,11 +133,29 @@ def _close_agent(agent) -> None:
     agent.stop_subagents()
     for terminal_id in list(agent.terminal_manager.terminals):
         agent.terminal_manager.close_terminal(terminal_id)
-    if agent.browser_manager.is_open:
+    # The browser also when no window is open: after a failed launch or a
+    # window closed by hand its Playwright worker can still be running.
+    for manager in (agent.browser_manager, agent.desktop_manager):
         try:
-            agent.browser_manager.close()
+            manager.close()
         except Exception:
             pass
+
+
+_WORKSPACE_LINE = re.compile(r"^Your current workspace is: (.+)$", re.MULTILINE)
+
+
+def _chat_workspace(history: list) -> str | None:
+    """The folder a saved offline chat ran in, from its system prompt.
+
+    Chats of all fresh folders share one store, which does not record each
+    chat's folder; the Agent's system prompt states it.
+    """
+    if history and history[0].get("role") == "system":
+        match = _WORKSPACE_LINE.search(_text(history[0].get("content")))
+        if match:
+            return match.group(1).strip()
+    return None
 
 
 # ------------------------------------------------------------------ #
@@ -392,7 +407,16 @@ class OfflineBackend:
             if sanitized is None:
                 raise ValueError("That chat has no resumable state.")
             self.save()
-            self.agent.reset()
+            # Without a path the list spans every fresh folder: continue the
+            # chat in its own folder, as the gateway does.
+            workspace = (None if self._explicit else _chat_workspace(history)) or self.workspace
+            if _same_path(workspace, self.workspace):
+                self.agent.reset()
+            else:
+                _close_agent(self.agent)
+                Path(workspace).mkdir(parents=True, exist_ok=True)
+                self.workspace = workspace
+                self.agent = self._new_agent(workspace)
             self.agent.conversation_history = sanitized
             self.sessions.set_current_session(conversation_id)
             self._forget_pending()
@@ -560,6 +584,8 @@ class GatewayBackend:
     def _wait(self, run_id: str, stop: threading.Event, on_event):
         """Render this run's events until it ends or the user stops it."""
         while True:
+            # Ctrl+C can land anywhere here, also while an event renders;
+            # it must always cancel the run.
             try:
                 if stop.is_set():
                     # Do not wait for the run to wind down: the prompt comes
@@ -571,18 +597,44 @@ class GatewayBackend:
                         pass
                     return "interrupted", None
                 event = self.client.next_event(0.05)
+                if event is None:
+                    continue
+                name, data = event.get("event"), event.get("data") or {}
+                if event.get("run_id") != run_id:
+                    self._background(event)  # e.g. a wake run this message queued behind
+                    continue
+                if name in _RUN_ENDED:
+                    return _run_outcome(name, data)
+                on_event(name, data)
             except KeyboardInterrupt:
                 stop.set()
-                continue
-            if event is None:
-                continue
-            name, data = event.get("event"), event.get("data") or {}
-            if event.get("run_id") != run_id:
-                self._background(event)  # e.g. a wake run this message queued behind
-                continue
-            if name in _RUN_ENDED:
-                return _run_outcome(name, data)
-            on_event(name, data)
+
+    def _start(self, command: str, payload: dict, stop: threading.Event) -> str:
+        """Send the command that starts a run and return its run id.
+
+        It is sent from a helper thread: Ctrl+C meanwhile sets ``stop`` and
+        the ack is still awaited, so ``_wait`` can cancel the run.
+        """
+        result: dict = {}
+
+        def send():
+            try:
+                result["ack"] = self.client.request(command, self._id, payload)
+            except Exception as exc:
+                result["error"] = exc
+
+        sender = threading.Thread(target=send, daemon=True)
+        sender.start()
+        while True:
+            try:
+                sender.join(0.05)
+                if not sender.is_alive():
+                    break
+            except KeyboardInterrupt:
+                stop.set()
+        if "error" in result:
+            raise result["error"]
+        return result["ack"]["run_id"]
 
     def _settle(self, timeout: float = 30.0) -> None:
         """Wait for runs stopped with Esc to end before a control command."""
@@ -601,16 +653,12 @@ class GatewayBackend:
         # Hold the stream from before the send, so the pump cannot take
         # this run's first events.
         with self._events():
-            ack = self.client.request("message.send", self._id, payload)
-            return self._wait(ack["run_id"], stop, on_event)
+            return self._wait(self._start("message.send", payload, stop), stop, on_event)
 
     def continue_run(self, stop: threading.Event, on_event):
         with self._events():
-            ack = self.client.request(
-                "conversation.continue", self._id,
-                {"instruction": CONTINUE_INSTRUCTION, "source": "cli"},
-            )
-            return self._wait(ack["run_id"], stop, on_event)
+            payload = {"instruction": CONTINUE_INSTRUCTION, "source": "cli"}
+            return self._wait(self._start("conversation.continue", payload, stop), stop, on_event)
 
     def compact(self) -> str:
         self._settle()
@@ -701,12 +749,37 @@ def _handle_sighup(sig, frame):
     sys.exit(0)
 
 
+_console_handler = None  # keeps the ctypes callback alive
+
+
+def _on_console_event(event: int) -> bool:
+    """Windows console control handler: save when the window closes."""
+    if event in (2, 5, 6):  # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+        try:
+            _save_now()
+        except Exception:
+            pass
+    # Not handled: Ctrl+C still becomes KeyboardInterrupt, and after a close
+    # Windows ends the process as usual.
+    return False
+
+
 def _start_signal_handlers():
     """Save the chat when the window closes. Ctrl+C arrives as
     KeyboardInterrupt and stops the running request."""
+    global _console_handler
     signal.signal(signal.SIGTERM, _handle_sigterm)
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, _handle_sighup)
+    if sys.platform == "win32":
+        # Closing the console window sends no signal on Windows. The handler
+        # runs on a system thread; Windows waits for it (about 5 s at most).
+        import ctypes
+        from ctypes import wintypes
+
+        handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+        _console_handler = handler_type(_on_console_event)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_handler, True)
 
 
 def _start_auto_save(interval_seconds: int = 60):
@@ -715,7 +788,11 @@ def _start_auto_save(interval_seconds: int = 60):
     def _loop():
         while True:
             time.sleep(interval_seconds)
-            _save_now()
+            try:
+                _save_now()
+            except Exception:
+                # One failed save (a locked file, a full disk) must not end auto-saving.
+                logging.getLogger(__name__).warning("Auto-save failed", exc_info=True)
 
     threading.Thread(target=_loop, daemon=True).start()
 

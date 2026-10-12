@@ -194,6 +194,137 @@ class BrowserManagerTests(unittest.TestCase):
                 del self.bm.DEFAULT_PROFILES_DIR
 
 
+class _FakeContext:
+    def __init__(self):
+        self.pages, self.closed = [], False
+
+    def on(self, *args):
+        pass
+
+    async def new_page(self):
+        import types
+
+        return types.SimpleNamespace(is_closed=lambda: False)
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeChromium:
+    """launch_persistent_context that takes `delay` seconds, like a real launch."""
+
+    def __init__(self, delay):
+        self.delay, self.launched = delay, []
+
+    async def launch_persistent_context(self, path, **kwargs):
+        import asyncio
+
+        await asyncio.sleep(self.delay)
+        ctx = _FakeContext()
+        self.launched.append(ctx)
+        return ctx
+
+
+class BrowserManagerUnitTests(unittest.TestCase):
+    """BrowserManager logic that needs no real browser."""
+
+    def manager(self, delay=0.0):
+        import asyncio
+        import tempfile
+        import threading
+        import types
+
+        from kairos.browser_manager import BrowserManager
+
+        bm = BrowserManager()
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        bm.DEFAULT_PROFILES_DIR = Path(root.name)
+        fake_pw = types.SimpleNamespace(chromium=_FakeChromium(delay))
+        # build_args, ensure_binary, IGNORE_DEFAULT_ARGS, patch_context_async, resolve_config
+        bm._cloak = lambda: (lambda **k: [], lambda: "chrome.exe", [], lambda *a: None, lambda *a: None)
+        worker, ready = bm._worker, threading.Event()
+
+        def run():
+            worker._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(worker._loop)
+            worker.pw = fake_pw
+            ready.set()
+            worker._loop.run_forever()
+            worker._loop.close()
+
+        worker._thread = threading.Thread(target=run, daemon=True)
+        worker._thread.start()
+        ready.wait()
+        self.addCleanup(lambda: worker._loop.call_soon_threadsafe(worker._loop.stop))
+        bm._state = lambda mode="full": asyncio.sleep(0, result="state")
+        return bm, fake_pw.chromium
+
+    def test_cancelled_profile_launch_releases_the_profile_and_closes_late_context(self):
+        import threading
+
+        from kairos import browser_manager as bmod
+
+        bm, chromium = self.manager(delay=0.5)
+        threading.Timer(0.1, bm.cancel_active_operation).start()
+        with self.assertRaises(Exception):
+            bm.profile("use", "work")  # Esc while the browser is still launching
+        # The cancel reaches the worker's loop a moment after the call returned.
+        deadline = time.time() + 5
+        while (bmod._open_profiles or not (chromium.launched and chromium.launched[0].closed)) and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(bmod._open_profiles, set())
+        self.assertTrue(chromium.launched[0].closed, "a browser that finished launching after Esc is closed")
+
+        other, _ = self.manager()  # another conversation in the same process
+        other.DEFAULT_PROFILES_DIR = bm.DEFAULT_PROFILES_DIR
+        self.assertIn("Relaunched in profile 'work'", other.profile("use", "work"))
+        other._reset()
+
+    def test_failed_setup_after_launch_releases_the_profile_and_closes_it(self):
+        from kairos import browser_manager as bmod
+
+        bm, chromium = self.manager()
+
+        def patch_fails(*args):
+            raise RuntimeError("humanize patch failed")
+
+        bm._cloak = lambda: (lambda **k: [], lambda: "chrome.exe", [], patch_fails, lambda *a: None)
+        with self.assertRaises(RuntimeError):
+            bm.profile("use", "work")
+        self.assertEqual(bmod._open_profiles, set())
+        self.assertFalse(bm.is_open)
+        deadline = time.time() + 5
+        while not chromium.launched[0].closed and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(chromium.launched[0].closed)
+
+    def test_screenshots_in_the_same_second_get_different_files(self):
+        import tempfile
+        from unittest import mock
+
+        from kairos.browser_manager import BrowserManager
+
+        bm = BrowserManager()
+        bm._run = lambda fn, timeout=120: (b"png", "about:blank")
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"USERPROFILE": home, "HOME": home}):
+            first, second = bm.screenshot()[1], bm.screenshot()[1]
+            self.assertNotEqual(first.split("Saved to: ")[1], second.split("Saved to: ")[1])
+            self.assertEqual(len(list((Path(home) / ".kairos" / "screenshots").iterdir())), 2)
+
+    def test_network_listing_keeps_the_end_of_long_urls(self):
+        from kairos.browser_manager import BrowserManager
+
+        url = "https://example.com/" + "a/" * 80 + "checkout.js?v=2"
+        entry = {"method": "GET", "url": url, "type": "script", "status": 200, "duration_ms": 5, "failure": None}
+        bm = BrowserManager()
+        bm._run = lambda fn, timeout=120: [entry]
+        line = bm.network()
+        self.assertIn("https://example.com/", line)
+        self.assertIn("checkout.js?v=2", line)
+        self.assertLess(len(line), 140)
+
+
 class ToolSchemaTests(unittest.TestCase):
     def test_browser_schema_matches_manager_signatures(self):
         """Dispatch passes schema arguments straight through as keyword arguments."""

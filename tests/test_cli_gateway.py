@@ -434,9 +434,11 @@ class FakeOfflineAgent:
     def __init__(self, workspace):
         type(self).instances.append(self)
         self.cwd = Path(workspace)
-        self.conversation_history = [{"role": "system", "content": "system"}]
+        # The real system prompt states the workspace the same way.
+        self.conversation_history = [{"role": "system", "content": f"## Workspace\nYour current workspace is: {workspace}"}]
         self.terminal_manager = SimpleNamespace(terminals={})
-        self.browser_manager = SimpleNamespace(is_open=False)
+        self.browser_manager = mock.Mock(is_open=False)
+        self.desktop_manager = mock.Mock()
         self.subagent_tool = SimpleNamespace()
         self.configured = []
         self.received = []
@@ -580,6 +582,60 @@ class OfflineBackendTests(OfflineCase):
         last, mid_execution = backend.resume(sessions[0]["id"])
         self.assertEqual(last, "done")
         backend.close()
+
+    def test_resume_without_path_continues_in_the_chats_own_folder(self):
+        backend = kmain.OfflineBackend(None)
+        backend.run("hi", None, threading.Event(), lambda e, d: None)
+        backend.reset()  # now in a second fresh folder
+        second = backend.agent
+        backend.resume(backend.list_conversations()[0]["id"])
+        self.assertEqual(Path(backend.workspace), self.created[0])
+        self.assertEqual(backend.agent.cwd, self.created[0])  # git, terminals, skills, prompt
+        self.assertEqual(backend.agent.get_history()[-1]["content"], "done")
+        second.desktop_manager.close.assert_called_once()
+        backend.close()
+
+    def test_reset_and_exit_close_the_browser_and_desktop(self):
+        backend = kmain.OfflineBackend(None)
+        first = backend.agent
+        backend.reset()
+        backend.close()
+        for agent in (first, backend.agent):
+            # The browser even without an open window (its worker may still run).
+            agent.browser_manager.close.assert_called_once()
+            agent.desktop_manager.close.assert_called_once()
+
+    def test_closing_the_console_window_saves_the_chat(self):
+        saves = []
+        with mock.patch.object(kmain, "_backend", SimpleNamespace(save=lambda: saves.append(1))):
+            self.assertFalse(kmain._on_console_event(0))  # Ctrl+C: left to Python
+            self.assertEqual(saves, [])
+            self.assertFalse(kmain._on_console_event(2))  # CTRL_CLOSE_EVENT
+            self.assertEqual(saves, [1])
+        if sys.platform == "win32":
+            import ctypes
+
+            with mock.patch.object(ctypes.windll.kernel32, "SetConsoleCtrlHandler") as register, \
+                    mock.patch.object(kmain.signal, "signal"):
+                kmain._start_signal_handlers()
+            handler, add = register.call_args.args
+            self.assertTrue(add)
+            with mock.patch.object(kmain, "_backend", SimpleNamespace(save=lambda: saves.append(2))):
+                handler(2)  # the registered ctypes callback
+            self.assertEqual(saves, [1, 2])
+
+    def test_auto_save_keeps_running_after_a_failed_save(self):
+        calls = []
+
+        def save():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("disk full")
+
+        with mock.patch.object(kmain, "_backend", SimpleNamespace(save=save)), \
+                self.assertLogs("kairos.main", "WARNING"):
+            kmain._start_auto_save(interval_seconds=0.02)
+            _wait_for(lambda: len(calls) >= 3)
 
 
 # ---------------------------------------------------------------------- #
@@ -925,6 +981,114 @@ class PromptCoexistenceTests(unittest.TestCase):
         self.assertEqual(len(escapes), 1)
         self.assertFalse(cli._wake)
         self.assertIsNone(cli._above)
+
+
+# ---------------------------------------------------------------------- #
+#  Ctrl+C in gateway runs, typed-ahead input, one reply panel              #
+# ---------------------------------------------------------------------- #
+
+class _RunClient(FakeClient):
+    """message.send starts run1, whose first events are queued."""
+
+    def __init__(self, send_delay=0.0):
+        super().__init__()
+        self.send_delay = send_delay
+        self.queue = []
+
+    def request(self, command, conversation_id=None, payload=None, timeout=None):
+        if command != "message.send":
+            return super().request(command, conversation_id, payload, timeout)
+        self.requests.append((command, conversation_id, dict(payload or {})))
+        time.sleep(self.send_delay)
+        for name, data in (("assistant.stream_started", {}), ("assistant.token", {"delta": "x"})):
+            self.queue.append({"event": name, "run_id": "run1", "conversation_id": conversation_id, "data": data})
+        return {"run_id": "run1"}
+
+    def next_event(self, timeout):
+        return self.queue.pop(0) if self.queue else None
+
+    def cancelled(self):
+        return [p.get("run_id") for c, _, p in self.requests if c == "run.cancel"]
+
+
+class GatewayCtrlCTests(unittest.TestCase):
+    def run_message(self, client, on_event):
+        backend = kmain.GatewayBackend(None, client)
+        try:
+            return backend.run("hi", None, threading.Event(), on_event)
+        except KeyboardInterrupt:
+            self.fail("Ctrl+C escaped run(): the prompt came back without cancelling the run")
+
+    def test_ctrl_c_while_an_event_renders_cancels_the_run(self):
+        def on_event(name, data):
+            if name == "assistant.token":
+                raise KeyboardInterrupt
+
+        client = _RunClient()
+        self.assertEqual(self.run_message(client, on_event), ("interrupted", None))
+        self.assertEqual(client.cancelled(), ["run1"])
+
+    def test_ctrl_c_while_the_message_is_sent_cancels_the_run(self):
+        import _thread
+
+        client = _RunClient(send_delay=0.5)
+        threading.Timer(0.1, _thread.interrupt_main).start()  # Ctrl+C in the main thread
+        self.assertEqual(self.run_message(client, lambda name, data: None), ("interrupted", None))
+        self.assertEqual(client.cancelled(), ["run1"])
+
+
+class TypedAheadTests(unittest.TestCase):
+    def listen(self, keys):
+        """Feed *keys* to the Windows Esc listener (msvcrt mocked)."""
+        cli, _ = _recording_cli()
+        queue = list(keys)
+        fake = SimpleNamespace(kbhit=lambda: bool(queue), getwch=lambda: queue.pop(0))
+        with mock.patch.dict(sys.modules, {"msvcrt": fake}):
+            cli._escape_listening = True
+            cli._escape_listener_thread = threading.Thread(target=cli._escape_listener_windows, daemon=True)
+            cli._escape_listener_thread.start()
+            _wait_for(lambda: not queue)
+            cli.stop_escape_listener()
+        return cli
+
+    def prompt_default(self, cli):
+        seen = {}
+
+        def prompt(message, **kwargs):
+            seen["default"] = kwargs.get("default")
+            return ""
+
+        cli._prompt = prompt
+        cli.get_user_input()
+        return seen["default"]
+
+    def test_arrow_keys_are_dropped_and_backspace_is_applied(self):
+        # Up, Left, "hi", Backspace, "!" typed while the agent works.
+        cli = self.listen(["\xe0", "H", "\xe0", "K", "h", "i", "\x08", "!"])
+        self.assertEqual(self.prompt_default(cli), "h!")
+
+    def test_typed_lines_are_prefilled_not_sent(self):
+        cli = self.listen(list("fix the bug\rand then run tests\r"))
+        self.assertEqual(self.prompt_default(cli), "fix the bug\nand then run tests")
+        self.assertEqual(self.prompt_default(cli), "")  # taken once
+
+
+class ReplyPrintedOnceTests(unittest.TestCase):
+    def test_a_wake_turn_starting_right_after_a_reply_does_not_print_it_again(self):
+        cli, out = _recording_cli(width=100)
+        cli._live = None
+        cli.handle_event("assistant.stream_started", {})
+        cli.handle_event("assistant.token", {"delta": "USER-REPLY"})
+        cli.handle_event("assistant.stream_ended", {"content": "USER-REPLY", "has_tool_calls": False})
+        # The wake turn starts before the user turn's finish_turn runs.
+        cli.handle_event("wake.started", {"notifications": [SUBAGENT_DONE]})
+        cli.finish_turn("completed", "USER-REPLY")
+        cli.handle_event("assistant.stream_started", {})
+        cli.handle_event("assistant.token", {"delta": "WAKE-REPLY"})
+        cli.handle_event("assistant.stream_ended", {"content": "WAKE-REPLY", "has_tool_calls": False})
+        cli.handle_event("wake.ended", {"outcome": "completed", "payload": "WAKE-REPLY"})
+        self.assertEqual(out.getvalue().count("USER-REPLY"), 1)
+        self.assertEqual(out.getvalue().count("WAKE-REPLY"), 1)
 
 
 if __name__ == "__main__":
