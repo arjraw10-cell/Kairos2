@@ -14,6 +14,7 @@ class CompactionAccountingTests(unittest.TestCase):
         agent.COMPACT_RESERVE_TOKENS = 1_000
         agent.COMPACT_SUMMARY_PROMPT = "summarize"
         agent.COMPACT_UPDATE_PROMPT = "update"
+        agent._api_context = None
         return agent
 
     def test_tool_metadata_and_schema_are_counted(self):

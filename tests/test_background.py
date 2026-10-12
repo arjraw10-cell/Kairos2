@@ -9,9 +9,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from kairos import providers
 from kairos.agent import SUBAGENT_TOOL_NAMES, Agent
 from kairos.terminal_manager import TerminalManager
-from kairos.tools.subagent import SubAgentTool
+from kairos.tools.subagent import SubAgentTool, _SubAgent
 from kairos.wake import NOTIFICATION_PREFIX
 
 CONFIG = {
@@ -53,6 +54,7 @@ class FakeChild:
     def __init__(self, workspace):
         self._interrupt_event = threading.Event()
         self.release = threading.Event()
+        self.stubborn = False  # True: a tool call in flight ignores the stop
         self.on_tool_call = None
         self.prompts = []
         FakeChild.instances.append(self)
@@ -60,12 +62,15 @@ class FakeChild:
     def _use_spec(self, spec, effort):
         pass
 
+    def _setup_system_prompt(self):
+        pass
+
     def run(self, prompt):
         self.prompts.append(prompt)
         for name, args in self.TOOLS:
             self.on_tool_call(name, args)
         while not self.release.is_set():
-            if self._interrupt_event.is_set():
+            if self._interrupt_event.is_set() and not self.stubborn:
                 return "[Interrupted]"
             time.sleep(0.01)
         self.release.clear()
@@ -138,6 +143,31 @@ class SubAgentToolTests(unittest.TestCase):
         self.assertIn("edited file: a.py | search: 'x' in src (timeout: 10.0s) | git status", listing)
         self.tool.stop_all()
 
+    def test_message_waits_for_a_terminated_run_to_finish(self):
+        # Reproduction: terminate then message ran two threads on one Agent;
+        # the old run reported its result as the reply and the new one was lost.
+        sub_id = self.spawn("first")
+        child = FakeChild.instances[0]
+        child.stubborn = True
+        self.tool.STOP_WAIT_SECONDS = 0.05
+        self.assertTrue(self.tool.terminate(sub_id).success)
+        refused = self.tool.message(sub_id, "second")
+        self.assertFalse(refused.success)
+        self.assertIn("still stopping", refused.error)
+        self.assertEqual(child.prompts, ["first"])
+
+        # A run that finishes within the wait is waited for; its own result
+        # is not reported (it was terminated).
+        self.tool.STOP_WAIT_SECONDS = 5
+        threading.Timer(0.05, child.release.set).start()
+        self.assertTrue(self.tool.message(sub_id, "second").success)
+        self.assertTrue(wait_for(lambda: child.prompts == ["first", "second"]))
+        child.release.set()
+        self.assertTrue(wait_for(lambda: self.events))
+        time.sleep(0.05)
+        self.assertEqual(len(self.events), 1)
+        self.assertIn("result for second", self.events[0]["text"])
+
     def test_cap_terminate_stop_all_and_lost(self):
         ids = [self.spawn(f"t{i}") for i in range(SubAgentTool.MAX_RUNNING)]
         over = self.tool.spawn("one too many")
@@ -186,6 +216,15 @@ class AgentBackgroundTests(ProviderConfigMixin, unittest.TestCase):
         self.assertFalse(SUBAGENT_TOOL_NAMES & child)
         self.assertNotIn("get_subagent_result", parent)
         self.assertIn("stop_command", child)
+
+    def test_subagent_prompt_describes_only_its_tools(self):
+        tool = SubAgentTool(self.workspace, lambda: (providers.resolve(), None), lambda e: None, lambda s: None)
+        child = tool._create_sub_agent(_SubAgent(id="x", prompt="p"))
+        for absent in ("## Browser Tools", "browser_", "browse the web", "when a sub-agent finishes"):
+            self.assertNotIn(absent, child.system_prompt)
+        self.assertIn("## Native Desktop Tools", child.system_prompt)
+        self.assertEqual(child.conversation_history, [{"role": "system", "content": child.system_prompt}])
+        self.assertIn("## Browser Tools", Agent(self.workspace).system_prompt)
 
     def test_child_cannot_call_subagent_tools_directly(self):
         agent = Agent(self.workspace)

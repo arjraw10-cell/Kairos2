@@ -138,6 +138,47 @@ def _repair_trailing_tool_chain(result: list[dict]) -> None:
     result[chain_start:] = repaired
 
 
+def repair_tool_chains(history: list[dict]) -> int:
+    """Make every tool-call chain in *history* API-valid, in place.
+
+    Each assistant ``tool_calls`` message is followed by exactly one result
+    per call, in call order (missing results are synthesized); tool messages
+    that answer no preceding assistant tool call are removed. Returns the
+    number of chains rebuilt plus orphaned tool messages removed (0 when the
+    history was already valid).
+    """
+    repaired: list[dict] = []
+    fixes = 0
+    i = 0
+    while i < len(history):
+        message = history[i]
+        i += 1
+        if message.get("role") == "tool":
+            fixes += 1  # not part of a chain handled below: orphaned
+            continue
+        repaired.append(message)
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        chain_end = i
+        while chain_end < len(history) and history[chain_end].get("role") == "tool":
+            chain_end += 1
+        chain = history[i:chain_end]
+        expected = [_extract_tool_call(call, index) for index, call in enumerate(message["tool_calls"])]
+        existing: dict[str, dict] = {}
+        for result in chain:
+            call_id = result.get("tool_call_id", "")
+            if call_id not in existing:
+                existing[call_id] = result
+        rebuilt = [existing.get(call_id) or _make_synthetic_result(call_id, name) for call_id, name in expected]
+        if len(rebuilt) != len(chain) or any(a is not b for a, b in zip(rebuilt, chain)):
+            fixes += 1
+        repaired.extend(rebuilt)
+        i = chain_end
+    if fixes:
+        history[:] = repaired
+    return fixes
+
+
 def sanitize_history_for_resume(
     history: list[dict],
 ) -> tuple[list[dict] | None, str, bool]:

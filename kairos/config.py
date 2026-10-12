@@ -10,7 +10,6 @@ class Config:
 
     DEFAULT_MAX_TOOL_RESULT_CHARS = 20_000
     DEFAULT_CONTEXT_WINDOW = 300_000
-    DEFAULT_CONTEXT_RESERVE_TOKENS = 16_384
 
     @classmethod
     @lru_cache(maxsize=1)

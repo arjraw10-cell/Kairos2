@@ -3,7 +3,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Callable, Tuple, Generator
+from typing import List, Dict, Any, Optional, Callable, Tuple
 import httpx
 from openai import APIStatusError, APIConnectionError, RateLimitError, AuthenticationError
 
@@ -23,7 +23,7 @@ from .tools import (
     DesktopHotkeyTool, DesktopScrollTool, DesktopMoveTool, DesktopDragTool, DesktopWindowActionTool,
 )
 from .tools.skills import SkillManager
-from .resume import _repair_trailing_tool_chain
+from .resume import _repair_trailing_tool_chain, repair_tool_chains
 from .wake import format_notifications
 
 # Sub-agents never get these (schema and dispatch both refuse them).
@@ -37,7 +37,6 @@ class APIRequestError(Exception):
 
 
 class Agent:
-    MAX_HISTORY_MESSAGES = 10000000
     API_MAX_RETRIES = 2  # Two retries after the initial request.
     API_RETRY_BASE_DELAY = 1.0
     MAX_TOOL_RESULT_CHARS = Config.DEFAULT_MAX_TOOL_RESULT_CHARS
@@ -56,12 +55,10 @@ class Agent:
         # the request.  It stays set until ``run`` reaches its cleanup so a
         # stop cannot be lost between API steps.
         self._interrupt_event = threading.Event()
-        self._stop_requested = False  # retained for compatibility with callers
         self._processing_lock = threading.Lock()
         self._is_processing = False
         self._active_stream_lock = threading.Lock()
         self._active_stream = None
-        self._partial_stream_content = ""
         self._interrupted_pending = False
         # Background events (sub-agents, terminals) owned by the Agent: those
         # that arrive during a run (injected before its next API step) and,
@@ -71,6 +68,10 @@ class Agent:
 
         # Token counter
         self.tokens = TokenCounter(self.model, self.spec.context_window, self.spec.pricing)
+        # (prompt_tokens, history length) of the last API request that
+        # reported usage; auto-compaction builds on it (see
+        # _refresh_context_tokens). None after compaction or reset.
+        self._api_context: Optional[Tuple[int, int]] = None
 
         # Working directory (used by git and search defaults)
         self.cwd = Path(workspace).resolve()
@@ -255,31 +256,62 @@ class Agent:
             self._is_processing = False
             return True
 
+    def _end_run(self) -> None:
+        """Clear the processing flag; hand events the run did not show to the
+        model (it ended by error, stop or an empty response) back to the host.
+
+        The host ignored them while they were marked ``in_run``, so without
+        this they would wait for the next user message instead of waking the
+        agent. Without a host callback they stay queued for the next run.
+        """
+        with self._processing_lock:
+            self._is_processing = False
+            callback = self.on_background_event
+            leftovers = list(self._background_events) if callback else []
+            if callback:
+                self._background_events.clear()
+        for event in leftovers:
+            try:
+                callback(event)
+            except Exception:
+                pass
+
+    BROWSER_PROMPT = (
+        "## Browser Tools\n"
+        "The browser is a headed, humanized CloakBrowser. It launches automatically on the first browser tool call.\n"
+        "It passes bot detection (Cloudflare, reCAPTCHA, fingerprinting checks): its Chromium is patched at the source and every click, keystroke and scroll is humanized. Use it on sites that block scripts or plain HTTP fetches instead of giving up.\n"
+        "1. `browser_navigate` opens a URL (or back / forward / reload) and returns an accessibility snapshot.\n"
+        "2. Elements in the snapshot carry refs like [ref=e12]; refs inside iframes or after the page navigates look like f1e12. Pass them as `ref` to click/type/select/hover/drag. Always use refs from the latest snapshot.\n"
+        "3. Every action returns the resulting page state: on the same page only the changed snapshot lines, after navigation the full snapshot. Call `browser_snapshot` only to see the whole page again.\n"
+        "4. If an action opens an alert/confirm/prompt, the result says so; answer it with `browser_handle_dialog` before anything else.\n"
+        "5. `browser_search_page` finds text when a snapshot is truncated; `browser_evaluate` reads anything else.\n"
+        "6. `browser_screenshot` is for visual checks only; prefer snapshots for reading and acting.\n"
+        "7. Use `browser_profile use <name>` only when a task needs a login (profiles keep cookies and a fixed fingerprint); return with `browser_profile ephemeral`.\n\n"
+    )
+
     def _setup_system_prompt(self):
+        # A sub-agent has no browser and no sub-agent tools, and its final
+        # message goes to the parent: its prompt describes only what it has.
+        sub = self._is_subagent
         base = (
-            "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, inspect version control, and browse the web.\n\n"
+            "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, "
+            + ("and inspect version control.\n\n" if sub else "inspect version control, and browse the web.\n\n") +
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
             "Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
             "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, it will not automatically be injected, so you will have to look for the AGENTS.md file in that directory. Note that the AGENTS.md does not always exist.\n\n"
-            "When you finish a task, the final message (that has no tool calls) will be showm to user as your message to them.\n\n"
+            + ("When you finish your task, your final message (that has no tool calls) is returned as your result to the agent that started you.\n\n" if sub else
+               "When you finish a task, the final message (that has no tool calls) will be showm to user as your message to them.\n\n") +
             "## Terminal Tools\n"
             "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call requires a finite positive timeout; values above 20 seconds are capped at 20 seconds. Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately and the persistent shell stays alive. The full output remains available through read_logs.\n\n"
             "## Background Work\n"
-            "Background terminal commands and sub-agents report back with a `[Background notification]` message: when a command finishes (or its `until` pattern matches) and when a sub-agent finishes or fails. If your turn has already ended, you are woken with the notification. Never poll, sleep or wait for background work: start it, tell the user what is running, and end your turn or keep working on something else.\n\n"
+            + ("Background terminal commands report back with a `[Background notification]` message when a command finishes (or its `until` pattern matches), delivered before your next step while you are still working. Your final message ends your task; notifications that arrive after it reach you only if you are messaged again, so get the background results you need (read_logs has the output) before finishing.\n\n" if sub else
+               "Background terminal commands and sub-agents report back with a `[Background notification]` message: when a command finishes (or its `until` pattern matches) and when a sub-agent finishes or fails. If your turn has already ended, you are woken with the notification. Never poll, sleep or wait for background work: start it, tell the user what is running, and end your turn or keep working on something else.\n\n") +
             f"## Tool Result Limits\nText returned by tools is capped before it is added to conversation history: up to {self.max_tool_result_chars:,} characters per tool result. Oversized results contain a truncation marker and preserve both the beginning and end. Use narrower commands or queries; for complete background-terminal output, use read_logs.\n\n"
             "## Web Search\n"
-            "Use `web_search` for quick facts and current events. Use the browser for pages that need interaction, or when web_search is unavailable.\n\n"
-            "## Browser Tools\n"
-            "The browser is a headed, humanized CloakBrowser. It launches automatically on the first browser tool call.\n"
-            "It passes bot detection (Cloudflare, reCAPTCHA, fingerprinting checks): its Chromium is patched at the source and every click, keystroke and scroll is humanized. Use it on sites that block scripts or plain HTTP fetches instead of giving up.\n"
-            "1. `browser_navigate` opens a URL (or back / forward / reload) and returns an accessibility snapshot.\n"
-            "2. Elements in the snapshot carry refs like [ref=e12]; refs inside iframes or after the page navigates look like f1e12. Pass them as `ref` to click/type/select/hover/drag. Always use refs from the latest snapshot.\n"
-            "3. Every action returns the resulting page state: on the same page only the changed snapshot lines, after navigation the full snapshot. Call `browser_snapshot` only to see the whole page again.\n"
-            "4. If an action opens an alert/confirm/prompt, the result says so; answer it with `browser_handle_dialog` before anything else.\n"
-            "5. `browser_search_page` finds text when a snapshot is truncated; `browser_evaluate` reads anything else.\n"
-            "6. `browser_screenshot` is for visual checks only; prefer snapshots for reading and acting.\n"
-            "7. Use `browser_profile use <name>` only when a task needs a login (profiles keep cookies and a fixed fingerprint); return with `browser_profile ephemeral`.\n\n"
+            + ("Use `web_search` for quick facts and current events. You have no browser: if web_search is unavailable, say so in your result.\n\n" if sub else
+               "Use `web_search` for quick facts and current events. Use the browser for pages that need interaction, or when web_search is unavailable.\n\n"
+               + self.BROWSER_PROMPT) +
             "## Native Desktop Tools\n"
             "Native desktop tools use Cua Driver. Start with `desktop_doctor`, then `desktop_list_windows`, and use `desktop_window_state(pid, window_id)` before every interaction. Prefer `element_index` values from the latest accessibility snapshot for click/type/key/scroll actions. Use x/y coordinates only as a fallback when the accessibility tree is missing, degraded, stale, or the action did not land; never infer coordinates from the tree without checking the matching screenshot. Re-snapshot after every state-changing action to verify the result. Desktop state is session-scoped and available to sub-agents.\n\n"
             f"## Workspace\nYour current workspace is: {self.cwd}"
@@ -1028,10 +1060,15 @@ class Agent:
         except Exception as e:
             # Dispatch lambdas read required arguments as a["x"]; a bare "'x'"
             # gives the model nothing to fix, so name the missing argument.
-            error = (
-                f"Missing required argument {e} for tool {name}. Call it again with that argument."
-                if isinstance(e, KeyError) else str(e)
-            )
+            # A KeyError can also come from a bad value (an unknown action),
+            # so only an absent parameter of this tool counts as missing.
+            if isinstance(e, KeyError) and e.args and isinstance(args, dict) and e.args[0] not in args \
+                    and e.args[0] in self._tool_parameters(name):
+                error = f"Missing required argument {e} for tool {name}. Call it again with that argument."
+            elif isinstance(e, KeyError):
+                error = f"KeyError: {e}"
+            else:
+                error = str(e)
             return json.dumps(
                 self._cap_tool_result(
                     {"success": False, "output": "", "error": error},
@@ -1040,80 +1077,22 @@ class Agent:
                 ensure_ascii=False,
             )
 
+    def _tool_parameters(self, name: str) -> set:
+        """Parameter names the tool's schema declares."""
+        for tool in self._get_tool_schema():
+            if tool["function"]["name"] == name:
+                return set(tool["function"].get("parameters", {}).get("properties", {}))
+        return set()
+
     @staticmethod
-    def _tool_summary(name: str, args: Dict[str, Any]) -> str:
-        if name == "read": return f"read file: {args.get('path', '?')}"
-        if name == "write": return f"wrote file: {args.get('path', '?')}"
-        if name == "edit": return f"edited file: {args.get('path', '?')}"
-        if name == "search":
-            timeout = args.get("timeout", SearchTool.DEFAULT_TIMEOUT)
-            return f"search: '{args.get('pattern', '?')}' in {args.get('path', 'cwd')} (timeout: {timeout}s)"
-        if name == "web_search": return f"web search: '{args.get('query', '?')}'"
-        if name == "git":
-            cmd = args.get("command", "?")
-            if cmd == "commit": return f"git commit: {args.get('message', '')[:40]}"
-            return f"git {cmd}"
-        if name == "new_terminal": return f"opened {'background' if args.get('background') else 'blocking'} terminal"
-        if name == "execute_command": return f"terminal {args.get('terminal_id', '?')}: {args.get('command', '?')}"
-        if name == "read_logs": return f"read terminal {args.get('terminal_id', '?')} logs"
-        if name == "close_terminal": return f"closed terminal {args.get('terminal_id', '?')}"
-        if name == "get_terminal_info": return f"info on terminal {args.get('terminal_id', '?')}"
-        if name == "stop_command": return f"stop command in terminal {args.get('terminal_id', '?')}"
-        if name == "spawn_subagent": return f"spawn subagent: {args.get('prompt', '')[:40]}"
-        if name == "message_subagent": return f"message subagent {args.get('subagent_id', '?')}: {args.get('message', '')[:40]}"
-        if name == "terminate_subagent": return f"terminate subagent {args.get('subagent_id', '?')}"
-        if name == "list_subagents": return "list subagents"
-        # Browser tool summaries
-        if name == "desktop_doctor": return "check native desktop automation"
-        if name == "desktop_list_windows": return "list native desktop windows"
-        if name == "desktop_window_state": return f"inspect native window {args.get('pid', '?')}:{args.get('window_id', '?')}"
-        if name == "desktop_screenshot": return f"screenshot native window {args.get('pid', '?')}:{args.get('window_id', '?')}"
-        if name == "desktop_launch_app": return f"launch native app: {args.get('name') or args.get('bundle_id') or '?'}"
-        if name == "desktop_click": return "click native desktop element" if "element_index" in args else "click native desktop pixel"
-        if name == "desktop_type": return f"type into native desktop: {(args.get('text') or '')[:30]}"
-        if name == "desktop_press_key": return f"press native desktop key: {args.get('key', '?')}"
-        if name == "desktop_hotkey": return f"native desktop hotkey: {args.get('keys', '?')}"
-        if name == "desktop_scroll": return f"scroll native desktop {args.get('direction', '?')}"
-        if name == "desktop_move": return "move native desktop cursor"
-        if name == "desktop_drag": return "drag native desktop"
-        if name == "desktop_window_action": return f"{args.get('action', 'act')} native window"
-        if name == "browser_navigate": return f"navigate: {args.get('url', '?')}"
-        if name == "browser_snapshot": return "snapshot current page"
-        if name == "browser_click":
-            if args.get("ref"): return f"click {args['ref']}" + (" (double)" if args.get("double") else "")
-            return f"click at ({args.get('x', '?')}, {args.get('y', '?')})"
-        if name == "browser_type":
-            text = args.get("text", "")
-            return f"type into {args.get('ref', '?')}: \"{text[:30]}{'...' if len(text) > 30 else ''}\""
-        if name == "browser_fill_form": return f"fill {len(args.get('fields', []))} form field(s)"
-        if name == "browser_select": return f"select {args.get('values', '?')} in {args.get('ref', '?')}"
-        if name == "browser_hover": return f"hover {args.get('ref', '?')}"
-        if name == "browser_drag": return f"drag {args.get('from_ref', 'xy')} -> {args.get('to_ref', 'xy')}"
-        if name == "browser_press_key": return f"press key: {args.get('key', '?')}"
-        if name == "browser_scroll": return f"scroll {args.get('direction', 'down')} {args.get('pages', 1)} page(s)"
-        if name == "browser_wait_for":
-            if args.get("text"): return f"wait for text: '{args['text']}'"
-            if args.get("text_gone"): return f"wait for text to disappear: '{args['text_gone']}'"
-            return f"wait {args.get('seconds', '?')}s"
-        if name == "browser_screenshot": return "screenshot (" + ("full page" if args.get("full_page") else args.get("ref") or "viewport") + ")"
-        if name == "browser_evaluate":
-            expr = args.get("expression", "")
-            return f"run JS: {expr[:40]}{'...' if len(expr) > 40 else ''}"
-        if name == "browser_search_page": return f"search page for: '{args.get('pattern', '?')}'"
-        if name == "browser_tabs": return f"tabs: {args.get('action', 'list')}" + (f" [{args['index']}]" if args.get("index") is not None else "")
-        if name == "browser_handle_dialog": return ("accept" if args.get("accept") else "dismiss") + " dialog"
-        if name == "browser_console": return "console messages" + (f" [{args['index']}]" if args.get("index") is not None else "")
-        if name == "browser_network": return "network requests" + (f" [{args['index']}]" if args.get("index") is not None else "")
-        if name == "browser_profile": return f"browser profile: {args.get('action', '?')} {args.get('name') or ''}".rstrip()
-        if name == "browser_close": return "close browser"
-        # Skill tool summaries
-        if name == "list_skills": return "list skills"
-        if name == "load_skill": return f"load skill: {args.get('skill_name', '?')}"
-        if name == "write_skill":
-            skill = args.get("skill_name", "?")
-            ow = " (overwrite)" if args.get("overwrite") else ""
-            return f"write skill: {skill}{ow}"
-        return name
+    def _tool_summary(name: str, args: Any) -> str:
+        """One-line summary of a tool call. Never raises: the arguments are
+        whatever JSON the model sent (null values, a list instead of an
+        object, ...), and hosts call this while the tool loop is running."""
+        try:
+            return _summarize_tool_call(name, args if isinstance(args, dict) else {})
+        except Exception:
+            return str(name)
 
     @staticmethod
     def _get_text_content(content) -> str:
@@ -1171,18 +1150,6 @@ class Agent:
                 changed += 1
         return changed
 
-    def _truncate_history_if_needed(self):
-        if len(self.conversation_history) >= 1 + self.MAX_HISTORY_MESSAGES:
-            system = self.conversation_history[0]
-            tail = self.conversation_history[-(self.MAX_HISTORY_MESSAGES):]
-            has_user = any(m.get("role") == "user" for m in tail)
-            if not has_user:
-                for i in range(len(self.conversation_history) - 1, 0, -1):
-                    if self.conversation_history[i].get("role") == "user":
-                        tail = self.conversation_history[i:]
-                        break
-            self.conversation_history = [system] + tail
-
     def _validate_history_before_api(self) -> Optional[str]:
         history = self.conversation_history
         if len(history) <= 2:
@@ -1190,18 +1157,12 @@ class Agent:
         has_user = any(m.get("role") == "user" for m in history)
         if not has_user:
             return self.compact()
-        # Only inspect a trailing tool chain. A normal user message (including
-        # the synthetic background-notification user message) is a valid end
-        # of history and must not be mistaken for an orphaned tool result.
-        if history[-1].get("role") != "tool":
-            return None
-        i = len(history) - 1
-        while i > 0 and history[i].get("role") == "tool":
-            i -= 1
-        if i > 0 and history[i].get("role") != "assistant":
-            orphan_count = len(history) - 1 - i
-            self.conversation_history = history[:i + 1]
-            return f"Removed {orphan_count} orphaned tool message(s) to fix history ordering."
+        # Every assistant tool call needs its result right after it, anywhere
+        # in history (a failed tool loop can leave a gap before a later user
+        # message); providers reject the request otherwise.
+        repaired = repair_tool_chains(history)
+        if repaired:
+            return f"Repaired {repaired} tool-call chain(s) or orphaned tool message(s) to fix history ordering."
         return None
 
     COMPACT_RESERVE_TOKENS = 16384
@@ -1326,15 +1287,23 @@ Keep each section concise. Preserve exact file paths, function names, and error 
     def _refresh_context_tokens(
         self, pending_user_message: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Refresh context, including tools and a user message about to append."""
+        """Refresh context, including tools and a user message about to append.
+
+        The tiktoken estimate can be far below what the provider counts
+        (screenshots, provider framing), so when the last request reported
+        usage, its prompt tokens plus an estimate of the messages added since
+        then are used if larger.
+        """
         self._normalize_history_for_context()
         messages = self.conversation_history
         if pending_user_message is not None:
             messages = [*messages, pending_user_message]
-        self.tokens.context_tokens = self.tokens.count_request(
-            messages,
-            self._get_tool_schema(),
-        )
+        context = self.tokens.count_request(messages, self._get_tool_schema())
+        if self._api_context is not None:
+            prompt_tokens, length = self._api_context
+            if length <= len(self.conversation_history):
+                context = max(context, prompt_tokens + self.tokens.count_history(messages[length:]))
+        self.tokens.context_tokens = context
 
     def _should_auto_compact(self) -> bool:
         if self.tokens.context_window == 0:
@@ -1494,14 +1463,22 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             {"role": "system", "content": self.COMPACT_SYSTEM_PROMPT},
             {"role": "user", "content": full_prompt},
         ]
-        try:
-            stream = self.adapter.stream(messages, None, self.effort)
+
+        def attempt() -> str:
+            stream = self._open_stream(messages, None)
             try:
-                summary = "".join(event[1] for event in stream if event[0] == "text")
+                summary = ""
+                for event in stream:
+                    self._check_interrupt()
+                    if event[0] == "text":
+                        summary += event[1]
+                self._check_interrupt()  # a stream closed by interrupt() may just end
+                return summary
             finally:
-                stream.close()
-        except Exception as e:
-            raise Exception(self._format_api_error(e)) from e
+                self._close_stream(stream)
+
+        # Same retry policy as a normal request; interrupt() closes the stream.
+        summary = self._with_retries(attempt)
         return summary or "(compaction produced no summary)"
 
     def compact(self) -> str:
@@ -1511,9 +1488,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         boundary = self._find_compact_boundary()
         if not self._is_safe_compact_boundary(boundary):
             return "Nothing to compact \u2014 couldn't find a safe message boundary."
-        to_summarize = history[1:boundary]
-        if not to_summarize:
-            return "Nothing to compact \u2014 all messages are recent."
         system_msg = history[0]
         existing_summary = None
         if (
@@ -1523,6 +1497,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             and history[1]["content"].startswith("[Conversation compacted")
         ):
             existing_summary = history[1].get("content")
+        # The previous summary is sent once, as <previous-summary>.
+        to_summarize = history[2 if existing_summary else 1:boundary]
+        if not to_summarize:
+            return "Nothing to compact \u2014 all messages are recent."
         summary = self._generate_summary(to_summarize, existing_summary)
         compaction_msg = {
             "role": "user",
@@ -1530,6 +1508,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         }
         recent = history[boundary:]
         self.conversation_history = [system_msg, compaction_msg] + recent
+        self._api_context = None  # the last request's usage no longer applies
         # Recount the compacted request for display/trigger decisions, but do
         # not add it to cumulative session input: those messages were already
         # accounted for on their original turns.
@@ -1555,7 +1534,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         the worker has stopped, making it safe for the next prompt.
         """
         self._interrupt_event.set()
-        self._stop_requested = True
         # Closing an OpenAI stream releases a blocked iterator as well as
         # stopping further token delivery. The worker still owns history and
         # is joined by process_request before the next prompt is accepted.
@@ -1587,27 +1565,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         if self._interrupt_event.is_set():
             raise InterruptedError("Interrupted by user")
 
-    def request_stop(self):
-        """Escape uses the same immediate-stop path as Ctrl+C."""
-        self.interrupt()
-
-    def _should_stop(self) -> bool:
-        return self._interrupt_event.is_set()
-
-    def _prepare_messages_for_api(self) -> List[Dict[str, Any]]:
-        messages = []
-        for msg in self.conversation_history:
-            if msg.get("role") == "tool" and "_image_url" in msg:
-                messages.append({
-                    "tool_call_id": msg["tool_call_id"],
-                    "role": "tool",
-                    "name": msg.get("name", ""),
-                    "content": msg["content"],
-                })
-            else:
-                messages.append(msg)
-        return messages
-
     def _format_api_error(self, e: Exception) -> str:
         """Return concise API diagnostics without an exception traceback.
 
@@ -1620,14 +1577,17 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         message = " ".join(str(e).split()) or "No additional details provided."
         lines = [f"API Error: {error_name}", f"  Message: {message}"]
 
-        if isinstance(e, (APIStatusError, providers.ProviderError)) and getattr(e, "status_code", None):
-            lines.insert(1, f"  Status Code: {e.status_code}")
+        status = getattr(e, "status_code", None)
+        if isinstance(e, (APIStatusError, providers.ProviderError)) and status:
+            lines.insert(1, f"  Status Code: {status}")
             request_id = getattr(e, "request_id", None)
             if request_id:
                 lines.insert(2, f"  Request ID:  {request_id}")
-        elif isinstance(e, AuthenticationError):
+        # AuthenticationError and RateLimitError are APIStatusErrors; the
+        # other adapters raise ProviderError with the same statuses.
+        if isinstance(e, AuthenticationError) or status == 401:
             lines.append(f"  Hint: Check the '{self.spec.provider}' API keys in provider.json")
-        elif isinstance(e, RateLimitError):
+        elif isinstance(e, RateLimitError) or status == 429:
             lines.append("  Hint: You are being rate-limited. Wait a moment and retry.")
         elif isinstance(e, (APIConnectionError, httpx.TransportError)):
             lines.append(f"  Hint: Could not connect to {self.spec.base_url}")
@@ -1663,107 +1623,130 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         is discarded before retrying so content/tool calls are never mixed
         across attempts.
         """
-        retries = self.API_MAX_RETRIES
-        attempts = retries + 1
-        last_exc = None
+        def close_panel() -> None:
+            # The UI may hold a partial stream from the failed attempt: close
+            # it rather than appending the next attempt (or leaving a live
+            # partial response on screen after a stop).
+            if self.on_stream_end:
+                self.on_stream_end("", False)
 
-        for attempt in range(attempts):
-            stream = None
+        # Never turn a partial assistant stream into a completed assistant
+        # message. Resume repair will continue the latest user request on the
+        # next explicit prompt.
+        return self._with_retries(self._stream_once, on_retry=close_panel, on_interrupt=close_panel)
+
+    def _stream_once(self) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, int]]]:
+        """One streaming attempt of :meth:`_stream_response`."""
+        stream = None
+        try:
+            stream = self._open_stream(list(self.conversation_history), self._get_tool_schema())
+            if self.on_stream_start:
+                self.on_stream_start()
+            content = ""
+            tool_calls: Dict[int, Dict[str, str]] = {}
+            api_usage = None
+            extras: Dict[str, Any] = {}
+            # Adapters normalize every wire format into the same events
+            # (see kairos/providers/base.py).
+            for event in stream:
+                self._check_interrupt()
+                kind = event[0]
+                if kind == "text":
+                    content += event[1]
+                    if self.on_stream_token:
+                        self.on_stream_token(event[1])
+                elif kind == "tool_call":
+                    _, idx, call_id, name, arguments = event
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                    if call_id:
+                        tool_calls[idx]["id"] = call_id
+                    if name:
+                        tool_calls[idx]["name"] = name
+                    tool_calls[idx]["arguments"] += arguments
+                elif kind == "usage":
+                    api_usage = {"prompt_tokens": event[1], "completion_tokens": event[2],
+                                 "cached_tokens": event[3] if len(event) > 3 else 0}
+                elif kind == "message_extra":
+                    extras[event[1]] = event[2]
+            self._check_interrupt()  # a stream closed by interrupt() may just end
+
+            assembled = []
+            for idx in sorted(tool_calls.keys()):
+                tc = tool_calls[idx]
+                try:
+                    args = json.loads(tc["arguments"])
+                except json.JSONDecodeError:
+                    args = {}
+                assembled.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+            # Provider state for the assistant message (step() attaches it).
+            self._stream_extras = extras
+            return content, assembled, api_usage
+        finally:
+            self._close_stream(stream)
+
+    def _open_stream(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]):
+        """Open a provider stream that interrupt() can close."""
+        stream = self.adapter.stream(messages, tools, self.effort)
+        with self._active_stream_lock:
+            self._active_stream = stream
+        if self._interrupt_event.is_set():  # the stop came while it was opening
+            self._close_stream(stream)
+            raise InterruptedError("Interrupted by user")
+        return stream
+
+    def _close_stream(self, stream) -> None:
+        if stream is None:
+            return
+        try:
+            close = getattr(stream, "close", None)
+            if close:
+                close()
+        except Exception:
+            pass
+        with self._active_stream_lock:
+            if self._active_stream is stream:
+                self._active_stream = None
+
+    def _with_retries(
+        self,
+        attempt: Callable[[], Any],
+        on_retry: Optional[Callable[[], None]] = None,
+        on_interrupt: Optional[Callable[[], None]] = None,
+    ) -> Any:
+        """Run one API request (``attempt``) with the retry policy: an initial
+        try plus ``API_MAX_RETRIES`` retries with backoff for retryable errors.
+        A stop raises ``InterruptedError``; exhausted or non-retryable errors
+        raise ``APIRequestError`` with concise diagnostics."""
+        attempts = self.API_MAX_RETRIES + 1
+        last_exc = None
+        for n in range(attempts):
             try:
                 self._check_interrupt()
-                stream = self.adapter.stream(
-                    self._prepare_messages_for_api(),
-                    self._get_tool_schema(),
-                    self.effort,
-                )
-                with self._active_stream_lock:
-                    self._active_stream = stream
-                    self._partial_stream_content = ""
-
-                if self.on_stream_start:
-                    self.on_stream_start()
-                content = ""
-                tool_calls: Dict[int, Dict[str, str]] = {}
-                api_usage = None
-                extras: Dict[str, Any] = {}
-                # Adapters normalize every wire format into the same events
-                # (see kairos/providers/base.py).
-                for event in stream:
-                    self._check_interrupt()
-                    kind = event[0]
-                    if kind == "text":
-                        content += event[1]
-                        with self._active_stream_lock:
-                            self._partial_stream_content = content
-                        if self.on_stream_token:
-                            self.on_stream_token(event[1])
-                    elif kind == "tool_call":
-                        _, idx, call_id, name, arguments = event
-                        if idx not in tool_calls:
-                            tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
-                        if call_id:
-                            tool_calls[idx]["id"] = call_id
-                        if name:
-                            tool_calls[idx]["name"] = name
-                        tool_calls[idx]["arguments"] += arguments
-                    elif kind == "usage":
-                        api_usage = {"prompt_tokens": event[1], "completion_tokens": event[2],
-                                     "cached_tokens": event[3] if len(event) > 3 else 0}
-                    elif kind == "message_extra":
-                        extras[event[1]] = event[2]
-
-                assembled = []
-                for idx in sorted(tool_calls.keys()):
-                    tc = tool_calls[idx]
-                    try:
-                        args = json.loads(tc["arguments"])
-                    except json.JSONDecodeError:
-                        args = {}
-                    assembled.append({"id": tc["id"], "name": tc["name"], "arguments": args})
-                # Provider state for the assistant message (step() attaches it).
-                self._stream_extras = extras
-                return content, assembled, api_usage
+                return attempt()
             except InterruptedError:
-                # Close the visible panel too: otherwise the CLI would leave
-                # a live partial response on screen after the prompt returns.
-                if self.on_stream_end:
-                    self.on_stream_end("", False)
-                # Never turn a partial assistant stream into a completed
-                # assistant message. Resume repair will continue the latest
-                # user request on the next explicit prompt.
+                if on_interrupt:
+                    on_interrupt()
                 raise
             except Exception as e:
                 if self._interrupt_event.is_set():
-                    if self.on_stream_end:
-                        self.on_stream_end("", False)
+                    if on_interrupt:
+                        on_interrupt()
                     raise InterruptedError("Interrupted by user")
                 last_exc = e
-                if not self._is_retryable_error(e) or attempt == attempts - 1:
+                if not self._is_retryable_error(e) or n == attempts - 1:
                     break
-                # The UI may still hold a partial stream from this attempt;
-                # close it before the next request rather than appending a
-                # second response to the same panel.
-                if self.on_stream_end:
-                    self.on_stream_end("", False)
-                if self._interrupt_event.wait(self._retry_delay(attempt)):
+                if on_retry:
+                    on_retry()
+                if self._interrupt_event.wait(self._retry_delay(n)):
                     raise InterruptedError("Interrupted by user")
-            finally:
-                if stream is not None:
-                    try:
-                        close = getattr(stream, "close", None)
-                        if close:
-                            close()
-                    except Exception:
-                        pass
-                with self._active_stream_lock:
-                    if self._active_stream is stream:
-                        self._active_stream = None
-                        self._partial_stream_content = ""
 
         raise APIRequestError(self._format_api_error(last_exc)) from None
 
     def step(self, user_message: Optional[str] = None, image_url: Optional[str] = None) -> Tuple[Optional[str], List[Dict[str, Any]]]:
-        self._check_interrupt()
+        # No stop check before the user message is appended: run() checks
+        # just before, and a stop arriving now is caught before the request
+        # with the message safely in history.
         background_notifications = self._drain_background_notifications()
         if user_message is not None:
             if image_url:
@@ -1795,7 +1778,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             self.conversation_history,
             extra_tokens=self.tokens.count_tools(self._get_tool_schema()),
         )
+        request_length = len(self.conversation_history)
         content, assembled_tool_calls, api_usage = self._stream_response()
+        if api_usage and api_usage.get("prompt_tokens"):
+            self._api_context = (api_usage["prompt_tokens"], request_length)
         if api_usage:
             self.tokens.set_turn_from_api(api_usage["prompt_tokens"], api_usage["completion_tokens"],
                                           api_usage.get("cached_tokens", 0))
@@ -1829,7 +1815,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             func_name = tc["name"]
             func_args = tc["arguments"]
             if self.on_tool_call:
-                self.on_tool_call(func_name, func_args)
+                try:
+                    self.on_tool_call(func_name, func_args)
+                except Exception:
+                    pass  # like on_tool_result: observers must never break tool execution
             result_json = self._execute_tool(func_name, func_args)
             result_dict = json.loads(result_json)
             if self.on_tool_result:
@@ -1857,7 +1846,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             for img_url in tool_image_data_urls:
                 image_parts.append({"type": "image_url", "image_url": {"url": img_url}})
             self.conversation_history.append({"role": "user", "content": image_parts})
-        self._truncate_history_if_needed()
         self.tokens.finish_turn()
         if self.on_token_update:
             self.on_token_update(self.tokens)
@@ -1870,8 +1858,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         # Do not clear a stop here: an interrupt can arrive between thread
         # creation and this function's first instruction.
         if self._interrupt_event.is_set():
-            self._set_processing(False)
-            self._stop_requested = False
+            self._end_run()
             self._interrupt_event.clear()
             return "[Stopped — waiting for your input]"
         current = user_message
@@ -1896,16 +1883,23 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         empty_retry_count = 0
         try:
             while True:
-                if self._should_stop():
-                    return "[Stopped \u2014 waiting for your input]"
                 # Check before every API step, not only before the initial
                 # user message. A tool-call loop sets ``current`` to None
                 # after its first step, so restricting this check to
                 # ``current is not None`` delayed compaction until the next
                 # user request.
                 pending_user = self._make_user_message(current, _first_image)
-                self._refresh_context_tokens(pending_user)
-                compact_msg = self.auto_compact_if_needed()
+                try:
+                    self._check_interrupt()
+                    self._refresh_context_tokens(pending_user)
+                    compact_msg = self.auto_compact_if_needed()
+                except Exception:
+                    # A stop (or failure) before step() appended the user's
+                    # message, e.g. during auto-compaction: keep the message
+                    # so the next request continues it instead of losing it.
+                    if pending_user is not None:
+                        self.conversation_history.append(pending_user)
+                    raise
                 if compact_msg and self.on_compact:
                     self.on_compact(compact_msg)
                 response, tool_calls = self.step(current, image_url=_first_image)
@@ -1938,17 +1932,27 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 pass
             self._interrupted_pending = True
             return "[Interrupted]"
+        except Exception:
+            # Any other failure (a provider error, a host callback, a bug)
+            # must not leave an assistant tool call without its results: the
+            # next request would be rejected and the conversation wedged.
+            try:
+                _repair_trailing_tool_chain(self.conversation_history)
+            except Exception:
+                pass
+            raise
         finally:
-            self._set_processing(False)
+            self._end_run()
             # This is the stable handoff point: no new prompt may reuse the
             # agent until this worker has reached here.
-            self._stop_requested = False
             self._interrupt_event.clear()
 
     def reset(self):
         self._interrupt_event.clear()
-        self._stop_requested = False
         self._interrupted_pending = False
+        self._api_context = None
+        # Notifications of the old conversation must not reach the new one.
+        self.drain_background_events()
         self._setup_system_prompt()
         self.tokens = TokenCounter(self.model, self.spec.context_window, self.spec.pricing)
         if self.browser_manager.is_open:
@@ -1992,3 +1996,78 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
     def model_info(self) -> Dict[str, Any]:
         return self.spec.info(self.effort)
+
+
+def _summarize_tool_call(name: str, args: Dict[str, Any]) -> str:
+    if name == "read": return f"read file: {args.get('path', '?')}"
+    if name == "write": return f"wrote file: {args.get('path', '?')}"
+    if name == "edit": return f"edited file: {args.get('path', '?')}"
+    if name == "search":
+        timeout = args.get("timeout", SearchTool.DEFAULT_TIMEOUT)
+        return f"search: '{args.get('pattern', '?')}' in {args.get('path', 'cwd')} (timeout: {timeout}s)"
+    if name == "web_search": return f"web search: '{args.get('query', '?')}'"
+    if name == "git":
+        cmd = args.get("command", "?")
+        if cmd == "commit": return f"git commit: {str(args.get('message') or '')[:40]}"
+        return f"git {cmd}"
+    if name == "new_terminal": return f"opened {'background' if args.get('background') else 'blocking'} terminal"
+    if name == "execute_command": return f"terminal {args.get('terminal_id', '?')}: {args.get('command', '?')}"
+    if name == "read_logs": return f"read terminal {args.get('terminal_id', '?')} logs"
+    if name == "close_terminal": return f"closed terminal {args.get('terminal_id', '?')}"
+    if name == "get_terminal_info": return f"info on terminal {args.get('terminal_id', '?')}"
+    if name == "stop_command": return f"stop command in terminal {args.get('terminal_id', '?')}"
+    if name == "spawn_subagent": return f"spawn subagent: {str(args.get('prompt') or '')[:40]}"
+    if name == "message_subagent": return f"message subagent {args.get('subagent_id', '?')}: {str(args.get('message') or '')[:40]}"
+    if name == "terminate_subagent": return f"terminate subagent {args.get('subagent_id', '?')}"
+    if name == "list_subagents": return "list subagents"
+    # Browser tool summaries
+    if name == "desktop_doctor": return "check native desktop automation"
+    if name == "desktop_list_windows": return "list native desktop windows"
+    if name == "desktop_window_state": return f"inspect native window {args.get('pid', '?')}:{args.get('window_id', '?')}"
+    if name == "desktop_screenshot": return f"screenshot native window {args.get('pid', '?')}:{args.get('window_id', '?')}"
+    if name == "desktop_launch_app": return f"launch native app: {args.get('name') or args.get('bundle_id') or '?'}"
+    if name == "desktop_click": return "click native desktop element" if "element_index" in args else "click native desktop pixel"
+    if name == "desktop_type": return f"type into native desktop: {(args.get('text') or '')[:30]}"
+    if name == "desktop_press_key": return f"press native desktop key: {args.get('key', '?')}"
+    if name == "desktop_hotkey": return f"native desktop hotkey: {args.get('keys', '?')}"
+    if name == "desktop_scroll": return f"scroll native desktop {args.get('direction', '?')}"
+    if name == "desktop_move": return "move native desktop cursor"
+    if name == "desktop_drag": return "drag native desktop"
+    if name == "desktop_window_action": return f"{args.get('action', 'act')} native window"
+    if name == "browser_navigate": return f"navigate: {args.get('url', '?')}"
+    if name == "browser_snapshot": return "snapshot current page"
+    if name == "browser_click":
+        if args.get("ref"): return f"click {args['ref']}" + (" (double)" if args.get("double") else "")
+        return f"click at ({args.get('x', '?')}, {args.get('y', '?')})"
+    if name == "browser_type":
+        text = str(args.get("text") or "")
+        return f"type into {args.get('ref', '?')}: \"{text[:30]}{'...' if len(text) > 30 else ''}\""
+    if name == "browser_fill_form": return f"fill {len(args.get('fields', []))} form field(s)"
+    if name == "browser_select": return f"select {args.get('values', '?')} in {args.get('ref', '?')}"
+    if name == "browser_hover": return f"hover {args.get('ref', '?')}"
+    if name == "browser_drag": return f"drag {args.get('from_ref', 'xy')} -> {args.get('to_ref', 'xy')}"
+    if name == "browser_press_key": return f"press key: {args.get('key', '?')}"
+    if name == "browser_scroll": return f"scroll {args.get('direction', 'down')} {args.get('pages', 1)} page(s)"
+    if name == "browser_wait_for":
+        if args.get("text"): return f"wait for text: '{args['text']}'"
+        if args.get("text_gone"): return f"wait for text to disappear: '{args['text_gone']}'"
+        return f"wait {args.get('seconds', '?')}s"
+    if name == "browser_screenshot": return "screenshot (" + ("full page" if args.get("full_page") else args.get("ref") or "viewport") + ")"
+    if name == "browser_evaluate":
+        expr = str(args.get("expression") or "")
+        return f"run JS: {expr[:40]}{'...' if len(expr) > 40 else ''}"
+    if name == "browser_search_page": return f"search page for: '{args.get('pattern', '?')}'"
+    if name == "browser_tabs": return f"tabs: {args.get('action', 'list')}" + (f" [{args['index']}]" if args.get("index") is not None else "")
+    if name == "browser_handle_dialog": return ("accept" if args.get("accept") else "dismiss") + " dialog"
+    if name == "browser_console": return "console messages" + (f" [{args['index']}]" if args.get("index") is not None else "")
+    if name == "browser_network": return "network requests" + (f" [{args['index']}]" if args.get("index") is not None else "")
+    if name == "browser_profile": return f"browser profile: {args.get('action', '?')} {args.get('name') or ''}".rstrip()
+    if name == "browser_close": return "close browser"
+    # Skill tool summaries
+    if name == "list_skills": return "list skills"
+    if name == "load_skill": return f"load skill: {args.get('skill_name', '?')}"
+    if name == "write_skill":
+        skill = args.get("skill_name", "?")
+        ow = " (overwrite)" if args.get("overwrite") else ""
+        return f"write skill: {skill}{ow}"
+    return name

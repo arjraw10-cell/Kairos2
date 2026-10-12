@@ -340,6 +340,12 @@ class AnthropicTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 529)
         self.assertTrue(Agent._is_retryable_error(caught.exception))
 
+    def test_adapters_share_one_http_client(self):
+        # One client per adapter leaked an open client per sub-agent.
+        self.assertIs(AnthropicAdapter(self.spec)._client, AnthropicAdapter(self.spec)._client)
+        transport = httpx.MockTransport(lambda request: httpx.Response(200))
+        self.assertIsNot(AnthropicAdapter(self.spec, transport=transport)._client, AnthropicAdapter(self.spec)._client)
+
 
 class FakeAdapter:
     def __init__(self, events):
@@ -359,7 +365,6 @@ def bare_agent(spec, events):
     agent._interrupt_event = threading.Event()
     agent._active_stream_lock = threading.Lock()
     agent._active_stream = None
-    agent._partial_stream_content = ""
     agent._get_tool_schema = lambda: TOOLS
     agent.on_stream_start = agent.on_stream_end = None
     agent.tokens_streamed = []
@@ -390,6 +395,21 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(usage, {"prompt_tokens": 11, "completion_tokens": 3, "cached_tokens": 0})
         self.assertEqual(agent._stream_extras, {"_thinking": ["block"]})
         self.assertEqual(agent.adapter.calls[0][1:], (TOOLS, "high"))
+
+    def test_error_hints_for_keys_and_rate_limits(self):
+        # AuthenticationError/RateLimitError are APIStatusErrors; the status
+        # branch used to swallow their hints.
+        from openai import AuthenticationError, RateLimitError
+
+        agent = bare_agent(providers.resolve(), [])
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        auth = AuthenticationError("Incorrect API key", response=httpx.Response(401, request=request), body=None)
+        text = agent._format_api_error(auth)
+        self.assertIn("Status Code: 401", text)
+        self.assertIn("Hint: Check the 'openai' API keys in provider.json", text)
+        limited = RateLimitError("slow down", response=httpx.Response(429, request=request), body=None)
+        self.assertIn("rate-limited", agent._format_api_error(limited))
+        self.assertIn("API keys", agent._format_api_error(providers.ProviderError("HTTP 401: invalid x-api-key", 401)))
 
     def test_model_selection(self):
         agent = bare_agent(providers.resolve(), [])
