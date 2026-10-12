@@ -8,7 +8,7 @@ import uvicorn
 
 from .config import Config
 from .gateway.manager import GatewayManager
-from .gateway.server import create_app
+from .gateway.server import create_app, is_loopback_host
 from .workspaces import WORKSPACE_ROOT
 
 
@@ -30,7 +30,15 @@ def main() -> None:
     workspace = sys.argv[1] if len(sys.argv) > 1 else Config.KAIROS_DEFAULT_WORKSPACE()
     host = Config.KAIROS_GATEWAY_HOST()
     port = Config.KAIROS_GATEWAY_PORT()
-    gateway = GatewayManager(default_workspace=workspace)
+    if not is_loopback_host(host) and Config.KAIROS_AUTH_TOKEN() is None:
+        print(f"Refusing to listen on {host} without KAIROS_AUTH_TOKEN: anyone who can reach it could drive the agent.")
+        print("Set KAIROS_AUTH_TOKEN, or set KAIROS_GATEWAY_HOST to 127.0.0.1.")
+        raise SystemExit(1)
+    try:
+        gateway = GatewayManager(default_workspace=workspace)
+    except RuntimeError as exc:  # another gateway holds the data directory
+        print(f"Error: {exc}")
+        raise SystemExit(1) from exc
     app = create_app(gateway)
 
     print("Kairos Gateway")

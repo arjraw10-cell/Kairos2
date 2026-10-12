@@ -1,10 +1,31 @@
+import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from kairos.gateway.manager import GatewayManager
 from kairos.gateway.repository import GatewayRepository
 from kairos.gateway.server import create_app
+
+# The gateway refuses non-loopback Host headers (TestClient defaults to
+# "testserver") unless a token is configured.
+BASE_URL = "http://127.0.0.1:8765"
+WS_URL = "ws://127.0.0.1:8765/api/v1/ws"
+
+PROVIDER_CONFIG = {
+    "default_setup": "fake",
+    "providers": {"local": {"format": "completions", "base_url": "http://127.0.0.1:9/v1", "api_keys": ["k"]}},
+    "setups": {"fake": {"provider": "local", "model": "fake-model"}},
+}
+
+
+@pytest.fixture(autouse=True)
+def provider_config(tmp_path: Path, monkeypatch):
+    """Real Agents read a temporary provider.json, not the repository's."""
+    path = tmp_path / "provider.json"
+    path.write_text(json.dumps(PROVIDER_CONFIG), encoding="utf-8")
+    monkeypatch.setattr("kairos.providers.config.config_path", lambda: path)
 
 
 def test_health_and_readiness_are_public(tmp_path: Path, monkeypatch):
@@ -34,7 +55,7 @@ def test_conversation_and_workspace_endpoints(tmp_path: Path):
         max_concurrent_runs=1,
     )
     app = create_app(manager)
-    with TestClient(app) as client:
+    with TestClient(app, base_url=BASE_URL) as client:
         response = client.post(
             "/api/v1/conversations",
             json={"workspace": str(tmp_path / "project"), "title": "Test"},
@@ -68,9 +89,9 @@ def test_conversation_without_workspace_gets_fresh_folder(tmp_path: Path, monkey
         max_concurrent_runs=1,
     )
     app = create_app(manager)
-    with TestClient(app) as client:
+    with TestClient(app, base_url=BASE_URL) as client:
         rest = client.post("/api/v1/conversations", json={"title": "REST"}).json()
-        with client.websocket_connect("/api/v1/ws") as ws:
+        with client.websocket_connect(WS_URL) as ws:
             ws.send_json({"type": "command", "command": "conversation.create", "request_id": "r1", "payload": {}})
             reply = ws.receive_json()
             while reply.get("type") != "ack":

@@ -20,6 +20,11 @@ from kairos.gateway.manager import GatewayManager
 from kairos.gateway.repository import GatewayRepository
 from kairos.gateway.server import create_app
 
+# The gateway refuses non-loopback Host headers (TestClient defaults to
+# "testserver") unless a token is configured.
+BASE_URL = "http://127.0.0.1:8765"
+WS_URL = "ws://127.0.0.1:8765/api/v1/ws"
+
 
 class FakeAgent:
     created = 0
@@ -275,10 +280,17 @@ def auth_test() -> None:
 
 
 def api_test() -> None:
-    with tempfile.TemporaryDirectory() as directory:
+    import json
+    from unittest import mock
+
+    with tempfile.TemporaryDirectory() as directory, mock.patch(
+        "kairos.providers.config.config_path", return_value=Path(directory) / "provider.json"
+    ):
+        # A real Agent, configured from a temporary provider.json.
+        (Path(directory) / "provider.json").write_text(json.dumps(MODEL_CONFIG), encoding="utf-8")
         manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1)
         app = create_app(manager)
-        with TestClient(app) as client:
+        with TestClient(app, base_url=BASE_URL) as client:
             response = client.post("/api/v1/conversations", json={"workspace": directory, "title": "Test"})
             assert response.status_code == 201, response.text
             conversation_id = response.json()["id"]
@@ -380,7 +392,7 @@ def model_config_test() -> None:
                 max_concurrent_runs=1,
                 agent_factory=ModelFakeAgent,
             )
-            with TestClient(create_app(manager)) as client, client.websocket_connect("/api/v1/ws") as ws:
+            with TestClient(create_app(manager)) as client, client.websocket_connect(WS_URL) as ws:
                 def command(name, conversation_id=None, **payload):
                     ws.send_json({"type": "command", "command": name, "request_id": name,
                                   "conversation_id": conversation_id, "payload": payload})
@@ -439,6 +451,7 @@ def fresh_workspace_test() -> None:
             assert Path(manager.create_conversation().workspace_path) != fresh
             explicit = manager.create_conversation(directory).workspace_path
             assert Path(explicit) == Path(directory).resolve(), explicit
+            asyncio.run(manager.shutdown())  # releases the data-dir lock
         finally:
             workspaces.WORKSPACE_ROOT = previous_root
 
@@ -626,7 +639,7 @@ def unload_protection_and_lost_test() -> None:
 def subagent_commands_test() -> None:
     with tempfile.TemporaryDirectory() as directory:
         manager = background_manager(directory)
-        with TestClient(create_app(manager)) as client, client.websocket_connect("/api/v1/ws") as ws:
+        with TestClient(create_app(manager)) as client, client.websocket_connect(WS_URL) as ws:
             def command(name, conversation_id=None, **payload):
                 ws.send_json({"type": "command", "command": name, "request_id": name,
                               "conversation_id": conversation_id, "payload": payload})
@@ -645,6 +658,435 @@ def subagent_commands_test() -> None:
             assert reply["data"] == {"stopped": 0}, reply
             reply = command("subagent.list", "conv_missing")
             assert reply["type"] == "error" and reply["code"] == "not_found", reply
+
+
+def _set_env(**values) -> dict:
+    """Set (or, with None, remove) environment variables; return the old values."""
+    import os
+    from kairos.config import Config
+
+    previous = {name: os.environ.get(name) for name in values}
+    for name, value in values.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    Config.reload()
+    return previous
+
+
+def _ws_rejected(client, url: str, headers: dict | None = None) -> bool:
+    from starlette.websockets import WebSocketDisconnect
+
+    try:
+        with client.websocket_connect(url, headers=headers or {}):
+            return False
+    except WebSocketDisconnect:
+        return True
+
+
+def cross_site_test() -> None:
+    """Fix 1: a web page must not reach the gateway through the browser."""
+    import hmac
+    from unittest import mock
+
+    evil = {"origin": "https://evil.example"}
+    previous = _set_env(KAIROS_AUTH_TOKEN=None)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1, agent_factory=FakeAgent)
+            with TestClient(create_app(manager), base_url=BASE_URL) as client:
+                # WebSocket: a cross-site Origin is refused; loopback or no Origin (CLI) is fine.
+                assert _ws_rejected(client, WS_URL, evil)
+                assert not _ws_rejected(client, WS_URL, {"origin": "http://localhost:5173"})
+                assert not _ws_rejected(client, WS_URL)
+                # DNS rebinding: a non-loopback Host is refused without a token.
+                assert _ws_rejected(client, "ws://evil.example:8765/api/v1/ws")
+                assert client.get("/api/v1/capabilities").status_code == 200
+                assert client.get("/api/v1/capabilities", headers=evil).status_code == 403
+                assert client.get("http://evil.example:8765/api/v1/capabilities").status_code == 403
+                assert client.get("/healthz", headers={"host": "[::1]:8765"}).status_code == 200
+                assert client.get("http://localhost/healthz").status_code == 200
+
+        _set_env(KAIROS_AUTH_TOKEN="secret")
+        with tempfile.TemporaryDirectory() as directory:
+            manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1, agent_factory=FakeAgent)
+            with TestClient(create_app(manager), base_url="http://kairos.lan:8765") as client:
+                # With a token the token is the gate: any Host, constant-time compare.
+                with mock.patch("hmac.compare_digest", wraps=hmac.compare_digest) as compare:
+                    assert client.get("/api/v1/capabilities", headers={"Authorization": "Bearer secret"}).status_code == 200
+                    assert compare.called
+                assert client.get("/api/v1/capabilities", headers={"Authorization": "Bearer wrong"}).status_code == 401
+                assert not _ws_rejected(client, "ws://kairos.lan:8765/api/v1/ws?token=secret")
+                assert _ws_rejected(client, "ws://kairos.lan:8765/api/v1/ws?token=secret", evil)
+    finally:
+        _set_env(**previous)
+
+
+def bind_refusal_test() -> None:
+    """Fix 1: no non-loopback bind without KAIROS_AUTH_TOKEN."""
+    from unittest import mock
+    from kairos import gateway_main
+    from kairos.config import Config
+
+    previous = _set_env(KAIROS_GATEWAY_HOST="0.0.0.0", KAIROS_AUTH_TOKEN=None)
+    try:
+        with mock.patch.object(Config, "validate"), mock.patch.object(sys, "argv", ["gateway_main"]), \
+                mock.patch.object(gateway_main, "GatewayManager") as manager_cls, \
+                mock.patch.object(gateway_main, "create_app"), \
+                mock.patch.object(gateway_main.uvicorn, "run") as run:
+            try:
+                gateway_main.main()
+            except SystemExit as exc:
+                assert exc.code == 1
+            else:
+                raise AssertionError("a non-loopback bind without a token must be refused")
+            assert not manager_cls.called and not run.called
+            _set_env(KAIROS_AUTH_TOKEN="secret")
+            gateway_main.main()
+            assert run.called
+    finally:
+        _set_env(**previous)
+
+
+def token_redaction_test() -> None:
+    """Fix 1: ?token= never reaches uvicorn's log lines."""
+    import logging
+    import logging.config
+    import uvicorn.config
+    from kairos.gateway.server import RedactTokenFilter
+
+    with tempfile.TemporaryDirectory() as directory:
+        manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1, agent_factory=FakeAgent)
+        create_app(manager)
+        asyncio.run(manager.shutdown())
+
+    lines: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    for name, message, args in (
+        ("uvicorn.error", '%s - "WebSocket %s" [accepted]', ("127.0.0.1:5000", "/api/v1/ws?token=secret")),
+        ("uvicorn.access", '%s - "%s %s HTTP/%s" %d', ("127.0.0.1:5000", "GET", "/api/v1/x?a=1&token=secret", "1.1", 200)),
+    ):
+        logger = logging.getLogger(name)
+        handler, level = Capture(), logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
+            logger.info(message, *args)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(level)
+    assert len(lines) == 2 and all("secret" not in line and "token=***" in line for line in lines), lines
+    # uvicorn configures its loggers at startup; the filter must survive that.
+    logging.config.dictConfig(uvicorn.config.LOGGING_CONFIG)
+    assert any(isinstance(f, RedactTokenFilter) for f in logging.getLogger("uvicorn.access").filters)
+
+
+def event_order_test() -> None:
+    """Fix 2: an event whose ID was assigned first is never dropped by a
+    subscriber that already received a later one."""
+    import threading
+    import time
+
+    with tempfile.TemporaryDirectory() as directory:
+        manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1, agent_factory=FakeAgent)
+        conversation = manager.create_conversation(directory)
+        real_append = manager.repository.append_event
+        first_has_id = threading.Event()
+
+        def slow_append(conversation_id, event, data, run_id=None):
+            payload = real_append(conversation_id, event, data, run_id)
+            if event == "first":
+                first_has_id.set()
+                time.sleep(0.3)  # its ID is assigned; its delivery is late
+            return payload
+
+        manager.repository.append_event = slow_append
+        with TestClient(create_app(manager), base_url=BASE_URL) as client, client.websocket_connect(WS_URL) as ws:
+            ws.send_json({"type": "command", "command": "conversation.subscribe", "request_id": "s",
+                          "conversation_id": conversation.id, "payload": {}})
+            assert ws.receive_json()["type"] == "ack"
+            first = threading.Thread(target=manager.emit, args=(conversation.id, "first", {}))
+            first.start()
+            assert first_has_id.wait(5)
+            second = threading.Thread(target=manager.emit, args=(conversation.id, "second", {}))
+            second.start()
+            first.join()
+            second.join()
+            manager.emit(conversation.id, "last", {})
+            names = []
+            while not names or names[-1] != "last":
+                names.append(ws.receive_json()["event"])
+        assert names == ["first", "second", "last"], names
+
+
+class StopAwareAgent(FakeAgent):
+    """Mimics Agent.run's stop flag: a stop pending at the start returns
+    "[Stopped ...]" and the end of run() clears it."""
+
+    def __init__(self, workspace: str):
+        import threading
+
+        super().__init__(workspace)
+        self._interrupt_event = threading.Event()
+        self._stop_requested = False
+        self.after_run = None  # called once at the very end of run()
+
+    def interrupt(self):
+        self._interrupt_event.set()
+        self._stop_requested = True
+
+    def run(self, content, image_url=None):
+        if self._interrupt_event.is_set():
+            self._interrupt_event.clear()
+            return "[Stopped — waiting for your input]"
+        result = super().run(content, image_url)
+        self._interrupt_event.clear()
+        self._stop_requested = False
+        hook, self.after_run = self.after_run, None
+        if hook:
+            hook()
+        return result
+
+
+def late_interrupt_test() -> None:
+    """Fix 3: an Esc processed after Agent.run returned must not stop the next run."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1, agent_factory=StopAwareAgent)
+            conversation = manager.create_conversation(directory)
+            agent = (await manager.load_runtime(conversation.id)).agent
+            loop = asyncio.get_running_loop()
+            # The interrupt reaches the loop before the gateway handles the
+            # run's return (the window a late run.cancel/run.interrupt hits).
+            agent.after_run = lambda: loop.call_soon_threadsafe(
+                lambda: loop.create_task(manager.interrupt_run(conversation.id))
+            )
+            first = await manager.submit_message(conversation.id, "one")
+            assert await wait_until(lambda: manager.repository.get_run(first.id).status == "completed")
+            second = await manager.submit_message(conversation.id, "two")
+            assert await wait_until(lambda: manager.repository.get_run(second.id).status != "queued" and not manager.get_runtime(conversation.id).is_running)
+            assert manager.repository.get_run(second.id).status == "completed", manager.repository.get_run(second.id)
+            assert agent.conversation_history[-1]["content"] == "done: two"
+            await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def reload_keeps_interrupted_turn_test() -> None:
+    """Fix 4: loading an interrupted conversation keeps the user's request and
+    the executed tool calls, and the next save does not erase them."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1, agent_factory=FakeAgent)
+            conversation = manager.create_conversation(directory)
+            manager.repository.replace_messages(conversation.id, [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "second request"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "read", "arguments": "{}"}},
+                    {"id": "call_b", "type": "function", "function": {"name": "edit", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "call_a", "name": "read", "content": "A result"},
+            ])
+            runtime = await manager.load_runtime(conversation.id)
+            for history in (runtime.agent.conversation_history, None):
+                if history is None:
+                    await manager.unload_runtime(conversation.id)
+                    history = manager.repository.load_history(conversation.id)
+                assert any(m.get("content") == "second request" for m in history), history
+                assert any(m.get("tool_call_id") == "call_a" and m.get("content") == "A result" for m in history), history
+                assert history[-1]["tool_call_id"] == "call_b"  # repaired, API-valid
+            await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def data_dir_lock_test() -> None:
+    """Fix 5: a second gateway on the same data dir refuses to start and does
+    not mark the live gateway's runs interrupted."""
+    with tempfile.TemporaryDirectory() as directory:
+        data = Path(directory) / "data"
+        first = GatewayManager(GatewayRepository(data), max_concurrent_runs=1, agent_factory=FakeAgent)
+        conversation = first.create_conversation(directory)
+        run = first.repository.create_run(conversation.id, "live queued run")
+        try:
+            GatewayManager(GatewayRepository(data), max_concurrent_runs=1, agent_factory=FakeAgent)
+        except RuntimeError as exc:
+            assert "already using" in str(exc), exc
+        else:
+            raise AssertionError("a second gateway on the same data dir must refuse to start")
+        assert first.repository.get_run(run.id).status == "queued"
+        asyncio.run(first.shutdown())
+        # Released at shutdown: the next gateway starts and recovers the run.
+        second = GatewayManager(GatewayRepository(data), max_concurrent_runs=1, agent_factory=FakeAgent)
+        assert second.repository.get_run(run.id).status == "interrupted"
+        asyncio.run(second.shutdown())
+
+
+class BlockingAgent(FakeAgent):
+    def __init__(self, workspace: str):
+        import threading
+
+        super().__init__(workspace)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def run(self, content, image_url=None):
+        self.started.set()
+        self.release.wait(5)
+        return super().run(content, image_url)
+
+
+def queued_run_status_change_test() -> None:
+    """Fix 5: a queued run whose status changed underneath it ends with a
+    terminal run event instead of silence."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1, agent_factory=BlockingAgent)
+            conversation = manager.create_conversation(directory)
+            agent = (await manager.load_runtime(conversation.id)).agent
+            await manager.submit_message(conversation.id, "one")
+            assert await wait_until(agent.started.is_set)
+            second = await manager.submit_message(conversation.id, "two")
+            manager.repository.update_run(second.id, "interrupted", "Gateway restarted.", expected_status="queued")
+            agent.release.set()
+            assert await wait_until(lambda: any(
+                e["event"] == "run.interrupted" and e["run_id"] == second.id
+                for e in manager.events_after(conversation.id)
+            ))
+            await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+class SlowCloseAgent(FakeAgent):
+    def __init__(self, workspace: str):
+        import time
+
+        super().__init__(workspace)
+        self.closed = []
+        closed = self.closed
+
+        class Browser:
+            is_open = False  # the worker can be alive while no page is open
+
+            def close(self):
+                time.sleep(0.5)
+                closed.append("browser")
+
+        class Desktop:
+            def close(self):
+                closed.append("desktop")
+
+        self.browser_manager = Browser()
+        self.desktop_manager = Desktop()
+
+
+def unload_off_loop_test() -> None:
+    """Fix 6: a slow resource close does not freeze the event loop, and the
+    browser and desktop managers are always closed."""
+    import time
+
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1, agent_factory=SlowCloseAgent)
+            conversation = manager.create_conversation(directory)
+            agent = (await manager.load_runtime(conversation.id)).agent
+            started = time.monotonic()
+            unload = asyncio.create_task(manager.unload_runtime(conversation.id))
+            await asyncio.sleep(0.05)
+            assert time.monotonic() - started < 0.4, "the event loop was blocked by unload"
+            assert not unload.done()
+            await unload
+            assert agent.closed == ["browser", "desktop"], agent.closed
+            await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def wake_unload_race_test() -> None:
+    """Fix 7: notifications taken by a wake that loses the race with an
+    unload are kept for the next load."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            manager = background_manager(directory)
+            conversation = manager.create_conversation(directory)
+            runtime = await manager.load_runtime(conversation.id)
+            # The wake timer took the event just before the unload; its
+            # enqueue reaches the event loop after the unload began.
+            manager._start_wake(runtime, [bg_event("raced")])
+            await manager.unload_runtime(conversation.id)
+            await asyncio.sleep(0.05)
+            agent = (await manager.load_runtime(conversation.id)).agent
+            assert [e["id"] for e in agent.held] == ["raced"], agent.held
+            await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+class BlockingModelAgent(ModelFakeAgent):
+    def __init__(self, workspace: str):
+        import threading
+
+        super().__init__(workspace)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.models_seen: list = []
+
+    def run(self, content, image_url=None):
+        self.started.set()
+        self.release.wait(5)
+        self.models_seen.append(self.spec.model)
+        return super().run(content, image_url)
+
+
+def configure_during_run_test() -> None:
+    """Fix 8: a model change requested during a run applies before the next run."""
+    import json
+    from unittest import mock
+
+    async def scenario(directory: str):
+        manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1, agent_factory=BlockingModelAgent)
+        conversation = manager.create_conversation(directory)
+        agent = (await manager.load_runtime(conversation.id)).agent
+        first = await manager.submit_message(conversation.id, "one")
+        assert await wait_until(agent.started.is_set)
+        info = await manager.configure_conversation(conversation.id, setup="mimo")
+        assert info["setup"] == "mimo", info
+        assert agent.spec.setup == "luna"  # not switched under the running run
+        agent.release.set()
+        assert await wait_until(lambda: manager.repository.get_run(first.id).status == "completed")
+        second = await manager.submit_message(conversation.id, "two")
+        assert await wait_until(lambda: manager.repository.get_run(second.id).status == "completed")
+        assert agent.models_seen == ["gpt-6-luna", "xiaomi/mimo"], agent.models_seen
+        assert (await manager.configure_conversation(conversation.id))["setup"] == "mimo"
+        await manager.shutdown()
+
+    with tempfile.TemporaryDirectory() as directory:
+        config = Path(directory) / "provider.json"
+        config.write_text(json.dumps(MODEL_CONFIG), encoding="utf-8")
+        with mock.patch("kairos.providers.config.config_path", return_value=config):
+            asyncio.run(scenario(directory))
+
+
+def malformed_frame_test() -> None:
+    """Fix 9: a malformed frame gets an error reply; the connection stays."""
+    with tempfile.TemporaryDirectory() as directory:
+        manager = GatewayManager(GatewayRepository(Path(directory) / "data"), max_concurrent_runs=1, agent_factory=FakeAgent)
+        with TestClient(create_app(manager), base_url=BASE_URL) as client, client.websocket_connect(WS_URL) as ws:
+            for frame in ("not json", "[1, 2]", '"text"'):
+                ws.send_text(frame)
+                reply = ws.receive_json()
+                assert reply["type"] == "error" and reply["code"] == "invalid_message", reply
+            ws.send_json({"type": "command", "command": "ping", "request_id": "p"})
+            assert ws.receive_json()["data"] == {"pong": True}
 
 
 def main() -> None:
@@ -666,6 +1108,18 @@ def main() -> None:
         wake_cap_test,
         unload_protection_and_lost_test,
         subagent_commands_test,
+        cross_site_test,
+        bind_refusal_test,
+        token_redaction_test,
+        event_order_test,
+        late_interrupt_test,
+        reload_keeps_interrupted_turn_test,
+        data_dir_lock_test,
+        queued_run_status_change_test,
+        unload_off_loop_test,
+        wake_unload_race_test,
+        configure_during_run_test,
+        malformed_frame_test,
     ]
     for test in tests:
         print(f"running {test.__name__}", flush=True)

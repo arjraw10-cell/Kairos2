@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -57,11 +61,70 @@ def _conversation_response(conversation: Conversation) -> dict[str, Any]:
 
 
 def _token_is_valid(token: str | None, expected: str | None) -> bool:
-    return expected is None or (token is not None and token == expected)
+    return expected is None or (
+        token is not None and hmac.compare_digest(token.encode(), expected.encode())
+    )
+
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def is_loopback_host(value: str | None) -> bool:
+    """True for 127.0.0.1, localhost or [::1], with any port, as a bind host,
+    Host header or Origin URL."""
+    if not value:
+        return False
+    if value in _LOOPBACK_HOSTS:
+        return True
+    try:
+        hostname = urlsplit(value if "//" in value else "//" + value).hostname
+    except ValueError:
+        return False
+    return hostname in _LOOPBACK_HOSTS
+
+
+def _untrusted_request(headers: Any, auth_token: str | None) -> str | None:
+    """Why a request must be refused, or None.
+
+    A browser page on any site can reach the loopback gateway; its requests
+    carry a non-loopback Origin (cross-site) or, through DNS rebinding, a
+    non-loopback Host. Clients without an Origin (the CLI) are allowed. With a
+    token configured, the token is the gate and any Host is accepted.
+    """
+    origin = headers.get("origin")
+    if origin is not None and not is_loopback_host(origin):
+        return "Cross-origin requests are not allowed"
+    if auth_token is None and not is_loopback_host(headers.get("host")):
+        return "Host not allowed"
+    return None
+
+
+class RedactTokenFilter(logging.Filter):
+    """Keep ``?token=...`` (WebSocket auth) out of uvicorn's log lines."""
+
+    _PATTERN = re.compile(r"([?&]token=)[^&\s\"']*")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Redact in the arguments: uvicorn's access formatter unpacks them.
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self._PATTERN.sub(r"\1***", arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        return True
+
+
+def _redact_tokens_in_uvicorn_logs() -> None:
+    # Logger filters survive uvicorn's own logging configuration.
+    for name in ("uvicorn.access", "uvicorn.error"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(f, RedactTokenFilter) for f in logger.filters):
+            logger.addFilter(RedactTokenFilter())
 
 
 def create_app(manager: GatewayManager | None = None) -> FastAPI:
     gateway = manager or GatewayManager()
+    _redact_tokens_in_uvicorn_logs()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -88,6 +151,9 @@ def create_app(manager: GatewayManager | None = None) -> FastAPI:
     @app.middleware("http")
     async def authenticate_http(request, call_next):
         auth_token = current_auth_token()
+        rejection = _untrusted_request(request.headers, auth_token)
+        if rejection:
+            return JSONResponse({"detail": rejection}, status_code=403)
         # Health/ready endpoints remain usable for process supervision. Keep
         # this exact-path check narrow so similarly prefixed routes are not
         # accidentally exposed without authentication.
@@ -341,6 +407,10 @@ def create_app(manager: GatewayManager | None = None) -> FastAPI:
     @app.websocket("/api/v1/ws")
     async def websocket_endpoint(websocket: WebSocket):
         auth_token = current_auth_token()
+        rejection = _untrusted_request(websocket.headers, auth_token)
+        if rejection:
+            await websocket.close(code=1008, reason=rejection)
+            return
         if auth_token is not None:
             header = websocket.headers.get("authorization", "")
             supplied = (
@@ -425,13 +495,16 @@ def create_app(manager: GatewayManager | None = None) -> FastAPI:
 
         try:
             while True:
-                message = await websocket.receive_json()
-                if message.get("type") != "command":
+                try:
+                    message = json.loads(await websocket.receive_text())
+                except ValueError:
+                    message = None
+                if not isinstance(message, dict) or message.get("type") != "command":
                     await send(
                         error_message(
                             "invalid_message",
                             "Expected a command envelope.",
-                            message.get("request_id"),
+                            message.get("request_id") if isinstance(message, dict) else None,
                         )
                     )
                     continue
@@ -468,8 +541,8 @@ def create_app(manager: GatewayManager | None = None) -> FastAPI:
                         runtime = await gateway.load_runtime(conversation_id)
                         with runtime.state_lock:
                             history = list(runtime.agent.get_history())
-                        # Loading drops an unfinished suffix; report it so a
-                        # client can offer conversation.continue (CLI /resume).
+                        # Loading keeps a repaired unfinished suffix; report it
+                        # so a client can offer conversation.continue (CLI /resume).
                         _, needs_continue = sanitize_for_resume(
                             gateway.repository.load_history(conversation_id) or [],
                             prefer_incomplete=True,

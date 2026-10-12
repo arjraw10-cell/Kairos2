@@ -12,6 +12,42 @@ from typing import Any
 from .models import Conversation, Run, StoredMessage, new_id, utc_now
 
 
+class DataDirLock:
+    """Exclusive lock on a data directory, held until ``release()`` or exit."""
+
+    def __init__(self, data_dir: Path):
+        self._handle = open(Path(data_dir) / "gateway.lock", "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self._handle.close()
+            raise RuntimeError(
+                f"Another Kairos gateway is already using {data_dir}. Stop it, "
+                "or set KAIROS_DATA_DIR to a different folder."
+            ) from exc
+
+    def release(self) -> None:
+        if self._handle.closed:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                # Unlock explicitly: Windows may release a closed handle's lock late.
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self._handle.close()
+
+
 class GatewayRepository:
     """Thread-safe repository using one short-lived SQLite connection per call."""
 
@@ -152,7 +188,7 @@ class GatewayRepository:
     def _run_from_row(row: sqlite3.Row) -> Run:
         return Run(
             id=row["id"], conversation_id=row["conversation_id"], status=row["status"],
-            source=row["source"], client_id=row["client_id"], input_message_id=row["input_message_id"],
+            source=row["source"], client_id=row["client_id"],
             started_at=row["started_at"], completed_at=row["completed_at"], error=row["error"],
             request_content=row["request_content"], request_image_url=row["request_image_url"],
             origin=row["origin"],
