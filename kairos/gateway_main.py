@@ -9,6 +9,7 @@ import uvicorn
 from .config import Config
 from .gateway.manager import GatewayManager
 from .gateway.server import create_app
+from .workspaces import WORKSPACE_ROOT
 
 
 logging.basicConfig(
@@ -37,7 +38,7 @@ def main() -> None:
     print(f"  WebSocket: ws://{host}:{port}/api/v1/ws")
     print(f"  Health:    http://{host}:{port}/healthz")
     print(f"  Database:  {app.state.gateway.repository.db_path}")
-    print(f"  Default:   {workspace or '(none — clients must provide a workspace)'}")
+    print(f"  Workspace: new conversations without one get a fresh folder in {WORKSPACE_ROOT}")
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 

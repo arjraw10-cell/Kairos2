@@ -290,6 +290,28 @@ def api_test() -> None:
             assert unloaded.status_code == 200, unloaded.text
 
 
+def fresh_workspace_test() -> None:
+    from kairos import workspaces
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "kairos_workspace"
+        previous_root = workspaces.WORKSPACE_ROOT
+        workspaces.WORKSPACE_ROOT = root
+        try:
+            manager = GatewayManager(
+                GatewayRepository(Path(directory) / "data"),
+                default_workspace=str(Path(directory) / "old-default"),
+                max_concurrent_runs=1,
+            )
+            fresh = Path(manager.create_conversation().workspace_path)
+            assert fresh.parent == root.resolve() and fresh.is_dir(), fresh
+            assert Path(manager.create_conversation().workspace_path) != fresh
+            explicit = manager.create_conversation(directory).workspace_path
+            assert Path(explicit) == Path(directory).resolve(), explicit
+        finally:
+            workspaces.WORKSPACE_ROOT = previous_root
+
+
 def main() -> None:
     tests = [
         terminal_test,
@@ -302,6 +324,7 @@ def main() -> None:
         config_test,
         auth_test,
         api_test,
+        fresh_workspace_test,
     ]
     for test in tests:
         print(f"running {test.__name__}", flush=True)

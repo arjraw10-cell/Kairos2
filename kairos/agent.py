@@ -14,7 +14,7 @@ from .tokens import TokenCounter
 from .tools import (
     ReadTool, WriteTool, EditTool,
     NewTerminalTool, ExecuteCommandTool, ReadLogsTool, CloseTerminalTool, GetTerminalInfoTool,
-    SearchTool, GitTool, SubAgentTool,
+    SearchTool, GitTool, SubAgentTool, WebSearchTool,
     BrowserTool, BrowserScreenshotTool,
     DesktopDoctorTool, DesktopListWindowsTool, DesktopWindowStateTool, DesktopScreenshotTool,
     DesktopLaunchAppTool, DesktopClickTool, DesktopTypeTool, DesktopPressKeyTool,
@@ -72,6 +72,7 @@ class Agent:
         self.close_terminal_tool = CloseTerminalTool(self.terminal_manager)
         self.get_terminal_info_tool = GetTerminalInfoTool(self.terminal_manager)
         self.search_tool = SearchTool()
+        self.web_search_tool = WebSearchTool()
         self.git_tool = GitTool()
         self.git_tool.set_workspace(str(self.cwd))
 
@@ -201,6 +202,8 @@ class Agent:
             "## Terminal Tools\n"
             "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call requires a finite positive timeout; values above 20 seconds are capped at 20 seconds. Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately, the persistent shell stays alive, and a completion notification containing capped output is delivered while the agent is active or queued for the next user message when the agent is idle. The full output remains available through read_logs.\n\n"
             f"## Tool Result Limits\nText returned by tools is capped before it is added to conversation history: up to {self.max_tool_result_chars:,} characters per tool result. Oversized results contain a truncation marker and preserve both the beginning and end. Use narrower commands or queries; for complete background-terminal output, use read_logs.\n\n"
+            "## Web Search\n"
+            "Use `web_search` for quick facts and current events. Use the browser for pages that need interaction, or when web_search is unavailable.\n\n"
             "## Browser Tools\n"
             "The browser is a headed, humanized CloakBrowser. It launches automatically on the first browser tool call.\n"
             "1. `browser_navigate` opens a URL (or back / forward / reload) and returns an accessibility snapshot.\n"
@@ -318,6 +321,21 @@ class Agent:
                             "timeout": {"type": "number", "description": "Maximum search time in seconds (default 10; non-negative)"},
                         },
                         "required": ["pattern"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web (Tavily). Returns a short answer when available, then title, URL and snippet per result.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query"},
+                            "max_results": {"type": "integer", "description": "Number of results, 1-10 (default 5)"},
+                        },
+                        "required": ["query"],
                     },
                 },
             },
@@ -830,6 +848,7 @@ class Agent:
                 a.get("max_results", 50),
                 a.get("timeout", SearchTool.DEFAULT_TIMEOUT),
             ).to_dict(),
+            "web_search": lambda a: self.web_search_tool(a["query"], a.get("max_results", 5)).to_dict(),
             "git": lambda a: self.git_tool(a["command"], path=a.get("path"), count=a.get("count", 10), message=a.get("message", "")).to_dict(),
             "new_terminal": lambda a: self.new_terminal_tool(a["background"]).to_dict(),
             "execute_command": lambda a: self.execute_command_tool(a["terminal_id"], a["command"], a.get("timeout"), a.get("is_background")).to_dict(),
@@ -894,6 +913,7 @@ class Agent:
         if name == "search":
             timeout = args.get("timeout", SearchTool.DEFAULT_TIMEOUT)
             return f"search: '{args.get('pattern', '?')}' in {args.get('path', 'cwd')} (timeout: {timeout}s)"
+        if name == "web_search": return f"web search: '{args.get('query', '?')}'"
         if name == "git":
             cmd = args.get("command", "?")
             if cmd == "commit": return f"git commit: {args.get('message', '')[:40]}"

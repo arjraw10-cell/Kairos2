@@ -19,6 +19,7 @@ from typing import Any, Callable, Awaitable
 
 from ..agent import Agent
 from ..config import Config
+from ..workspaces import new_workspace
 from .history import sanitize_for_resume
 from .models import Conversation, Run
 from .repository import GatewayRepository
@@ -81,12 +82,12 @@ class GatewayManager:
             self._legacy_import = self.repository.import_legacy_chats(legacy_file, self.default_workspace)
 
     def resolve_workspace(self, workspace: str | None) -> str:
-        value = workspace or self.default_workspace
-        if not value:
-            raise ValueError("No workspace specified. Provide an absolute workspace path.")
+        # A conversation created without a workspace gets its own fresh folder.
+        if not workspace:
+            return str(new_workspace())
         # Workspace paths are context, not a security boundary.  Do not apply
         # an allowlist or containment check here.
-        return str(Path(value).expanduser().resolve())
+        return str(Path(workspace).expanduser().resolve())
 
     def create_conversation(self, workspace: str | None = None, title: str = "") -> Conversation:
         return self.repository.create_conversation(self.resolve_workspace(workspace), title)
