@@ -298,14 +298,20 @@ class GatewayManager:
     def visible_messages(self, conversation_id: str, include_internal: bool = False, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return [m.to_dict(include_internal=include_internal) for m in self.repository.list_messages(conversation_id, include_internal, limit, offset)]
 
-    def emit(self, conversation_id: str, event: str, data: dict[str, Any], run_id: str | None = None) -> dict[str, Any]:
-        try:
-            payload = self.repository.append_event(conversation_id, event, data, run_id)
-        except Exception:
-            # Event persistence must not turn a successful Agent operation
-            # into a failed run. The event is still delivered to live clients
-            # when possible, but the failure is logged for diagnosis.
-            log.exception("Could not persist gateway event %s", event)
+    def emit(self, conversation_id: str, event: str, data: dict[str, Any], run_id: str | None = None, persist: bool = True) -> dict[str, Any]:
+        payload = None
+        # ``persist=False`` is used for streamed token deltas: storing each one
+        # cost a SQLite transaction (~14 ms) on the Agent worker thread, and
+        # ``assistant.stream_ended`` still persists the full text for replay.
+        if persist:
+            try:
+                payload = self.repository.append_event(conversation_id, event, data, run_id)
+            except Exception:
+                # Event persistence must not turn a successful Agent operation
+                # into a failed run. The event is still delivered to live clients
+                # when possible, but the failure is logged for diagnosis.
+                log.exception("Could not persist gateway event %s", event)
+        if payload is None:
             payload = {"event_id": None, "event": event, "conversation_id": conversation_id, "run_id": run_id, "created_at": None, "data": data}
         with self._subscribers_lock:
             subscribers = list(self._subscribers.get(conversation_id, {}).values())
@@ -489,8 +495,8 @@ class GatewayManager:
             self.emit(runtime.conversation_id, "run.started", {"run": started.to_dict()}, run.id)
             loop = asyncio.get_running_loop()
 
-            def send_event(event: str, data: dict[str, Any]) -> None:
-                payload = self.emit(runtime.conversation_id, event, data, run.id)
+            def send_event(event: str, data: dict[str, Any], persist: bool = True) -> None:
+                payload = self.emit(runtime.conversation_id, event, data, run.id, persist)
                 # The manager-level subscriber registry handles live fan-out.
                 # Keep this callback for compatibility with direct callers, but
                 # protect the Agent worker from disconnected client failures.
@@ -501,24 +507,28 @@ class GatewayManager:
                     except Exception:
                         log.debug("Direct event observer failed", exc_info=True)
 
+            def token_data(tokens: Any) -> dict[str, Any]:
+                return {"session_input": tokens.session_input, "session_output": tokens.session_output, "context_pct": round(tokens.context_pct, 2), "turn_input": tokens.turn_input, "turn_output": tokens.turn_output}
+
             def configure_callbacks() -> None:
                 agent = runtime.agent
                 # Use setattr/getattr rather than requiring every injectable
                 # test Agent to predeclare the full production callback set.
                 setattr(agent, "on_stream_start", lambda: send_event("assistant.stream_started", {}))
-                setattr(agent, "on_stream_token", lambda token: send_event("assistant.token", {"delta": token}))
+                setattr(agent, "on_stream_token", lambda token: send_event("assistant.token", {"delta": token}, persist=False))
                 setattr(agent, "on_stream_end", lambda text, has_tools: send_event("assistant.stream_ended", {"content": text, "has_tool_calls": has_tools}))
                 setattr(agent, "on_tool_call", lambda name, args: send_event("tool.started", {"name": name, "summary": Agent._tool_summary(name, args)}))
                 setattr(agent, "on_tool_result", lambda name, result, raw: send_event("tool.finished", {"name": name, "success": bool(result.get("success")), "error": result.get("error")}))
-                setattr(agent, "on_token_update", lambda tokens: send_event("token.updated", {"session_input": tokens.session_input, "session_output": tokens.session_output, "context_pct": round(tokens.context_pct, 2), "turn_input": tokens.turn_input, "turn_output": tokens.turn_output}))
+                setattr(agent, "on_token_update", lambda tokens: send_event("token.updated", token_data(tokens)))
                 setattr(agent, "on_compact", lambda message: send_event("conversation.compacted", {"message": message}))
                 setattr(agent, "on_background_notification", lambda message: send_event("terminal.completed", {"message": message}))
                 subagent_tool = getattr(agent, "subagent_tool", None)
                 if subagent_tool:
                     subagent_tool._tool_printer = lambda summary: send_event("tool.started", {"name": "subagent", "summary": summary})
                     subagent_tool._stream_start = lambda: send_event("assistant.stream_started", {"subagent": True})
-                    subagent_tool._stream_token = lambda token: send_event("assistant.token", {"delta": token, "subagent": True})
+                    subagent_tool._stream_token = lambda token: send_event("assistant.token", {"delta": token, "subagent": True}, persist=False)
                     subagent_tool._stream_end = lambda text, has_tools: send_event("assistant.stream_ended", {"content": text, "has_tool_calls": has_tools, "subagent": True})
+                    subagent_tool._token_update = lambda subagent_id, tokens: send_event("token.updated", {**token_data(tokens), "subagent_id": subagent_id})
 
             configure_callbacks()
             try:
@@ -580,6 +590,7 @@ class GatewayManager:
                     subagent_tool._stream_start = None
                     subagent_tool._stream_token = None
                     subagent_tool._stream_end = None
+                    subagent_tool._token_update = None
 
     async def interrupt_run(self, conversation_id: str, run_id: str | None = None) -> bool:
         runtime = self.get_runtime(conversation_id)

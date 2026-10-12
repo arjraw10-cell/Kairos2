@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ..config import Config
-from .history import visible_history
+from .history import sanitize_for_resume, visible_history
 from .manager import GatewayManager
 from .models import Conversation
 from .protocol import Command, PROTOCOL_VERSION, ack, error_message, event_message
@@ -468,6 +468,12 @@ def create_app(manager: GatewayManager | None = None) -> FastAPI:
                         runtime = await gateway.load_runtime(conversation_id)
                         with runtime.state_lock:
                             history = list(runtime.agent.get_history())
+                        # Loading drops an unfinished suffix; report it so a
+                        # client can offer conversation.continue (CLI /resume).
+                        _, needs_continue = sanitize_for_resume(
+                            gateway.repository.load_history(conversation_id) or [],
+                            prefer_incomplete=True,
+                        )
                         await send(
                             ack(
                                 request_id,
@@ -476,6 +482,7 @@ def create_app(manager: GatewayManager | None = None) -> FastAPI:
                                         conversation_id
                                     ).to_dict(),
                                     "history": visible_history(history),
+                                    "needs_continue": needs_continue,
                                 },
                             )
                         )

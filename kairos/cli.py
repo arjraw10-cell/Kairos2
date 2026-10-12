@@ -12,6 +12,8 @@ from pathlib import Path
 from rich.console import Console, ConsoleOptions, RenderResult
 from rich.panel import Panel
 from rich.markdown import Markdown, MarkdownElement, MarkdownContext, TableElement as _BaseTableElement
+from rich.markup import escape
+from rich.segment import Segment
 from rich.syntax import Syntax
 from rich.text import Text
 from rich.live import Live
@@ -87,7 +89,7 @@ class KairosMarkdown(Markdown):
     elements["table_open"] = _EnhancedTableElement
 from prompt_toolkit import PromptSession
 from prompt_toolkit.styles import Style
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.formatted_text import HTML, FormattedText
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 
@@ -95,8 +97,39 @@ console = Console()
 
 PROMPT_STYLE = Style.from_dict({
     "prompt": "ansicyan bold",
+    "rprompt": "ansibrightblack",
     "": "ansidefault",
 })
+
+
+class _StreamView:
+    """Live renderable for the grey streaming panel.
+
+    It reads the CLI's text at render time, so a token only appends to a
+    string. While streaming it shows the bottom of the panel that fits the
+    terminal: with Rich's default ``ellipsis`` overflow the view froze at the
+    top once a reply grew taller than the screen. ``full`` renders everything
+    for the final frame printed when the stream ends.
+    """
+
+    def __init__(self, cli: "CLI"):
+        self._cli = cli
+        self.full = False
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        text = self._cli._stream_text
+        if not self.full:
+            # The last height*width characters always contain every line
+            # that can be visible, so rendering cost stays bounded.
+            text = text[-(console.width * console.height):]
+        panel = Panel(Text(text or "...", style="italic dim"), border_style="dim", padding=(0, 1))
+        if self.full:
+            yield panel
+            return
+        lines = console.render_lines(panel, options, pad=False)
+        for line in lines[-max(3, console.height - 1):]:
+            yield from line
+            yield Segment.line()
 
 # ---- Paste counters (incrementing numbers for display, reset per prompt) ----
 _image_counter = 0
@@ -223,27 +256,52 @@ def _detect_mime(data: bytes) -> str:
     return 'image/png'
 
 
+def _read_windows_clipboard_text() -> str:
+    """Read CF_UNICODETEXT through the Win32 API.
+
+    This replaced two PowerShell launches that made Ctrl+V take ~2 s.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    CF_UNICODETEXT = 13
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+
+    if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+        return ""
+    # Another program can hold the clipboard briefly; retry a few times.
+    for _ in range(10):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.01)
+    else:
+        return ""
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            return ""
+        try:
+            return ctypes.wstring_at(pointer)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
 def _read_system_clipboard() -> str:
     """Read text from the OS clipboard (cross-platform)."""
     try:
         if sys.platform == "win32":
-            check = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Add-Type -Assembly System.Windows.Forms; "
-                 "if ([System.Windows.Forms.Clipboard]::ContainsText()) { 'yes' }"],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=3,
-            )
-            if "yes" not in check.stdout.lower():
-                return ""
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Add-Type -Assembly System.Windows.Forms; "
-                 "[System.Windows.Forms.Clipboard]::GetText()"],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=3,
-            )
-            return r.stdout
+            return _read_windows_clipboard_text()
         elif sys.platform == "darwin":
             r = subprocess.run(["pbpaste"], capture_output=True,
                                text=True, encoding="utf-8",
@@ -378,6 +436,7 @@ class CLI:
         self._stop_thinking = threading.Event()
         self._thinking_thread: Optional[threading.Thread] = None
         self._live: Optional[Live] = None
+        self._stream_view: Optional[_StreamView] = None
         self._stream_text = ""
         self._skip_print_response = False
 
@@ -402,31 +461,28 @@ class CLI:
     #  Banner / info                                                       #
     # ------------------------------------------------------------------ #
 
-    def print_banner(self):
-        # Build banner using chr(92) to avoid all backslash escaping issues
-        BS = chr(92)  # backslash character
-        line1 = " __  __     ______   __  __        ____  ____  ___"
-        line2 = "/  " + BS + "/  | __|__  / | /  " + BS + "/  | __ _|  _ " + BS + "/ ___|/ __|"
-        line3 = BS + "      / |_ / / /| ||      |/ _" + chr(96) + " | |_) " + BS + "___ " + BS + " (__ "
-        line4 = " " + BS + "__" + BS + "__/ /__/____|_|" + BS + "____/" + BS + "__,_|____/|____/" + BS + "___|"
-        banner_art = line1 + chr(10) + line2 + chr(10) + line3 + chr(10) + line4 + chr(10)
+    def print_banner(self, workspace: str = "", mode: str = ""):
+        """Print a one-line banner: name, mode, workspace."""
         banner = Text()
-        banner.append(banner_art, style="bold cyan")
-        banner.append("Minimal Coding Agent", style="italic white")
-        self.console.print(Panel(banner, border_style="cyan", padding=(1, 2)))
+        banner.append("KAIROS", style="bold cyan")
+        if mode:
+            banner.append(f"  {mode}", style="cyan")
+        if workspace:
+            banner.append(f"  {workspace}", style="dim")
+        self.console.print(banner)
         self.console.print()
 
     def print_workspace(self, path: str):
         self.console.print(f"[dim]Workspace:[/dim] [bold cyan]{path}[/bold cyan]")
 
     def print_info(self, message: str):
-        self.console.print(f"[cyan]Info:[/cyan] {message}")
+        self.console.print(Text(message, style="dim"))
 
     def print_background_notification(self, message: str):
         """Show a completed background command without hiding its details."""
         self.console.print(
             Panel(
-                message,
+                Text(message),
                 border_style="yellow",
                 title="Background terminal",
                 padding=(0, 1),
@@ -434,13 +490,14 @@ class CLI:
         )
 
     def print_error(self, message: str):
+        # Text(), not markup: error text often contains [brackets].
         if "\n" in message:
             self.console.print(
-                Panel(f"[red]{message}[/red]", border_style="red",
+                Panel(Text(message, style="red"), border_style="red",
                       title="Error", padding=(1, 2))
             )
         else:
-            self.console.print(f"[red]Error:[/red] {message}")
+            self.console.print(Text.assemble(("Error: ", "red"), message))
 
     def print_exit(self):
         self.console.print("\n[dim]Goodbye![/dim]\n")
@@ -459,11 +516,15 @@ class CLI:
 
     def stop_thinking(self):
         self._stop_thinking.set()
-        if self._thinking_thread and self._thinking_thread.is_alive():
+        if self._thinking_thread is not None:
             self._thinking_thread.join(timeout=0.5)
-        sys.stdout.write("\r" + " " * 30 + "\r")
-        sys.stdout.flush()
+            self._thinking_thread = None
+            # Erase the dots only if they were drawn. Writing this while the
+            # Live panel is active printed a stray blank line above it.
+            sys.stdout.write("\r" + " " * 30 + "\r")
+            sys.stdout.flush()
         if self._live:
+            self._stream_view.full = True
             self._live.stop()
             self._live = None
             self._stream_text = ""
@@ -484,27 +545,26 @@ class CLI:
     def start_stream(self):
         self.stop_thinking()
         self._stream_text = ""
+        self._stream_view = _StreamView(self)
         self._live = Live(
-            Panel("[italic dim]...[/italic dim]", border_style="dim", padding=(0, 1)),
+            self._stream_view,
             console=self.console,
-            refresh_per_second=8,
+            refresh_per_second=10,
             transient=False,
         )
         self._live.start()
 
     def on_stream_token(self, token: str):
+        # Live's refresh thread re-renders the view; no per-token work here.
         self._stream_text += token
-        if self._live:
-            self._live.update(
-                Panel(f"[italic dim]{self._stream_text}[/italic dim]",
-                      border_style="dim", padding=(0, 1))
-            )
 
     def finish_stream(self) -> str:
         text = self._stream_text
         if self._live:
             if not text.strip() or text.strip() == "...":
                 self._live.update(Text(""))
+            else:
+                self._stream_view.full = True
             self._live.stop()
             self._live = None
         self._stream_text = ""
@@ -516,11 +576,39 @@ class CLI:
             try:
                 display = KairosMarkdown(text) if text else Text("")
             except Exception:
-                display = text or ""
+                display = Text(text)
             self._live.update(Panel(display, border_style="green", padding=(1, 2)))
             self._live.stop()
             self._live = None
+            self._skip_print_response = True
         self._stream_text = ""
+
+    def handle_event(self, event: str, data: dict):
+        """Render one agent event; offline and gateway modes share this."""
+        if event == "assistant.stream_started":
+            self.start_stream()
+        elif event == "assistant.token":
+            self.on_stream_token(data.get("delta") or "")
+        elif event == "assistant.stream_ended":
+            content = data.get("content") or ""
+            if data.get("subagent") or data.get("has_tool_calls") or not content.strip():
+                # Tool-call preamble (or a subagent's text) stays as the grey
+                # thinking trace; an empty panel is cleared.
+                self.finish_stream()
+            else:
+                self.finalize_stream_as_response()
+        elif event == "tool.started":
+            summary = escape(str(data.get("summary") or data.get("name") or ""))
+            if data.get("name") == "subagent":
+                self.console.print(f"  [dim]↓[/dim] [italic dim]subagent:[/italic dim] {summary}")
+            else:
+                self.print_tool_summary(summary)
+        elif event == "token.updated":
+            self.print_token_status(data)
+        elif event == "conversation.compacted":
+            self.print_info(str(data.get("message") or ""))
+        elif event == "terminal.completed":
+            self.print_background_notification(str(data.get("message") or ""))
 
     # ------------------------------------------------------------------ #
     #  Tool call summary                                                   #
@@ -543,16 +631,17 @@ class CLI:
     #  Token status bar                                                    #
     # ------------------------------------------------------------------ #
 
-    def print_token_status(self, token_counter):
-        status = token_counter.format_status()
-        self.console.print(f"[dim]{status}[/dim]")
-
-    def print_subagent_token_status(self, subagent_id: str, token_counter):
-        """Print a child agent's token status without mixing it with the parent."""
-        status = token_counter.format_status()
-        self.console.print(
-            f"[dim]Subagent {subagent_id}: {status}[/dim]"
+    def print_token_status(self, data: dict):
+        """Print a ``token.updated`` payload (same layout as TokenCounter)."""
+        status = (
+            f"Session: {data.get('session_input', 0):,} in / {data.get('session_output', 0):,} out"
+            f"  |  Context: {data.get('context_pct', 0):.1f}%"
+            f"  |  Turn: {data.get('turn_input', 0):,} in / {data.get('turn_output', 0):,} out"
         )
+        if data.get("subagent_id"):
+            # A child agent's own counter, kept apart from the parent's.
+            status = f"Subagent {data['subagent_id']}: {status}"
+        self.console.print(Text(status, style="dim"))
 
     # ------------------------------------------------------------------ #
     #  Final response (green panel)                                        #
@@ -605,28 +694,16 @@ class CLI:
         self.console.print("[bold]Saved chats:[/bold]")
         for i, s in enumerate(sessions):
             ts = s.get("timestamp", "unknown")
-            preview = s.get("preview", "")
+            preview = escape(s.get("preview", ""))
             self.console.print(f"  [cyan]{i + 1}.[/cyan] {ts}  {preview}...")
         self.console.print()
 
         choice = initial_choice
         while True:
             if choice is None:
-                pending_line, pending_default = self._take_pending_input_for_prompt()
-                if pending_line is not None:
-                    choice = pending_line
-                else:
-                    try:
-                        choice = self._prompt_session.prompt(
-                            HTML(
-                                '<style class="prompt">Pick a chat (number) '
-                                'or press Enter to cancel: </style>'
-                            ),
-                            style=PROMPT_STYLE,
-                            default=pending_default,
-                        ).strip()
-                    except (EOFError, KeyboardInterrupt):
-                        return None
+                choice = self.ask("Pick a chat (number) or press Enter to cancel: ")
+                if choice is None:
+                    return None
 
             choice = choice.strip()
             if not choice:
@@ -640,6 +717,23 @@ class CLI:
 
             self.console.print("[red]Invalid choice. Enter a chat number or press Enter to cancel.[/red]")
             choice = None
+
+    def ask(self, label: str) -> Optional[str]:
+        """Prompt for one line (also taking input typed during a handoff).
+
+        Returns None on Ctrl+C / Ctrl+D.
+        """
+        pending_line, pending_default = self._take_pending_input_for_prompt()
+        if pending_line is not None:
+            return pending_line.strip()
+        try:
+            return self._prompt_session.prompt(
+                FormattedText([("class:prompt", label)]),
+                style=PROMPT_STYLE,
+                default=pending_default,
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
 
     # ------------------------------------------------------------------ #
     #  Escape key listener                                                 #
@@ -759,7 +853,8 @@ class CLI:
     #  User input  (the main entry point — handles all paste detection)   #
     # ------------------------------------------------------------------ #
 
-    def get_user_input(self, prefix: str = "kairos> ") -> Optional[str]:
+    def get_user_input(self, prefix: str = "kairos> ", status: str = "") -> Optional[str]:
+        """Read one request; ``status`` (model · effort) shows right-aligned."""
         try:
             # Reset paste token counters for this prompt
             _reset_paste_counters()
@@ -783,6 +878,7 @@ class CLI:
             # ---- Run the prompt ----
             result = self._prompt_session.prompt(
                 HTML(f'<style class="prompt">{prefix}</style>'),
+                rprompt=FormattedText([("class:rprompt", status)]),
                 style=PROMPT_STYLE,
                 default=pending_default,
             ).strip()
