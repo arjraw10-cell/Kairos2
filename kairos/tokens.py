@@ -96,8 +96,10 @@ class TokenCounter:
             image = block.get("image_url", {})
             if not isinstance(image, dict):
                 image = {}
-            detail = image.get("detail")
-            tokens += 765 if detail == "high" else 85
+            # Kairos never sets a detail, and providers treat a missing or
+            # "auto" detail like high detail for screenshots; only an explicit
+            # "low" is the cheap estimate.
+            tokens += 85 if image.get("detail") == "low" else 765
         return tokens
 
     def count_message(self, msg: dict) -> int:
@@ -231,12 +233,6 @@ class TokenCounter:
     def format_status(self) -> str:
         """Format a status line showing all token info."""
         return format_status_line(self.status_data())
-
-    def format_turn_summary(self) -> str:
-        """One-liner after a turn completes."""
-        ti = f"{self.turn_input:,}"
-        to = f"{self.turn_output:,}"
-        return f"Tokens this turn: {ti} in / {to} out"
 
 
 def status_payload(counter) -> dict:

@@ -6,6 +6,7 @@ Raw HTTP keeps this a generic wire-format adapter for any Messages-compatible
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Optional
 
 import httpx
@@ -13,6 +14,7 @@ import httpx
 from .base import EventStream, ProviderError, key_pool
 from .config import ModelSpec
 
+_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 ANTHROPIC_VERSION = "2023-06-01"
 MAX_TOKENS = 32000  # required by the API; streaming avoids HTTP timeouts
 THINKING_KEY = "_thinking"  # assistant-message key holding thinking blocks to echo back
@@ -97,15 +99,21 @@ def translate_messages(messages: list) -> tuple[str, list]:
     return "\n\n".join(system_parts), out
 
 
-class _HTTPStream:
-    """Closable SSE response; ``close`` releases a blocked read on hard stop."""
+_shared_client: Optional[httpx.Client] = None
+_shared_client_lock = threading.Lock()
 
-    def __init__(self, client: httpx.Client, response: httpx.Response):
-        self.client = client
-        self.response = response
 
-    def close(self) -> None:
-        self.response.close()
+def _client(transport: Optional[httpx.BaseTransport]) -> httpx.Client:
+    """One process-wide client (thread-safe, pooled connections), so adapters
+    created per sub-agent or model switch do not each leak an open client.
+    A test transport gets its own client."""
+    global _shared_client
+    if transport is not None:
+        return httpx.Client(timeout=_TIMEOUT, transport=transport)
+    with _shared_client_lock:
+        if _shared_client is None:
+            _shared_client = httpx.Client(timeout=_TIMEOUT)
+        return _shared_client
 
 
 def parse_sse(lines):
@@ -121,7 +129,7 @@ class AnthropicAdapter:
     def __init__(self, spec: ModelSpec, transport: Optional[httpx.BaseTransport] = None):
         self.spec = spec
         self._pool = key_pool(spec.api_keys)
-        self._client = httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0), transport=transport)
+        self._client = _client(transport)
 
     def request_body(self, messages: list, tools: Optional[list], effort: Optional[str]) -> dict[str, Any]:
         system, translated = translate_messages(messages)
@@ -140,7 +148,7 @@ class AnthropicAdapter:
             body["output_config"] = {"effort": effort}
         return body
 
-    def _open(self, key: str, body: dict) -> _HTTPStream:
+    def _open(self, key: str, body: dict) -> httpx.Response:
         url = (self.spec.base_url or "https://api.anthropic.com").rstrip("/") + "/v1/messages"
         headers = {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION, "content-type": "application/json"}
         response = self._client.send(self._client.build_request("POST", url, headers=headers, json=body), stream=True)
@@ -152,12 +160,13 @@ class AnthropicAdapter:
             finally:
                 response.close()
             raise ProviderError(f"HTTP {response.status_code}: {detail or response.reason_phrase}", response.status_code)
-        return _HTTPStream(self._client, response)
+        return response
 
     def stream(self, messages: list, tools: Optional[list], effort: Optional[str]) -> EventStream:
         body = self.request_body(messages, tools, effort)
-        raw = self._pool.call(lambda key: self._open(key, body))
-        return EventStream(self.events(parse_sse(raw.response.iter_lines())), raw.close)
+        response = self._pool.call(lambda key: self._open(key, body))
+        # Closing the response releases a blocked read on hard stop.
+        return EventStream(self.events(parse_sse(response.iter_lines())), response.close)
 
     @staticmethod
     def events(payloads):

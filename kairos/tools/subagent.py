@@ -20,6 +20,9 @@ class _SubAgent:
     recent_actions: deque = field(default_factory=lambda: deque(maxlen=3))
     started_at: float = field(default_factory=time.monotonic)
     finished_at: Optional[float] = None
+    # The thread of the latest run. After terminate it may still be finishing
+    # (a tool call in flight); the sub-agent is "stopping" until it exits.
+    thread: Optional[threading.Thread] = None
 
 
 class SubAgentTool:
@@ -36,6 +39,7 @@ class SubAgentTool:
     MAX_RUNNING = 5
     MAX_RESULT_CHARS = 12_000
     PROMPT_PREVIEW_CHARS = 100
+    STOP_WAIT_SECONDS = 2.0  # message() waits this long for a stopping run
 
     def __init__(
         self,
@@ -74,12 +78,24 @@ class SubAgentTool:
     def message(self, subagent_id: str, message: str) -> ToolResult:
         with self._lock:
             sub = self._subagents.get(subagent_id)
+            thread = sub.thread if sub is not None and sub.state != "running" else None
+        if thread is not None:
+            # A terminated run may still be finishing; give it a moment.
+            thread.join(self.STOP_WAIT_SECONDS)
+        with self._lock:
             if sub is None:
                 return ToolResult(False, "", f"Sub-agent {subagent_id} not found.")
             if sub.state == "running":
                 return ToolResult(False, "", (
                     f"Sub-agent {subagent_id} is still running. You will be woken "
                     "when it finishes; message it after that."
+                ))
+            if sub.thread is not None and sub.thread.is_alive():
+                # Starting now would run two threads on one Agent: the old run
+                # would report as the reply and the new one would be lost.
+                return ToolResult(False, "", (
+                    f"Sub-agent {subagent_id} is still stopping (its terminated run "
+                    "has not finished its current step). Message it again in a moment."
                 ))
             if self._running_count() >= self.MAX_RUNNING:
                 return ToolResult(False, "", self._cap_error())
@@ -168,6 +184,9 @@ class SubAgentTool:
         agent._use_spec(spec, effort)
         agent._is_subagent = True
         agent.subagent_tool = None
+        # Rebuild the prompt now that it is a sub-agent: it describes only
+        # the tools it has (no browser, no sub-agents).
+        agent._setup_system_prompt()
 
         def on_tool_call(name: str, args: dict) -> None:
             summary = Agent._tool_summary(name, args)
@@ -180,18 +199,21 @@ class SubAgentTool:
         return agent
 
     def _start(self, sub: _SubAgent, prompt: str) -> None:
+        thread = threading.Thread(
+            target=self._run, args=(sub, prompt), daemon=True, name=f"subagent-{sub.id}"
+        )
         with self._lock:
             sub.state = "running"
             sub.current_tool = None
             sub.started_at = time.monotonic()
             sub.finished_at = None
+            sub.thread = thread
         # A terminate that raced the end of the previous run can leave the
-        # stop flag set; it would make this run return at once.
+        # stop flag set; it would make this run return at once. The previous
+        # thread has exited (message() checks), so clearing it is safe.
         sub.agent._interrupt_event.clear()
         self._emit_status(sub)
-        threading.Thread(
-            target=self._run, args=(sub, prompt), daemon=True, name=f"subagent-{sub.id}"
-        ).start()
+        thread.start()
 
     def _run(self, sub: _SubAgent, prompt: str) -> None:
         result, error = None, None

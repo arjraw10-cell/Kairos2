@@ -1,0 +1,264 @@
+"""Agent loop robustness: tool-chain repair, background-event hand-back,
+stops during compaction, provider-reported context, compaction prompt and
+tool error messages. No network: adapters are scripted."""
+import json
+import threading
+import unittest
+
+from kairos import providers
+from kairos.agent import Agent, APIRequestError
+from kairos.providers.base import EventStream
+from kairos.resume import repair_tool_chains
+from kairos.tokens import TokenCounter
+from kairos.wake import WakeScheduler
+
+from test_background import ProviderConfigMixin, ScriptAdapter, bg_event, wait_for
+
+
+def tool_call(call_id, name, args):
+    return ("tool_call", 0, call_id, name, json.dumps(args))
+
+
+def assistant_calls(*ids):
+    return {"role": "assistant", "content": None, "tool_calls": [
+        {"id": i, "type": "function", "function": {"name": "read", "arguments": "{}"}} for i in ids]}
+
+
+def tool_result(call_id):
+    return {"role": "tool", "tool_call_id": call_id, "name": "read", "content": "{}"}
+
+
+def assert_valid_chains(test, messages):
+    """Every assistant tool call is answered right after it; no orphans."""
+    i = 0
+    while i < len(messages):
+        message = messages[i]
+        test.assertNotEqual(message.get("role"), "tool", f"orphaned tool message at {i}")
+        i += 1
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            expected = [c["id"] for c in message["tool_calls"]]
+            answered = [m.get("tool_call_id") for m in messages[i:i + len(expected)]]
+            test.assertEqual(answered, expected, f"tool chain at {i - 1} is incomplete")
+            i += len(expected)
+
+
+class ToolChainTests(ProviderConfigMixin, unittest.TestCase):
+    def test_tool_summary_never_raises(self):
+        names = [t["function"]["name"] for t in Agent(self.workspace)._get_tool_schema()]
+        for name in names:
+            for args in ({}, None, [], "text", {"message": None, "prompt": None, "text": None, "expression": None,
+                                                "command": "commit", "fields": 5, "ref": None}):
+                self.assertIsInstance(Agent._tool_summary(name, args), str, name)
+        self.assertEqual(Agent._tool_summary("git", {"command": "commit", "message": None}), "git commit: ")
+
+    def test_null_argument_and_failing_observer_do_not_wedge_the_conversation(self):
+        # Reproduction: the gateway's on_tool_call summarizes the call; a null
+        # message crashed it after the assistant tool call was in history.
+        agent = Agent(self.workspace)
+        agent.on_tool_call = lambda name, args: Agent._tool_summary(name, args)
+        agent.adapter = ScriptAdapter(
+            lambda m: [tool_call("call_1", "message_subagent", {"subagent_id": "nope", "message": None})],
+            lambda m: [("text", "Done here.")],
+        )
+        self.assertEqual(agent.run("go"), "Done here.")
+        assert_valid_chains(self, agent.adapter.requests[1])
+
+        def broken_observer(name, args):
+            raise RuntimeError("observer bug")
+
+        agent.on_tool_call = broken_observer
+        agent.adapter = ScriptAdapter(lambda m: [tool_call("call_2", "list_skills", {})],
+                                      lambda m: [("text", "Still fine.")])
+        self.assertEqual(agent.run("again"), "Still fine.")
+        assert_valid_chains(self, agent.adapter.requests[1])
+
+    def test_any_exception_leaving_run_repairs_the_tool_chain(self):
+        agent = Agent(self.workspace)
+        agent.adapter = ScriptAdapter(lambda m: [tool_call("call_1", "list_skills", {})])
+
+        def crash(name, args, max_chars=None):
+            raise RuntimeError("tool loop bug")
+
+        agent._execute_tool = crash
+        with self.assertRaises(RuntimeError):
+            agent.run("go")
+        del agent._execute_tool
+        assert_valid_chains(self, agent.conversation_history)
+
+        agent.adapter = ScriptAdapter(lambda m: [("text", "Recovered.")])
+        self.assertEqual(agent.run("next"), "Recovered.")
+        assert_valid_chains(self, agent.adapter.requests[0])
+
+    def test_validation_repairs_a_gap_before_a_later_message(self):
+        agent = Agent(self.workspace)
+        agent.conversation_history += [
+            {"role": "user", "content": "go"}, assistant_calls("a", "b"), tool_result("a"),
+            {"role": "user", "content": "later"},
+        ]
+        notices = []
+        agent.on_compact = notices.append
+        agent.adapter = ScriptAdapter(lambda m: [("text", "Okay then.")])
+        self.assertEqual(agent.run("now"), "Okay then.")
+        sent = agent.adapter.requests[0]
+        assert_valid_chains(self, sent)
+        self.assertEqual([m.get("tool_call_id") for m in sent[3:5]], ["a", "b"])
+        self.assertIn("Tool was not executed", sent[4]["content"])
+        self.assertTrue(any("Repaired" in n for n in notices))
+
+    def test_repair_tool_chains_orders_results_and_drops_orphans(self):
+        history = [{"role": "system", "content": "s"}, tool_result("x"), {"role": "user", "content": "u"},
+                   assistant_calls("a", "b"), tool_result("b"), tool_result("zz"), tool_result("a")]
+        self.assertEqual(repair_tool_chains(history), 2)
+        self.assertEqual([m.get("tool_call_id") for m in history], [None, None, None, "a", "b"])
+        self.assertEqual(repair_tool_chains(history), 0)
+
+
+class BackgroundHandBackTests(ProviderConfigMixin, unittest.TestCase):
+    def test_events_of_a_failed_run_go_back_to_the_host(self):
+        agent = Agent(self.workspace)
+        seen = []
+        agent.on_background_event = seen.append
+
+        def first(messages):
+            agent._push_background_event(bg_event(1))  # arrives in-run
+            raise providers.ProviderError("HTTP 400: bad request", 400)
+
+        agent.adapter = ScriptAdapter(first)
+        with self.assertRaises(APIRequestError):
+            agent.run("go")
+        self.assertEqual(seen[0]["in_run"], True)
+        self.assertEqual(seen[-1], bg_event(1))  # handed back without in_run
+        self.assertEqual(agent.drain_background_events(), [])
+
+    def test_events_of_an_interrupted_run_wake_the_host(self):
+        agent = Agent(self.workspace)
+        woken = []
+        scheduler = WakeScheduler(start_wake=woken.append, is_idle=lambda: not agent.is_processing, debounce=0.01)
+        agent.on_background_event = scheduler.push
+
+        def first(messages):
+            agent._push_background_event(bg_event(1))
+            agent.interrupt()
+            return [("text", "never shown")]
+
+        agent.adapter = ScriptAdapter(first)
+        self.assertEqual(agent.run("go"), "[Interrupted]")
+        self.assertTrue(wait_for(lambda: woken))
+        self.assertEqual(woken[0], [bg_event(1)])
+
+    def test_reset_forgets_the_old_conversations_events(self):
+        agent = Agent(self.workspace)
+        agent.add_background_events([bg_event(1)])
+        agent.reset()
+        self.assertEqual(agent.drain_background_events(), [])
+
+
+class BlockingSummaryAdapter:
+    """Normal requests answer at once; the summary request blocks until closed."""
+
+    def __init__(self):
+        self.opened = threading.Event()
+        self.closed = threading.Event()
+
+    def stream(self, messages, tools, effort):
+        if tools is not None:
+            return iter([("text", "unused")])
+        self.opened.set()
+
+        def events():
+            self.closed.wait(5)
+            return
+            yield
+
+        return EventStream(events(), self.closed.set)
+
+
+class CompactionTests(ProviderConfigMixin, unittest.TestCase):
+    def test_stop_during_auto_compaction_is_immediate_and_keeps_the_prompt(self):
+        agent = Agent(self.workspace)
+        agent.tokens.context_window = 1_000  # the tool schema alone is over 80%
+        agent.conversation_history += [{"role": "user", "content": "old"}, {"role": "assistant", "content": "old reply"}]
+        agent.adapter = BlockingSummaryAdapter()
+        result = []
+        worker = threading.Thread(target=lambda: result.append(agent.run("new request")))
+        worker.start()
+        self.assertTrue(agent.adapter.opened.wait(5))
+        agent.interrupt()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, ["[Interrupted]"])
+        self.assertEqual(agent.conversation_history[-1], {"role": "user", "content": "new request"})
+        self.assertEqual(agent.conversation_history[1:3], [{"role": "user", "content": "old"},
+                                                           {"role": "assistant", "content": "old reply"}])
+        self.assertTrue(agent._interrupted_pending)
+
+    def test_summary_request_is_retried_like_normal_requests(self):
+        agent = Agent(self.workspace)
+        agent.API_RETRY_BASE_DELAY = 0
+        agent.conversation_history += [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+
+        def overloaded(messages):
+            raise providers.ProviderError("overloaded_error: busy", 529)
+
+        agent.adapter = ScriptAdapter(overloaded, lambda m: [("text", "SUMMARY")])
+        self.assertTrue(agent.compact().startswith("Compacted"))
+        self.assertIn("SUMMARY", agent.conversation_history[1]["content"])
+
+    def test_previous_summary_is_sent_once(self):
+        agent = Agent(self.workspace)
+        agent.tokens.context_window = 5_000  # keeps ~1,000 tokens: the last reply
+        agent.conversation_history += [
+            {"role": "user", "content": "[Conversation compacted — summary of prior history]\n\nOLD-SUMMARY-TEXT"},
+            {"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "q3"}, {"role": "assistant", "content": "word " * 1500},
+        ]
+        agent.adapter = ScriptAdapter(lambda m: [("text", "NEW SUMMARY")])
+        self.assertTrue(agent.compact().startswith("Compacted"))
+        prompt = agent.adapter.requests[0][1]["content"]
+        self.assertEqual(prompt.count("OLD-SUMMARY-TEXT"), 1)
+        self.assertIn("<previous-summary>", prompt)
+        self.assertIn("User: q2", prompt)
+
+    def test_auto_compaction_uses_provider_reported_prompt_tokens(self):
+        # Screenshots cost far more than the tiktoken estimate: the provider
+        # said 97% while the estimate said a few percent.
+        agent = Agent(self.workspace)
+        window = agent.tokens.context_window
+        notices = []
+        agent.on_compact = notices.append
+        agent.adapter = ScriptAdapter(
+            lambda m: [tool_call("call_1", "list_skills", {}), ("usage", int(window * 0.97), 5, 0)],
+            lambda m: [("text", "SUMMARY")],
+            lambda m: [("text", "All done.")],
+        )
+        self.assertEqual(agent.run("look at the screenshot"), "All done.")
+        self.assertTrue(any(n.startswith("Compacted") for n in notices))
+        self.assertEqual(agent.adapter.requests[1][0]["content"], Agent.COMPACT_SYSTEM_PROMPT)
+        self.assertIsNone(agent._api_context)  # reset by compaction
+
+    def test_images_without_low_detail_count_as_high_detail(self):
+        def image(detail=None):
+            url = {"url": "data:image/png;base64,AAAA"}
+            if detail:
+                url["detail"] = detail
+            return [{"type": "image_url", "image_url": url}]
+
+        self.assertEqual(TokenCounter._estimate_image_tokens(image()), 765)
+        self.assertEqual(TokenCounter._estimate_image_tokens(image("auto")), 765)
+        self.assertEqual(TokenCounter._estimate_image_tokens(image("high")), 765)
+        self.assertEqual(TokenCounter._estimate_image_tokens(image("low")), 85)
+
+
+class ToolErrorTests(ProviderConfigMixin, unittest.TestCase):
+    def test_bad_value_key_error_is_not_reported_as_a_missing_argument(self):
+        agent = Agent(self.workspace)
+        result = json.loads(agent._execute_tool("desktop_window_action", {"action": "resize", "pid": 1}))
+        self.assertFalse(result["success"])
+        self.assertNotIn("Missing required argument", result["error"])
+        self.assertIn("resize", result["error"])
+        missing = json.loads(agent._execute_tool("desktop_window_action", {"action": "activate_window"}))
+        self.assertIn("Missing required argument 'pid' for tool desktop_window_action", missing["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()
