@@ -577,17 +577,6 @@ class CLI:
     def print_info(self, message: str):
         self.console.print(Text(message, style="dim"))
 
-    def print_background_notification(self, message: str):
-        """Show a completed background command without hiding its details."""
-        self.console.print(
-            Panel(
-                Text(message),
-                border_style="yellow",
-                title="Background terminal",
-                padding=(0, 1),
-            )
-        )
-
     def print_error(self, message: str):
         # Text(), not markup: error text often contains [brackets].
         if "\n" in message:
@@ -800,8 +789,6 @@ class CLI:
             self.print_token_status(data)
         elif event == "conversation.compacted":
             self.print_info(str(data.get("message") or ""))
-        elif event == "terminal.completed":
-            self.print_background_notification(str(data.get("message") or ""))
         elif event == "wake.started":
             self._begin_wake(data.get("notifications") or [])
         elif event == "wake.ended":

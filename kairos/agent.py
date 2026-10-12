@@ -258,7 +258,7 @@ class Agent:
             "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, inspect version control, and browse the web.\n\n"
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
             "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
-            "You have 40 tools. Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
+            "Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
             "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, it will not automatically be injected, so you will have to look for the AGENTS.md file in that directory. Note that the AGENTS.md does not always exist.\n\n"
             "When you finish a task, the final message (that has no tool calls) will be showm to user as your message to them.\n\n"
             "## Terminal Tools\n"
@@ -1023,9 +1023,15 @@ class Agent:
                 ensure_ascii=False,
             )
         except Exception as e:
+            # Dispatch lambdas read required arguments as a["x"]; a bare "'x'"
+            # gives the model nothing to fix, so name the missing argument.
+            error = (
+                f"Missing required argument {e} for tool {name}. Call it again with that argument."
+                if isinstance(e, KeyError) else str(e)
+            )
             return json.dumps(
                 self._cap_tool_result(
-                    {"success": False, "output": "", "error": str(e)},
+                    {"success": False, "output": "", "error": error},
                     max_chars=max_chars,
                 ),
                 ensure_ascii=False,

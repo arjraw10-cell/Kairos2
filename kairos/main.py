@@ -21,6 +21,7 @@ from rich.text import Text
 from kairos.cli import CLI, _paste_registry
 from kairos.gateway_client import GatewayClient, GatewayError
 from kairos.resume import sanitize_history_for_resume
+from kairos.wake import format_notifications
 
 # Backwards-compatible private name for callers that imported the original
 # helper from kairos.main before the shared resume module was introduced.
@@ -30,22 +31,6 @@ COMMANDS = ("/quit", "/clear", "/reset", "/compact", "/resume", "/model", "/effo
 PROVIDERS = ("openai", "anthropic", "openrouter")
 CONTINUE_INSTRUCTION = "Continue where you left off. Pick up the next step."
 _RUN_ENDED = frozenset(("run.completed", "run.interrupted", "run.failed", "run.cancelled"))
-# Offline wake turns and pending results use the agent's notification
-# wording; the "Background terminal notifications arrived" prefix is what
-# kairos.resume treats as an internal (not user-typed) message.
-WAKE_INSTRUCTION = (
-    "Background terminal notifications arrived while you were idle (from the "
-    "sub-agents and background terminals you started). The user has not sent "
-    "a new message. Process them and continue:"
-)
-PENDING_INSTRUCTION = (
-    "Background terminal notifications arrived since the previous turn. "
-    "Process them as context for the user's request:"
-)
-
-
-def _notification_texts(notifications: list[dict]) -> str:
-    return "\n\n".join(str(n.get("text") or "") for n in notifications)
 
 
 def _run_outcome(name: str, data: dict) -> tuple[str, str | None]:
@@ -222,9 +207,6 @@ class OfflineBackend:
         )
         agent.on_token_update = lambda counter: emit("token.updated", tokens(counter))
         agent.on_compact = lambda message: emit("conversation.compacted", {"message": message})
-        # Background completions show immediately; the agent also keeps them
-        # queued for the next API turn.
-        agent.on_background_notification = lambda message: emit("terminal.completed", {"message": message})
         # Finished background work wakes the agent; sub-agents report status
         # lines instead of streaming their text.
         agent.on_background_event = self._on_background_event
@@ -268,7 +250,8 @@ class OfflineBackend:
             self._show("wake.started", {"notifications": events})
             result: dict = {}
             try:
-                result["response"] = self.agent.run(f"{WAKE_INSTRUCTION}\n\n{_notification_texts(events)}")
+                # Same wake input as the gateway's wake runs.
+                result["response"] = self.agent.run(format_notifications(events))
             except Exception as exc:
                 result["error"] = exc
             try:
@@ -303,7 +286,7 @@ class OfflineBackend:
         """A new or resumed conversation must not get the old one's results."""
         if self._scheduler is not None:
             self._scheduler.take_pending()
-        self._show("subagent.list", {"subagents": self.agent.list_subagents()})
+        self._show("subagent.list", {"subagents": self.agent.subagent_statuses()})
 
     @staticmethod
     def _apply(agent, setup=None, model=None, provider=None, effort=None) -> None:
@@ -347,9 +330,8 @@ class OfflineBackend:
         if self._scheduler is not None:
             # A user message resets auto-wake and carries results not yet sent.
             self._scheduler.user_message_sent()
-            pending = self._scheduler.take_pending()
-            if pending:
-                text = f"{text}\n\n{PENDING_INSTRUCTION}\n\n{_notification_texts(pending)}"
+            # The agent injects them before its first step, as the gateway does.
+            self.agent.add_background_events(self._scheduler.take_pending())
         self._on_event, self._muted = on_event, False
         result: dict = {}
 
@@ -539,7 +521,8 @@ class GatewayBackend:
         if self._view is None or event.get("conversation_id") not in (None, self._id):
             return
         if name == "background.notification":
-            self._notes.extend(data.get("notifications") or [])
+            # Notifications handled inside a running turn never start a wake.
+            self._notes.extend(n for n in data.get("notifications") or [] if not n.get("in_run"))
         elif name in ("subagent.status", "wake.paused"):
             self._view(name, data)
         elif name == "run.started" and _origin(data) == "wake":

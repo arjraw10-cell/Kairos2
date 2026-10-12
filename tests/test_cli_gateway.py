@@ -447,6 +447,7 @@ class FakeOfflineAgent:
         self.subagent_tool = SimpleNamespace()
         self.configured = []
         self.received = []
+        self.background = []
         self.stopped_subagents = 0
         self.interrupts = 0
         self._stop = threading.Event()
@@ -462,8 +463,11 @@ class FakeOfflineAgent:
         self.stopped_subagents += 1
         return 2
 
-    def list_subagents(self):
+    def subagent_statuses(self):
         return []
+
+    def add_background_events(self, events):
+        self.background.extend(events)
 
     def run(self, text, image_url=None):
         self.received.append(text)
@@ -715,7 +719,7 @@ class OfflineWakeTests(OfflineCase):
         self.assertEqual(self.names()[1:4], ["tool.started", "assistant.stream_started", "assistant.token"])
         self.assertEqual(self.events[-1], ("wake.ended", {"outcome": "completed", "payload": "done"}))
         message = self.agent.received[-1]
-        self.assertTrue(message.startswith(kmain.WAKE_INSTRUCTION))
+        self.assertEqual(message, kmain.format_notifications([SUBAGENT_DONE]))
         self.assertIn("sub-agent a3f2 result: 42", message)
         # /resume does not mistake the wake message for something the user typed.
         from kairos.resume import _is_synthetic_user_message
@@ -736,8 +740,8 @@ class OfflineWakeTests(OfflineCase):
         self.assertEqual(outcome, ("completed", "done"))
         self.assertEqual(idle_during_run, [False])
         self.assertEqual(self.scheduler.user_messages, 1)
-        self.assertTrue(self.agent.received[-1].startswith("hi\n\n" + kmain.PENDING_INSTRUCTION))
-        self.assertIn("terminal 2 printed READY", self.agent.received[-1])
+        self.assertEqual(self.agent.received[-1], "hi")
+        self.assertEqual(self.agent.background, [TERMINAL_HIT])  # injected by the agent, as in the gateway
         _wait_for(self.scheduler.is_idle)
 
         # A wake that fires while a user turn runs waits for it.
