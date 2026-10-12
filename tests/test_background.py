@@ -325,7 +325,7 @@ class TerminalBackgroundTests(unittest.TestCase):
         received = []
         manager.set_completion_callback(received.append)
         self.assertEqual(len(received), 1)
-        self.assertEqual(manager.drain_completed_background_commands(), [])
+        self.assertEqual(list(manager._completed_background_commands), [])
 
 
 if __name__ == "__main__":

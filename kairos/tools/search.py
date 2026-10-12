@@ -6,7 +6,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .base import ToolResult
+# ``regex`` (a dependency of tiktoken) can bound a single match with a
+# timeout; the standard ``re`` cannot, so a catastrophic pattern such as
+# ``(a+)+$`` would otherwise run far past the search deadline.
+import regex
+
+from .base import ToolResult, resolve_path
 
 
 class SearchTool:
@@ -19,6 +24,10 @@ class SearchTool:
     """
 
     DEFAULT_TIMEOUT = 10.0
+
+    def __init__(self, workspace: Optional[str] = None):
+        # Default search root, and the base for relative paths.
+        self.workspace = workspace
 
     # Directories to always skip
     SKIP_DIRS = {
@@ -77,11 +86,11 @@ class SearchTool:
         deadline = time.monotonic() + timeout
 
         try:
-            regex = re.compile(pattern, re.IGNORECASE)
-        except re.error as e:
+            compiled = regex.compile(pattern, regex.IGNORECASE)
+        except regex.error as e:
             return ToolResult(False, "", f"Invalid regex: {e}")
 
-        search_root = Path(path).resolve() if path else Path.cwd()
+        search_root = resolve_path(path or ".", self.workspace)
         if not search_root.exists():
             return ToolResult(False, "", f"Path not found: {path}")
         if not search_root.is_dir():
@@ -161,7 +170,20 @@ class SearchTool:
                                     timeout,
                                     max_results,
                                 )
-                            if regex.search(line):
+                            try:
+                                found = compiled.search(
+                                    line, timeout=max(deadline - time.monotonic(), 0.001)
+                                )
+                            except TimeoutError:
+                                return self._timeout_result(
+                                    pattern,
+                                    search_root,
+                                    files_searched,
+                                    matches,
+                                    timeout,
+                                    max_results,
+                                )
+                            if found:
                                 rel = fpath.relative_to(search_root)
                                 matches.append({
                                     "file": str(rel),

@@ -8,14 +8,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 
-# Direct callers historically used the source tree's chats/ directory.  The
-# workspace-aware CLI now stores sessions in ~/.kairos, while still reading
-# that old location as a compatibility fallback.
-LEGACY_CHATS_DIR = Path(os.path.dirname(os.path.dirname(__file__))).parent / "chats"
-# Backwards-compatible alias for code that imported the old constant.
-CHATS_DIR = LEGACY_CHATS_DIR
-
-
 class SessionManager:
     """Manage chat sessions isolated by their absolute workspace path.
 
@@ -139,11 +131,9 @@ class SessionManager:
             return {}
 
     def _repair_store(self, path: Path, sessions: Dict[str, Any], canonical: bool):
-        """Repair a recoverable file without changing legacy file format."""
+        """Rewrite a recovered canonical store; the legacy file is never modified."""
         if canonical:
             self._write_store(path, sessions)
-        else:
-            self._atomic_write(path, sessions)
 
     def _load_all(self) -> Dict[str, Any]:
         """Load this workspace's canonical sessions plus legacy fallbacks."""
@@ -232,6 +222,11 @@ class SessionManager:
         if not session_id:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             session_id = f"chat_{timestamp}"
+            # Two chats saved in the same second must not share an ID.
+            suffix = 2
+            while session_id in data:
+                session_id = f"chat_{timestamp}_{suffix}"
+                suffix += 1
 
         timestamp = data.get(session_id, {}).get(
             "timestamp", time.strftime("%Y-%m-%d %H:%M:%S")
