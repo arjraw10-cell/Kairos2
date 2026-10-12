@@ -1908,7 +1908,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 current = None
                 word_count = len(response.split()) if response else 0
                 if not tool_calls and word_count == 0:
-                    # Response is empty or too short (≤2 words) with no tool calls — retry
+                    # Empty response with no tool calls — retry
                     if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
                         self.conversation_history.pop()
                     if empty_retry_count < max_empty_retries:

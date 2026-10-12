@@ -40,10 +40,6 @@ class StreamingFakeAgent:
         self.conversation_history = [{"role": "system", "content": "system"}]
         self.browser_manager = SimpleNamespace(is_open=False)
         self.terminal_manager = SimpleNamespace(terminals={})
-        self.subagent_tool = SimpleNamespace(
-            _tool_printer=None, _stream_start=None, _stream_token=None,
-            _stream_end=None, _token_update=None,
-        )
         self._stop = threading.Event()
 
     def get_history(self):
@@ -65,8 +61,6 @@ class StreamingFakeAgent:
             self.on_stream_token(word + " ")
         self.on_stream_end(reply, False)
         self.on_token_update(_tokens())
-        if self.subagent_tool._token_update:
-            self.subagent_tool._token_update("sub1", _tokens(turn_output=7))
         self.conversation_history.append({"role": "assistant", "content": reply})
         return reply
 
@@ -170,7 +164,6 @@ class RenderingTests(unittest.TestCase):
             cli.handle_event("assistant.token", {"delta": word + " "})
         cli.handle_event("assistant.stream_ended", {"content": "Final **answer** here", "has_tool_calls": False})
         cli.handle_event("token.updated", {"session_input": 1200, "session_output": 5, "context_pct": 1.234, "turn_input": 1200, "turn_output": 5})
-        cli.handle_event("token.updated", {"session_input": 1, "session_output": 2, "context_pct": 0, "turn_input": 1, "turn_output": 2, "subagent_id": "sub1"})
         cli.handle_event("conversation.compacted", {"message": "Compacted [ok]"})
         cli.handle_event("run.queued", {})  # ignored
         text = out.getvalue()
@@ -178,7 +171,6 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("Final answer here", text)
         self.assertTrue(cli._skip_print_response)
         self.assertIn("Session: 1,200 in / 5 out  |  Context: 1.2%  |  Turn: 1,200 in / 5 out", text)
-        self.assertIn("Subagent sub1: Session: 1 in / 2 out", text)
         self.assertIn("Compacted [ok]", text)
 
     def test_tool_preamble_stays_as_grey_trace(self):

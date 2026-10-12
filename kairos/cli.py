@@ -773,18 +773,15 @@ class CLI:
             self.on_stream_token(data.get("delta") or "")
         elif event == "assistant.stream_ended":
             content = data.get("content") or ""
-            if data.get("subagent") or data.get("has_tool_calls") or not content.strip():
-                # Tool-call preamble (or a subagent's text) stays as the grey
-                # thinking trace; an empty panel is cleared.
+            if data.get("has_tool_calls") or not content.strip():
+                # Tool-call preamble stays as the grey thinking trace; an
+                # empty panel is cleared.
                 self.finish_stream()
             else:
                 self.finalize_stream_as_response()
         elif event == "tool.started":
             summary = escape(str(data.get("summary") or data.get("name") or ""))
-            if data.get("name") == "subagent":
-                self.console.print(f"  [dim]↓[/dim] [italic dim]subagent:[/italic dim] {summary}")
-            else:
-                self.print_tool_summary(summary)
+            self.print_tool_summary(summary)
         elif event == "token.updated":
             self.print_token_status(data)
         elif event == "conversation.compacted":
@@ -832,9 +829,6 @@ class CLI:
             f"  |  Context: {data.get('context_pct', 0):.1f}%"
             f"  |  Turn: {data.get('turn_input', 0):,} in / {data.get('turn_output', 0):,} out"
         )
-        if data.get("subagent_id"):
-            # A child agent's own counter, kept apart from the parent's.
-            status = f"Subagent {data['subagent_id']}: {status}"
         self.console.print(Text(status, style="dim"))
 
     # ------------------------------------------------------------------ #

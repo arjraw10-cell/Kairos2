@@ -698,7 +698,8 @@ class GatewayManager:
                 with runtime.state_lock:
                     history = copy.deepcopy(runtime.agent.get_history())
                 self.repository.replace_messages(runtime.conversation_id, history, run.id)
-                final_status = "interrupted" if response == "[Interrupted]" else "completed"
+                # A stop requested before the run started returns "[Stopped — ...]".
+                final_status = "interrupted" if response == "[Interrupted]" or (response or "").startswith("[Stopped") else "completed"
                 self.repository.update_run(run.id, final_status, expected_status="running")
                 current = self.repository.get_conversation(runtime.conversation_id)
                 if current and current.active_run_id == run.id:
