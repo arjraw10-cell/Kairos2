@@ -15,9 +15,9 @@ class TokenCounter:
     tokens are supplied by :class:`kairos.agent.Agent` as ``extra_tokens``.
     """
 
-    DEFAULT_CONTEXT_WINDOW = 262_000
+    DEFAULT_CONTEXT_WINDOW = 300_000
 
-    def __init__(self, model: str = "gpt-4o", context_window: int | None = None):
+    def __init__(self, model: str = "gpt-4o", context_window: int | None = None, pricing: dict | None = None):
         # Try to get the encoding for the model; fall back to cl100k_base.
         try:
             self._enc = tiktoken.encoding_for_model(model)
@@ -34,6 +34,11 @@ class TokenCounter:
         # Per-turn counters (reset each turn)
         self.turn_input = 0
         self.turn_output = 0
+        self.turn_cached = 0  # part of turn_input served from the provider's prompt cache
+
+        # USD per 1M tokens: {"input", "cached_input", "output"}; None = unknown (no cost shown)
+        self.pricing = pricing
+        self.session_cost = 0.0
 
         # The configured budget is intentionally conservative for compatible
         # gateways whose advertised model context may be larger than the
@@ -177,21 +182,31 @@ class TokenCounter:
         self.turn_input = self.count_history(messages) + max(0, int(extra_tokens))
         self.context_tokens = self.turn_input
         self.turn_output = 0
+        self.turn_cached = 0
 
     def add_output_tokens(self, text: str):
         """Accumulate output tokens during streaming (tiktoken estimate)."""
         self.turn_output += len(self._enc.encode(text or ""))
 
-    def set_turn_from_api(self, prompt_tokens: int, completion_tokens: int):
+    def set_turn_from_api(self, prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0):
         """Override turn counters with ground-truth API usage when available."""
         self.turn_input = max(0, int(prompt_tokens or 0))
         self.context_tokens = self.turn_input
         self.turn_output = max(0, int(completion_tokens or 0))
+        self.turn_cached = min(self.turn_input, max(0, int(cached_tokens or 0)))
 
     def finish_turn(self):
-        """Called when a turn completes — update session totals."""
+        """Called when a turn (one API call) completes — update session totals and cost."""
         self.session_input += self.turn_input
         self.session_output += self.turn_output
+        if self.pricing:
+            uncached = self.turn_input - self.turn_cached
+            cached_rate = self.pricing.get("cached_input", self.pricing.get("input", 0))
+            self.session_cost += (
+                uncached * self.pricing.get("input", 0)
+                + self.turn_cached * cached_rate
+                + self.turn_output * self.pricing.get("output", 0)
+            ) / 1_000_000
 
     @property
     def context_pct(self) -> float:
@@ -200,21 +215,52 @@ class TokenCounter:
             return 0.0
         return (self.context_tokens / self.context_window) * 100
 
+    def status_data(self) -> dict:
+        """Payload of ``token.updated`` events (gateway and offline CLI)."""
+        return {
+            "context_pct": round(self.context_pct, 2),
+            "context_tokens": self.context_tokens,
+            "context_window": self.context_window,
+            "turn_input": self.turn_input,
+            "turn_output": self.turn_output,
+            "session_input": self.session_input,
+            "session_output": self.session_output,
+            "session_cost": round(self.session_cost, 6) if self.pricing else None,
+        }
+
     def format_status(self) -> str:
         """Format a status line showing all token info."""
-        si = f"{self.session_input:,}"
-        so = f"{self.session_output:,}"
-        ctx = f"{self.context_pct:.1f}%"
-        ti = f"{self.turn_input:,}"
-        to = f"{self.turn_output:,}"
-        return (
-            f"Session: {si} in / {so} out"
-            f"  |  Context: {ctx}"
-            f"  |  Turn: {ti} in / {to} out"
-        )
+        return format_status_line(self.status_data())
 
     def format_turn_summary(self) -> str:
         """One-liner after a turn completes."""
         ti = f"{self.turn_input:,}"
         to = f"{self.turn_output:,}"
         return f"Tokens this turn: {ti} in / {to} out"
+
+
+def status_payload(counter) -> dict:
+    """``token.updated`` payload for a TokenCounter, or for a minimal stand-in
+    (test agents) that only carries the basic counters."""
+    if hasattr(counter, "status_data"):
+        return counter.status_data()
+    return {name: getattr(counter, name, 0)
+            for name in ("session_input", "session_output", "context_pct", "turn_input", "turn_output")}
+
+
+def format_status_line(data: dict) -> str:
+    """Context % · tokens in context / window · this call's output · session in/out · cost."""
+    window = data.get("context_window")
+    context = f"{data.get('context_tokens', 0):,} / {window:,} tokens" if window else f"{data.get('context_tokens', 0):,} tokens"
+    cost = data.get("session_cost")
+    if cost is None:
+        money = "cost n/a"
+    else:
+        money = f"${cost:.4f}" if cost < 1 else f"${cost:.2f}"
+    return (
+        f"Context {data.get('context_pct', 0):.1f}%"
+        f" · {context}"
+        f" · this call: {data.get('turn_output', 0):,} out"
+        f" · session: {data.get('session_input', 0):,} in / {data.get('session_output', 0):,} out"
+        f" · {money}"
+    )

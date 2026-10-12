@@ -186,7 +186,7 @@ class CompletionsTests(unittest.TestCase):
         self.assertEqual(list(CompletionsAdapter.events(chunks)), [
             ("text", "Hel"), ("text", "lo"),
             ("tool_call", 0, "call_1", "read", '{"pa'), ("tool_call", 0, "", "", 'th": "a"}'),
-            ("usage", 10, 5),
+            ("usage", 10, 5, 0),
         ])
 
     def test_rate_limited_key_rotates(self):
@@ -249,7 +249,7 @@ class ResponsesTests(unittest.TestCase):
             ("text", "Hi"),
             ("tool_call", 2, "call_9", "read", ""), ("tool_call", 2, "", "", '{"path":'), ("tool_call", 2, "", "", '"b"}'),
             ("tool_call", 3, "call_10", "write", ""), ("tool_call", 3, "", "", "{}"),
-            ("usage", 20, 7),
+            ("usage", 20, 7, 0),
         ])
 
     def test_failed_response_raises(self):
@@ -324,7 +324,7 @@ class AnthropicTests(unittest.TestCase):
             ("tool_call", 2, "toolu_1", "read", ""),
             ("tool_call", 2, "", "", "{\"path\": "),
             ("tool_call", 2, "", "", "\"a.txt\"}"),
-            ("usage", 100, 42),
+            ("usage", 100, 42, 70),
             ("message_extra", "_thinking", [{"type": "thinking", "thinking": "Need the file.", "signature": "EqQB"}]),
         ])
 
@@ -387,7 +387,7 @@ class AgentTests(unittest.TestCase):
             {"id": "call_a", "name": "read", "arguments": {"path": "a"}},
             {"id": "call_b", "name": "write", "arguments": {"path": "x", "content": "y"}},
         ])
-        self.assertEqual(usage, {"prompt_tokens": 11, "completion_tokens": 3})
+        self.assertEqual(usage, {"prompt_tokens": 11, "completion_tokens": 3, "cached_tokens": 0})
         self.assertEqual(agent._stream_extras, {"_thinking": ["block"]})
         self.assertEqual(agent.adapter.calls[0][1:], (TOOLS, "high"))
 
@@ -409,3 +409,38 @@ class AgentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContextAndCostTests(unittest.TestCase):
+    def test_context_window_is_capped_at_300k_or_the_model_max(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["setups"]["luna"]["max_context"] = 1_050_000
+        with provider_config(config):
+            self.assertEqual(providers.resolve("luna").context_window, 300_000)
+            self.assertEqual(providers.resolve("luna-chat").context_window, 100_000)  # older "context_window" key
+            self.assertEqual(providers.resolve(model="x", provider="openai").context_window, 300_000)
+
+    def test_session_cost_uses_cached_rate(self):
+        from kairos.tokens import TokenCounter, format_status_line
+
+        counter = TokenCounter("model", 300_000, {"input": 2.0, "cached_input": 0.1, "output": 10.0})
+        counter.set_turn_from_api(100_000, 1_000, 40_000)
+        counter.finish_turn()
+        data = counter.status_data()
+        self.assertAlmostEqual(data["session_cost"], (60_000 * 2.0 + 40_000 * 0.1 + 1_000 * 10.0) / 1e6)
+        self.assertEqual((data["context_tokens"], data["context_window"], data["turn_output"]), (100_000, 300_000, 1_000))
+        self.assertEqual(format_status_line(data),
+                         "Context 33.3% · 100,000 / 300,000 tokens · this call: 1,000 out · session: 100,000 in / 1,000 out · $0.1340")
+        no_price = TokenCounter("model", 300_000)
+        no_price.set_turn_from_api(10, 2)
+        no_price.finish_turn()
+        self.assertIsNone(no_price.status_data()["session_cost"])
+        self.assertTrue(format_status_line(no_price.status_data()).endswith("cost n/a"))
+
+    def test_cached_tokens_are_reported_by_each_format(self):
+        completions = list(CompletionsAdapter.events([chunk(choices=False, usage=NS(
+            prompt_tokens=10, completion_tokens=5, prompt_tokens_details=NS(cached_tokens=4)))]))
+        self.assertEqual(completions, [("usage", 10, 5, 4)])
+        responses = list(ResponsesAdapter.events([NS(type="response.completed", response=NS(usage=NS(
+            input_tokens=20, output_tokens=7, input_tokens_details=NS(cached_tokens=12))))]))
+        self.assertEqual(responses, [("usage", 20, 7, 12)])

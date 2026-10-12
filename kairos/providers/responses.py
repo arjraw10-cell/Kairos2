@@ -133,7 +133,9 @@ class ResponsesAdapter:
             elif etype in ("response.completed", "response.incomplete"):
                 usage = getattr(event.response, "usage", None)
                 if usage:
-                    yield ("usage", usage.input_tokens or 0, usage.output_tokens or 0)
+                    details = getattr(usage, "input_tokens_details", None)
+                    cached = getattr(details, "cached_tokens", 0) or 0
+                    yield ("usage", usage.input_tokens or 0, usage.output_tokens or 0, cached)
             elif etype == "response.failed":
                 error = getattr(event.response, "error", None)
                 raise ProviderError(f"Response failed: {getattr(error, 'message', None) or error}")

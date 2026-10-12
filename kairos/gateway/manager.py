@@ -21,6 +21,7 @@ from .. import providers
 from ..agent import Agent
 from ..config import Config
 from ..wake import WakeScheduler, format_notifications
+from ..tokens import status_payload
 from ..workspaces import new_workspace
 from .history import sanitize_for_resume
 from .models import Conversation, Run
@@ -670,7 +671,7 @@ class GatewayManager:
                         log.debug("Direct event observer failed", exc_info=True)
 
             def token_data(tokens: Any) -> dict[str, Any]:
-                return {"session_input": tokens.session_input, "session_output": tokens.session_output, "context_pct": round(tokens.context_pct, 2), "turn_input": tokens.turn_input, "turn_output": tokens.turn_output}
+                return status_payload(tokens)
 
             def configure_callbacks() -> None:
                 agent = runtime.agent

@@ -64,7 +64,7 @@ Copy `provider.example.json` to `provider.json` in the repository root and fill 
 ```
 
 - **`providers`**: `format` is `responses` (OpenAI Responses API), `completions` (Chat Completions: OpenAI, OpenRouter, compatible servers) or `anthropic` (Messages API). `api_keys` is a list; extra keys are used when one is rate-limited or out of quota.
-- **`setups`**: named model choices with `provider`, `model`, `reasoning_efforts` and `default_effort`. A setup may override `format`, `base_url` or `api_keys`, and may set `context_window`.
+- **`setups`**: named model choices with `provider`, `model`, `reasoning_efforts` and `default_effort`, plus `max_context` (the model's real context limit) and `pricing` (`input`, `cached_input`, `output`, USD per 1M tokens) for the status line's cost. A setup may override `format`, `base_url` or `api_keys`.
 - **`default_setup`**: the setup new conversations start with.
 - **`tavily_api_key`**: for `web_search` (optional).
 
@@ -83,7 +83,7 @@ The Anthropic format is implemented and unit-tested but has not yet been used ag
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `KAIROS_CONTEXT_WINDOW` | 262000 | Prompt budget for token display and auto-compaction (a setup's `context_window` overrides it) |
+| `KAIROS_CONTEXT_WINDOW` | 300000 | Context cap; each model uses min(cap, its `max_context`) and auto-compacts at 80% of that |
 | `KAIROS_MAX_TOOL_RESULT_CHARS` | 20000 | Text cap per tool result |
 | `KAIROS_GATEWAY_HOST` / `KAIROS_GATEWAY_PORT` | 127.0.0.1 / 8765 | Gateway address (CLI and gateway) |
 | `KAIROS_AUTH_TOKEN` | none | Bearer token required by the gateway and sent by the CLI |
@@ -107,6 +107,12 @@ kairos_offline .        # same, with the agent running inside the CLI (no gatewa
 `kairos.bat` keeps your current folder, checks the gateway's `/healthz`, starts `python -m kairos.gateway_main` in a minimized "Kairos Gateway" window if it is not running, and then opens the CLI. `kairos_offline.bat` runs `main.py --offline`. Without the launchers: `python main.py [path] [--offline]`, and start the gateway yourself with `python -m kairos.gateway_main`.
 
 Without a path, each conversation gets a new folder such as `Documents/kairos_workspace/2026-10-11_143005`. With a path, `/reset` starts a new conversation in the same folder; without one, in a new folder.
+
+After each model call the CLI prints a status line: share of the context window used, tokens in context / the window, that call's output tokens, the session's input and output tokens, and the session cost (from the setup's `pricing`):
+
+```
+Context 12.0% · 36,120 / 300,000 tokens · this call: 812 out · session: 120,433 in / 8,210 out · $0.4213
+```
 
 ### Commands and keys
 
@@ -196,7 +202,7 @@ Skills are stored in `skills/<skill-name>/SKILL.md`. Only skill names are inject
 
 ### Browser Tools
 
-The browser is a headed, humanized CloakBrowser that launches automatically on the first browser tool call. Snapshots are Playwright's AI accessibility snapshots: elements carry refs like `[ref=e12]` (`f1e12` inside iframes and after the page navigates), and tools take those refs. Every action returns the resulting page state: only the changed snapshot lines while the URL stays the same, the full snapshot after navigation, and a fresh full snapshot with any error.
+The browser is a headed, humanized CloakBrowser that launches automatically on the first browser tool call. It passes bot detection (Cloudflare, reCAPTCHA, fingerprinting checks), and the system prompt tells the agent so. Snapshots are Playwright's AI accessibility snapshots: elements carry refs like `[ref=e12]` (`f1e12` inside iframes and after the page navigates), and tools take those refs. Every action returns the resulting page state: only the changed snapshot lines while the URL stays the same, the full snapshot after navigation, and a fresh full snapshot with any error.
 
 | Tool | Description |
 |------|-------------|
@@ -293,7 +299,7 @@ Replies stream into a grey panel that shows the latest lines; the final reply be
 
 ### Compaction
 
-When the conversation context exceeds 80% of the context budget, older messages are summarized into a structured checkpoint (Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context, and chronological User Messages and Agent-to-User Messages) and replaced, keeping the most recent 20% of the budget. The check runs before every API step, including inside long tool-call loops. `/compact` triggers it manually.
+When the conversation context exceeds 80% of the context window (min(300k, the model's `max_context`)), older messages are summarized into a structured checkpoint (Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context, and chronological User Messages and Agent-to-User Messages) and replaced, keeping the most recent 20% of the budget. The check runs before every API step, including inside long tool-call loops. `/compact` triggers it manually.
 
 ### Skills
 

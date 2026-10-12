@@ -824,12 +824,9 @@ class CLI:
 
     def print_token_status(self, data: dict):
         """Print a ``token.updated`` payload (same layout as TokenCounter)."""
-        status = (
-            f"Session: {data.get('session_input', 0):,} in / {data.get('session_output', 0):,} out"
-            f"  |  Context: {data.get('context_pct', 0):.1f}%"
-            f"  |  Turn: {data.get('turn_input', 0):,} in / {data.get('turn_output', 0):,} out"
-        )
-        self.console.print(Text(status, style="dim"))
+        from kairos.tokens import format_status_line
+
+        self.console.print(Text(format_status_line(data), style="dim"))
 
     # ------------------------------------------------------------------ #
     #  Final response (green panel)                                        #

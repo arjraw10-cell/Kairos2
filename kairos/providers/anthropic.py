@@ -161,7 +161,7 @@ class AnthropicAdapter:
 
     @staticmethod
     def events(payloads):
-        prompt_tokens = completion_tokens = 0
+        prompt_tokens = completion_tokens = cached_tokens = 0
         thinking: dict[int, dict] = {}
         tool_indexes: set[int] = set()
         for event in payloads:
@@ -174,6 +174,7 @@ class AnthropicAdapter:
                     + (usage.get("cache_read_input_tokens") or 0)
                 )
                 completion_tokens = usage.get("output_tokens", 0)
+                cached_tokens = usage.get("cache_read_input_tokens") or 0
             elif etype == "content_block_start":
                 index, block = event["index"], event["content_block"]
                 if block["type"] == "tool_use":
@@ -197,7 +198,7 @@ class AnthropicAdapter:
             elif etype == "message_delta":
                 completion_tokens = (event.get("usage") or {}).get("output_tokens", completion_tokens)
             elif etype == "message_stop":
-                yield ("usage", prompt_tokens, completion_tokens)
+                yield ("usage", prompt_tokens, completion_tokens, cached_tokens)
                 if thinking:
                     # Thinking blocks must be echoed back unchanged (with
                     # signatures) on the next request of a tool-use loop.

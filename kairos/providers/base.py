@@ -6,7 +6,8 @@ and normalize the streamed reply into these events:
 * ``("text", delta)``
 * ``("tool_call", index, call_id, name, arguments_delta)`` - id/name may be
   empty on continuation deltas; arguments accumulate per index
-* ``("usage", prompt_tokens, completion_tokens)``
+* ``("usage", prompt_tokens, completion_tokens, cached_tokens)`` - cached_tokens
+  is the part of prompt_tokens served from the provider's prompt cache
 * ``("message_extra", key, value)`` - provider state to keep on the assistant
   message (private ``_`` keys, e.g. Anthropic thinking blocks)
 """

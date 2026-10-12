@@ -188,13 +188,9 @@ class OfflineBackend:
         emit = self._emit
 
         def tokens(counter) -> dict:
-            return {
-                "session_input": counter.session_input,
-                "session_output": counter.session_output,
-                "context_pct": counter.context_pct,
-                "turn_input": counter.turn_input,
-                "turn_output": counter.turn_output,
-            }
+            from kairos.tokens import status_payload
+
+            return status_payload(counter)
 
         # Same event names and payloads as the gateway manager emits.
         agent.on_stream_start = lambda: emit("assistant.stream_started", {})

@@ -103,7 +103,7 @@ Lazy exports through a module `__getattr__`, so the CLI in gateway mode does not
 | Method | Returns | Default |
 |--------|---------|---------|
 | `MAX_TOOL_RESULT_CHARS()` | `int` | 20,000 (`KAIROS_MAX_TOOL_RESULT_CHARS`; invalid or < 1 falls back) |
-| `CONTEXT_WINDOW()` | `int` | 262,000 (`KAIROS_CONTEXT_WINDOW`; invalid or < 1 falls back) |
+| `CONTEXT_WINDOW()` | `int` | 300,000 (`KAIROS_CONTEXT_WINDOW`; invalid or < 1 falls back) |
 | `KAIROS_GATEWAY_HOST()` | `str` | `127.0.0.1` |
 | `KAIROS_GATEWAY_PORT()` | `int` | 8765 (raises `ValueError` if not an integer in 1-65535) |
 | `KAIROS_DEFAULT_WORKSPACE()` | `str \| None` | None; only the target workspace of the legacy-chat import |
@@ -116,7 +116,7 @@ Lazy exports through a module `__getattr__`, so the CLI in gateway mode does not
 | `validate()` | `bool` | Calls `providers.resolve()`; raises `ValueError` (`ProviderConfigError`) if `provider.json` is missing or its default setup is invalid |
 | `reload()` | `None` | Clears all caches |
 
-`CONTEXT_WINDOW()` is the conservative prompt budget used by `TokenCounter`, keep-recent compaction and compaction-prompt budgeting. A setup's `context_window` in `provider.json` overrides it for that model.
+`CONTEXT_WINDOW()` is the context cap (default 300,000). Each model's effective window is `min(cap, max_context)`, where `max_context` is the model's real limit from `provider.json` (the older key `context_window` is read the same way). `TokenCounter`, keep-recent compaction and compaction-prompt budgeting use that window; auto-compaction runs at 80% of it.
 
 ### `kairos/providers/` — Model Providers
 
@@ -146,7 +146,7 @@ Each adapter has `stream(messages, tools, effort) -> EventStream`; `EventStream.
 }
 ```
 
-A setup names a `provider` and `model` plus `reasoning_efforts` and `default_effort`; it may override the provider's `format`, `base_url` and `api_keys` and add `context_window`. `resolve(setup=None, *, model=None, provider=None)` returns a frozen `ModelSpec` (setup, provider, model, format, base_url, api_keys (not in repr), reasoning_efforts, default_effort, context_window) for a named setup, the default setup, or an ad-hoc `model` on a named `provider` (ad-hoc specs have `reasoning_efforts=None`, so any effort passes unvalidated). `list_setups()`, `default_setup()`, `validate_effort(spec, effort)` and `load_config()` complete the module; errors raise `ProviderConfigError` (a `ValueError`).
+A setup names a `provider` and `model` plus `reasoning_efforts` and `default_effort`; it may override the provider's `format`, `base_url` and `api_keys`, and adds `max_context` (the model's real context limit) and `pricing` (`input`, `cached_input`, `output` in USD per 1M tokens). `resolve(setup=None, *, model=None, provider=None)` returns a frozen `ModelSpec` (setup, provider, model, format, base_url, api_keys (not in repr), reasoning_efforts, default_effort, context_window (= min(cap, max_context)), pricing) for a named setup, the default setup, or an ad-hoc `model` on a named `provider` (ad-hoc specs have `reasoning_efforts=None`, so any effort passes unvalidated). `list_setups()`, `default_setup()`, `validate_effort(spec, effort)` and `load_config()` complete the module; errors raise `ProviderConfigError` (a `ValueError`).
 
 Setups in `provider.example.json` and their verified efforts:
 
@@ -200,7 +200,7 @@ Synchronous WebSocket client built on `websockets.sync.client`. `gateway_url()` 
 
 **`KairosMarkdown`** (subclass of `rich.markdown.Markdown`) swaps in `_EnhancedTableElement` for `table_open`: `box.ROUNDED`, cyan borders, `header_style="bold bright_white on grey15"`, alternating `dim` rows. Other elements use Rich's defaults.
 
-**Output**: `print_banner(workspace, mode)` prints one line (`KAIROS  <mode>  <workspace>`). Info lines are dim; error text is printed as `Text` (not markup), in a red panel when multi-line. Tool calls print `→ <summary>`; `print_token_status(data)` prints `Session: X in / Y out | Context: Z% | Turn: A in / B out`.
+**Output**: `print_banner(workspace, mode)` prints one line (`KAIROS  <mode>  <workspace>`). Info lines are dim; error text is printed as `Text` (not markup), in a red panel when multi-line. Tool calls print `→ <summary>`; `print_token_status(data)` prints `kairos.tokens.format_status_line(data)`: `Context Z% · N / W tokens · this call: O out · session: I in / O out · $cost` (`cost n/a` when the setup has no pricing).
 
 **Streaming**: `start_stream()` opens a Rich `Live` with a `_StreamView`, which renders the grey panel from the CLI's text at render time and, while streaming, shows only the bottom lines that fit the terminal (long replies keep scrolling; text wraps at word boundaries). `finish_stream()` leaves the grey trace (tool-call preamble); `finalize_stream_as_response()` turns the panel into a green `KairosMarkdown` panel. `finish_turn(outcome, payload)` prints the response, an error, or "Interrupted."
 
@@ -246,7 +246,7 @@ Synchronous WebSocket client built on `websockets.sync.client`. `gateway_url()` 
 
 **Constructor**: `Agent(workspace: str, setup: Optional[str] = None)`
 - Resolves `setup` (the default setup when None) to `self.spec`, creates `self.adapter`, sets `self.model` and `self.effort = spec.default_effort`
-- `self.tokens = TokenCounter(model, spec.context_window)`; `self.cwd = Path(workspace).resolve()`
+- `self.tokens = TokenCounter(model, spec.context_window, spec.pricing)` (`set_model` updates both); `self.cwd = Path(workspace).resolve()`
 - Creates the tool instances, `SubAgentTool`, `BrowserManager` and the 19 `BrowserTool`s plus `BrowserScreenshotTool`, `DesktopManager` and the desktop tools, and `SkillManager(<workspace>/skills)`
 - Sets itself as the terminal manager's completion callback and builds the system prompt
 
@@ -346,19 +346,21 @@ Clears stop state, rebuilds the system prompt and history, creates a new `TokenC
 
 ### `kairos/tokens.py` — TokenCounter
 
-**Constructor**: `TokenCounter(model="gpt-4o", context_window=None)` — tiktoken encoding for the model (falls back to `cl100k_base`); `context_window` defaults to `Config.CONTEXT_WINDOW()`.
+**Constructor**: `TokenCounter(model="gpt-4o", context_window=None, pricing=None)` — tiktoken encoding for the model (falls back to `cl100k_base`); `context_window` defaults to `Config.CONTEXT_WINDOW()`; `pricing` is USD per 1M tokens (`input`, `cached_input`, `output`) or `None`.
 
-**Attributes**: `session_input` / `session_output` (cumulative), `context_tokens`, `turn_input` / `turn_output`, `context_window`.
+**Attributes**: `session_input` / `session_output` (cumulative), `context_tokens`, `turn_input` / `turn_output` / `turn_cached` (one API call), `context_window`, `pricing`, `session_cost`.
 
 **Methods**:
 - `start_turn(messages, extra_tokens=0)` — counts history plus optional tool-schema tokens
 - `count_request(messages, tools?)` — message fields, assistant tool-call metadata/arguments, tool IDs/names, function-tool definitions
 - `count_tools(tools)`, `count_message(message)`
 - `add_output_tokens(text)` — tiktoken estimate
-- `set_turn_from_api(prompt_tokens, completion_tokens)` — replaces estimates with provider-reported usage
+- `set_turn_from_api(prompt_tokens, completion_tokens, cached_tokens=0)` — replaces estimates with provider-reported usage; every adapter reports cached prompt tokens (`("usage", prompt, completion, cached)`)
+- `finish_turn()` also adds the call's cost: uncached input × `input` + cached × `cached_input` + output × `output`
 - `finish_turn()` — adds turn totals to session totals
 - `context_pct` — `(context_tokens / context_window) * 100`
-- `format_status()` — `"Session: X in / Y out  |  Context: Z%  |  Turn: A in / B out"`
+- `status_data()` — the `token.updated` payload (`context_pct`, `context_tokens`, `context_window`, `turn_input`, `turn_output`, `session_input`, `session_output`, `session_cost` or `None`); `kairos.tokens.status_payload(counter)` also accepts minimal test stand-ins
+- `format_status()` — `format_status_line(status_data())`
 
 Images in vision content are estimated at 85 (low detail) or 765 (high detail) tokens, never from base64 length.
 

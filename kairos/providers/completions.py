@@ -52,7 +52,9 @@ class CompletionsAdapter:
     def events(chunks):
         for chunk in chunks:
             if getattr(chunk, "usage", None):
-                yield ("usage", chunk.usage.prompt_tokens or 0, chunk.usage.completion_tokens or 0)
+                details = getattr(chunk.usage, "prompt_tokens_details", None)
+                cached = getattr(details, "cached_tokens", 0) or 0
+                yield ("usage", chunk.usage.prompt_tokens or 0, chunk.usage.completion_tokens or 0, cached)
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta

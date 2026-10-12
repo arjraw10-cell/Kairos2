@@ -163,14 +163,15 @@ class RenderingTests(unittest.TestCase):
         for word in "Final **answer** here".split(" "):
             cli.handle_event("assistant.token", {"delta": word + " "})
         cli.handle_event("assistant.stream_ended", {"content": "Final **answer** here", "has_tool_calls": False})
-        cli.handle_event("token.updated", {"session_input": 1200, "session_output": 5, "context_pct": 1.234, "turn_input": 1200, "turn_output": 5})
+        cli.handle_event("token.updated", {"session_input": 1200, "session_output": 5, "context_pct": 1.234, "turn_input": 1200, "turn_output": 5,
+                                             "context_tokens": 3702, "context_window": 300000, "session_cost": 0.0123})
         cli.handle_event("conversation.compacted", {"message": "Compacted [ok]"})
         cli.handle_event("run.queued", {})  # ignored
         text = out.getvalue()
         self.assertIn("read [/bold] C:/x", text)  # markup-like text printed literally
         self.assertIn("Final answer here", text)
         self.assertTrue(cli._skip_print_response)
-        self.assertIn("Session: 1,200 in / 5 out  |  Context: 1.2%  |  Turn: 1,200 in / 5 out", text)
+        self.assertIn("Context 1.2% · 3,702 / 300,000 tokens · this call: 5 out · session: 1,200 in / 5 out · $0.0123", text)
         self.assertIn("Compacted [ok]", text)
 
     def test_tool_preamble_stays_as_grey_trace(self):

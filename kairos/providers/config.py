@@ -50,7 +50,10 @@ class ModelSpec:
     # None means unknown (ad-hoc model): any effort is passed through unvalidated.
     reasoning_efforts: Optional[tuple] = None
     default_effort: Optional[str] = None
+    # Effective budget: min(Config.CONTEXT_WINDOW() cap, the model's max_context).
     context_window: Optional[int] = None
+    # USD per 1M tokens {"input", "cached_input", "output"}; None = unknown.
+    pricing: Optional[dict] = field(default=None, compare=False)
 
     def info(self, effort: Optional[str]) -> dict[str, Any]:
         return {
@@ -74,7 +77,13 @@ def _build_spec(name: Optional[str], provider_name: str, model: str, overrides: 
     if fmt not in FORMATS:
         raise ProviderConfigError(f"Provider '{provider_name}' has invalid format {fmt!r}; expected one of {FORMATS}.")
     efforts = merged.get("reasoning_efforts")
-    context_window = merged.get("context_window")
+    from ..config import Config  # local import: kairos.config validates provider.json
+
+    cap = Config.CONTEXT_WINDOW()
+    # max_context is the model's real limit ("context_window" is the older name).
+    max_context = merged.get("max_context") or merged.get("context_window")
+    context_window = min(cap, int(max_context)) if max_context else cap
+    pricing = merged.get("pricing")
     return ModelSpec(
         setup=name,
         provider=provider_name,
@@ -84,7 +93,8 @@ def _build_spec(name: Optional[str], provider_name: str, model: str, overrides: 
         api_keys=tuple(merged.get("api_keys") or ()),
         reasoning_efforts=tuple(efforts) if efforts is not None else None,
         default_effort=merged.get("default_effort"),
-        context_window=int(context_window) if context_window else None,
+        context_window=context_window,
+        pricing=dict(pricing) if pricing else None,
     )
 
 

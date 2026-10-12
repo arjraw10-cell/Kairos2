@@ -69,7 +69,7 @@ class Agent:
         self._background_events: deque = deque()
 
         # Token counter
-        self.tokens = TokenCounter(self.model, self.spec.context_window)
+        self.tokens = TokenCounter(self.model, self.spec.context_window, self.spec.pricing)
 
         # Working directory (used by git and search defaults)
         self.cwd = Path(workspace).resolve()
@@ -270,6 +270,7 @@ class Agent:
             "Use `web_search` for quick facts and current events. Use the browser for pages that need interaction, or when web_search is unavailable.\n\n"
             "## Browser Tools\n"
             "The browser is a headed, humanized CloakBrowser. It launches automatically on the first browser tool call.\n"
+            "It passes bot detection (Cloudflare, reCAPTCHA, fingerprinting checks): its Chromium is patched at the source and every click, keystroke and scroll is humanized. Use it on sites that block scripts or plain HTTP fetches instead of giving up.\n"
             "1. `browser_navigate` opens a URL (or back / forward / reload) and returns an accessibility snapshot.\n"
             "2. Elements in the snapshot carry refs like [ref=e12]; refs inside iframes or after the page navigates look like f1e12. Pass them as `ref` to click/type/select/hover/drag. Always use refs from the latest snapshot.\n"
             "3. Every action returns the resulting page state: on the same page only the changed snapshot lines, after navigation the full snapshot. Call `browser_snapshot` only to see the whole page again.\n"
@@ -1704,7 +1705,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                             tool_calls[idx]["name"] = name
                         tool_calls[idx]["arguments"] += arguments
                     elif kind == "usage":
-                        api_usage = {"prompt_tokens": event[1], "completion_tokens": event[2]}
+                        api_usage = {"prompt_tokens": event[1], "completion_tokens": event[2],
+                                     "cached_tokens": event[3] if len(event) > 3 else 0}
                     elif kind == "message_extra":
                         extras[event[1]] = event[2]
 
@@ -1793,7 +1795,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         )
         content, assembled_tool_calls, api_usage = self._stream_response()
         if api_usage:
-            self.tokens.set_turn_from_api(api_usage["prompt_tokens"], api_usage["completion_tokens"])
+            self.tokens.set_turn_from_api(api_usage["prompt_tokens"], api_usage["completion_tokens"],
+                                          api_usage.get("cached_tokens", 0))
         else:
             self.tokens.add_output_tokens(content)
         assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content or None}
@@ -1945,7 +1948,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         self._stop_requested = False
         self._interrupted_pending = False
         self._setup_system_prompt()
-        self.tokens = TokenCounter(self.model, self.spec.context_window)
+        self.tokens = TokenCounter(self.model, self.spec.context_window, self.spec.pricing)
         if self.browser_manager.is_open:
             try:
                 self.browser_manager.close()
@@ -1970,6 +1973,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         self.model = spec.model
         self.effort = effort
         self.tokens.context_window = spec.context_window or Config.CONTEXT_WINDOW()
+        self.tokens.pricing = spec.pricing
 
     def set_model(self, setup: Optional[str] = None, model: Optional[str] = None, provider: Optional[str] = None) -> str:
         """Switch to a provider.json setup (the default setup when all are
