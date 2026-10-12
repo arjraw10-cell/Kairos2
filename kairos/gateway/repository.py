@@ -15,7 +15,7 @@ from .models import Conversation, Run, StoredMessage, new_id, utc_now
 class GatewayRepository:
     """Thread-safe repository using one short-lived SQLite connection per call."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, data_dir: str | os.PathLike[str] | None = None):
         if data_dir is None:
@@ -114,6 +114,9 @@ class GatewayRepository:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)")}
             if "active_run_id" not in columns:
                 conn.execute("ALTER TABLE conversations ADD COLUMN active_run_id TEXT")
+            if "model_settings" not in columns:
+                # JSON {setup, model, provider, effort}; NULL = default setup.
+                conn.execute("ALTER TABLE conversations ADD COLUMN model_settings TEXT")
             run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
             for name, definition in (
                 ("request_content", "TEXT"),
@@ -221,6 +224,21 @@ class GatewayRepository:
         with closing(self._connect()) as conn:
             conn.execute(f"UPDATE conversations SET {assignments} WHERE id = ?", values)
         return self.get_conversation(conversation_id)
+
+    def get_model_settings(self, conversation_id: str) -> dict[str, Any]:
+        """Per-conversation model choice; empty when it uses the default setup."""
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT model_settings FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        if not row:
+            raise KeyError(f"Conversation not found: {conversation_id}")
+        return json.loads(row["model_settings"]) if row["model_settings"] else {}
+
+    def set_model_settings(self, conversation_id: str, settings: dict[str, Any]) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE conversations SET model_settings = ? WHERE id = ?",
+                (json.dumps(settings), conversation_id),
+            )
 
     def delete_conversation(self, conversation_id: str) -> bool:
         # Explicit child cleanup keeps deletion compatible with databases

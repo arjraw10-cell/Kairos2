@@ -1,11 +1,11 @@
 import json
-import time
 import threading
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable, Tuple, Generator
-from openai import OpenAI
+import httpx
 from openai import APIStatusError, APIConnectionError, RateLimitError, AuthenticationError
 
+from . import providers
 from .config import Config
 from .terminal_manager import TerminalManager
 from .browser_manager import BrowserManager
@@ -34,12 +34,13 @@ class Agent:
     API_RETRY_BASE_DELAY = 1.0
     MAX_TOOL_RESULT_CHARS = Config.DEFAULT_MAX_TOOL_RESULT_CHARS
 
-    def __init__(self, workspace: str):
-        self.client = OpenAI(
-            api_key=Config.OPENAI_API_KEY(),
-            base_url=Config.OPENAI_BASE_URL(),
-        )
-        self.model = Config.OPENAI_MODEL()
+    def __init__(self, workspace: str, setup: Optional[str] = None):
+        # Model access: a provider.json setup (default_setup when omitted).
+        # ``spec``/``adapter``/``model``/``effort`` are replaced by set_model().
+        self.spec = providers.resolve(setup)
+        self.adapter = providers.create_adapter(self.spec)
+        self.model = self.spec.model
+        self.effort = self.spec.default_effort
         self.max_tool_result_chars = Config.MAX_TOOL_RESULT_CHARS()
         self.terminal_manager = TerminalManager()
         # A hard interrupt is shared by the UI thread and the worker running
@@ -57,7 +58,7 @@ class Agent:
         self._background_ui_notified_ids = set()
 
         # Token counter
-        self.tokens = TokenCounter(self.model)
+        self.tokens = TokenCounter(self.model, self.spec.context_window)
 
         # Working directory (used by git and search defaults)
         self.cwd = Path(workspace).resolve()
@@ -79,8 +80,7 @@ class Agent:
         self._is_subagent = False
         self.subagent_tool: Optional[SubAgentTool] = SubAgentTool(
             workspace=str(self.cwd),
-            client=self.client,
-            model=self.model,
+            model_config=lambda: (self.spec, self.effort),
         )
 
         # Browser tools: each forwards to one BrowserManager method
@@ -1335,18 +1335,19 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             full_prompt = f"<conversation>\n{prompt}\n</conversation>\n\n<previous-summary>\n{previous_summary}\n</previous-summary>\n\n{self.COMPACT_UPDATE_PROMPT}"
         else:
             full_prompt = f"<conversation>\n{prompt}\n</conversation>\n\n{self.COMPACT_SUMMARY_PROMPT}"
+        messages = [
+            {"role": "system", "content": self.COMPACT_SYSTEM_PROMPT},
+            {"role": "user", "content": full_prompt},
+        ]
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.COMPACT_SYSTEM_PROMPT},
-                    {"role": "user", "content": full_prompt},
-                ],
-                max_tokens=min(self.COMPACT_RESERVE_TOKENS, 8192),
-            )
+            stream = self.adapter.stream(messages, None, self.effort)
+            try:
+                summary = "".join(event[1] for event in stream if event[0] == "text")
+            finally:
+                stream.close()
         except Exception as e:
             raise Exception(self._format_api_error(e)) from e
-        return response.choices[0].message.content or "(compaction produced no summary)"
+        return summary or "(compaction produced no summary)"
 
     def compact(self) -> str:
         history = self.conversation_history
@@ -1462,34 +1463,35 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         """
         error_name = type(e).__name__
         message = " ".join(str(e).split()) or "No additional details provided."
-        lines = [f"OpenAI API Error: {error_name}", f"  Message: {message}"]
+        lines = [f"API Error: {error_name}", f"  Message: {message}"]
 
-        if isinstance(e, APIStatusError):
+        if isinstance(e, (APIStatusError, providers.ProviderError)) and getattr(e, "status_code", None):
             lines.insert(1, f"  Status Code: {e.status_code}")
             request_id = getattr(e, "request_id", None)
             if request_id:
                 lines.insert(2, f"  Request ID:  {request_id}")
         elif isinstance(e, AuthenticationError):
-            lines.append("  Hint: Check your OPENAI_API_KEY and OPENAI_BASE_URL in .env")
+            lines.append(f"  Hint: Check the '{self.spec.provider}' API keys in provider.json")
         elif isinstance(e, RateLimitError):
             lines.append("  Hint: You are being rate-limited. Wait a moment and retry.")
-        elif isinstance(e, APIConnectionError):
-            lines.append(f"  Hint: Could not connect to {self.client.base_url}")
+        elif isinstance(e, (APIConnectionError, httpx.TransportError)):
+            lines.append(f"  Hint: Could not connect to {self.spec.base_url}")
             lines.append("  Check that the API server is running and reachable.")
 
         lines.extend([
             "  Config:",
+            f"    Setup:    {self.spec.setup or '(ad-hoc)'} ({self.spec.provider}, {self.spec.format})",
             f"    Model:    {self.model}",
-            f"    Base URL: {self.client.base_url}",
+            f"    Base URL: {self.spec.base_url}",
         ])
         return "\n".join(lines)
 
     @staticmethod
     def _is_retryable_error(e: Exception) -> bool:
-        if isinstance(e, (RateLimitError, APIConnectionError)):
+        if isinstance(e, (RateLimitError, APIConnectionError, httpx.TransportError)):
             return True
-        if isinstance(e, APIStatusError):
-            return e.status_code in (500, 502, 503, 504)
+        if isinstance(e, APIStatusError) or (isinstance(e, providers.ProviderError) and e.status_code):
+            return e.status_code in (429, 500, 502, 503, 504, 529)
         err = str(e).lower()
         return any(c in err for c in ["timeout", "connection", "network", "remoteprotocolerror", "incomplete chunked read"])
 
@@ -1497,26 +1499,6 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         """Return a short exponential backoff with small deterministic jitter."""
         delay = self.API_RETRY_BASE_DELAY if base_delay is None else base_delay
         return delay * (2 ** attempt) + 0.5 * attempt
-
-    def _call_openai_with_retry(self, max_retries: Optional[int] = None, base_delay: Optional[float] = None):
-        """Call the non-streaming endpoint, retrying transient failures twice."""
-        retries = self.API_MAX_RETRIES if max_retries is None else max_retries
-        attempts = retries + 1
-        last_exc = None
-        for attempt in range(attempts):
-            try:
-                return self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self._prepare_messages_for_api(),
-                    tools=self._get_tool_schema(),
-                    tool_choice="auto",
-                )
-            except Exception as e:
-                last_exc = e
-                if not self._is_retryable_error(e) or attempt == attempts - 1:
-                    break
-                time.sleep(self._retry_delay(attempt, base_delay))
-        raise APIRequestError(self._format_api_error(last_exc)) from None
 
     def _stream_response(self) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, int]]]:
         """Stream a response, retrying transient connection failures twice.
@@ -1534,13 +1516,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             stream = None
             try:
                 self._check_interrupt()
-                stream = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self._prepare_messages_for_api(),
-                    tools=self._get_tool_schema(),
-                    tool_choice="auto",
-                    stream=True,
-                    stream_options={"include_usage": True},
+                stream = self.adapter.stream(
+                    self._prepare_messages_for_api(),
+                    self._get_tool_schema(),
+                    self.effort,
                 )
                 with self._active_stream_lock:
                     self._active_stream = stream
@@ -1551,36 +1530,31 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 content = ""
                 tool_calls: Dict[int, Dict[str, str]] = {}
                 api_usage = None
-                for chunk in stream:
+                extras: Dict[str, Any] = {}
+                # Adapters normalize every wire format into the same events
+                # (see kairos/providers/base.py).
+                for event in stream:
                     self._check_interrupt()
-                    if not chunk.choices:
-                        if chunk.usage:
-                            api_usage = {
-                                "prompt_tokens": chunk.usage.prompt_tokens or 0,
-                                "completion_tokens": chunk.usage.completion_tokens or 0,
-                            }
-                        continue
-                    delta = chunk.choices[0].delta
-                    if not delta:
-                        continue
-                    if delta.content:
-                        content += delta.content
+                    kind = event[0]
+                    if kind == "text":
+                        content += event[1]
                         with self._active_stream_lock:
                             self._partial_stream_content = content
                         if self.on_stream_token:
-                            self.on_stream_token(delta.content)
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            idx = tc.index
-                            if idx not in tool_calls:
-                                tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
-                            if tc.id:
-                                tool_calls[idx]["id"] = tc.id
-                            if tc.function:
-                                if tc.function.name:
-                                    tool_calls[idx]["name"] = tc.function.name
-                                if tc.function.arguments:
-                                    tool_calls[idx]["arguments"] += tc.function.arguments
+                            self.on_stream_token(event[1])
+                    elif kind == "tool_call":
+                        _, idx, call_id, name, arguments = event
+                        if idx not in tool_calls:
+                            tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                        if call_id:
+                            tool_calls[idx]["id"] = call_id
+                        if name:
+                            tool_calls[idx]["name"] = name
+                        tool_calls[idx]["arguments"] += arguments
+                    elif kind == "usage":
+                        api_usage = {"prompt_tokens": event[1], "completion_tokens": event[2]}
+                    elif kind == "message_extra":
+                        extras[event[1]] = event[2]
 
                 assembled = []
                 for idx in sorted(tool_calls.keys()):
@@ -1590,6 +1564,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                     except json.JSONDecodeError:
                         args = {}
                     assembled.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+                # Provider state for the assistant message (step() attaches it).
+                self._stream_extras = extras
                 return content, assembled, api_usage
             except InterruptedError:
                 # Close the visible panel too: otherwise the CLI would leave
@@ -1687,6 +1663,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         else:
             self.tokens.add_output_tokens(content)
         assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content or None}
+        assistant_msg.update(getattr(self, "_stream_extras", None) or {})
         if self.on_stream_end:
             self.on_stream_end(content, bool(assembled_tool_calls))
         if assembled_tool_calls:
@@ -1831,7 +1808,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         self._stop_requested = False
         self._interrupted_pending = False
         self._setup_system_prompt()
-        self.tokens = TokenCounter(self.model)
+        self.tokens = TokenCounter(self.model, self.spec.context_window)
         if self.browser_manager.is_open:
             try:
                 self.browser_manager.close()
@@ -1844,3 +1821,31 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
     def get_history(self) -> List[Dict[str, Any]]:
         return list(self.conversation_history)
+
+    # ------------------------------------------------------------------ #
+    #  Model selection                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _use_spec(self, spec: "providers.ModelSpec", effort: Optional[str]) -> None:
+        """Switch model access; history and token totals carry over."""
+        self.spec = spec
+        self.adapter = providers.create_adapter(spec)
+        self.model = spec.model
+        self.effort = effort
+        self.tokens.context_window = spec.context_window or Config.CONTEXT_WINDOW()
+
+    def set_model(self, setup: Optional[str] = None, model: Optional[str] = None, provider: Optional[str] = None) -> str:
+        """Switch to a provider.json setup (the default setup when all are
+        None) or to an ad-hoc ``model`` on ``provider``. Effort resets to the
+        new spec's default."""
+        spec = providers.resolve(setup, model=model, provider=provider)
+        self._use_spec(spec, spec.default_effort)
+        return f"Model: {spec.setup or spec.model} ({spec.provider}, {spec.format}), effort: {self.effort or 'default'}"
+
+    def set_effort(self, effort: str) -> str:
+        """Set the reasoning effort, validated when the spec lists efforts."""
+        self.effort = providers.validate_effort(self.spec, effort)
+        return f"Effort: {self.effort}"
+
+    def model_info(self) -> Dict[str, Any]:
+        return self.spec.info(self.effort)

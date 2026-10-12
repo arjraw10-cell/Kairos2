@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
+from .. import providers
 from ..agent import Agent
 from ..config import Config
 from .history import sanitize_for_resume
@@ -135,6 +136,11 @@ class GatewayManager:
     def _create_runtime(self, conversation: Conversation) -> AgentRuntime:
         history = self.repository.load_history(conversation.id)
         agent = self.agent_factory(conversation.workspace_path)
+        try:
+            self._apply_model_settings(agent, self.repository.get_model_settings(conversation.id))
+        except ValueError:
+            # A setup removed from provider.json must not block loading.
+            log.warning("Stored model settings for %s are invalid; using the default setup", conversation.id, exc_info=True)
         if history:
             sanitized, _needs_continue = sanitize_for_resume(history)
             if sanitized:
@@ -294,6 +300,49 @@ class GatewayManager:
                 if self._pending_runs.get(runtime.conversation_id):
                     raise ValueError("Conversation already has an active or queued run.")
                 runtime.control_busy = True
+
+    @staticmethod
+    def _apply_model_settings(agent: Agent, settings: dict[str, Any]) -> None:
+        # Injected test Agents may not implement model selection.
+        if not settings or not hasattr(agent, "set_model"):
+            return
+        agent.set_model(settings.get("setup"), settings.get("model"), settings.get("provider"))
+        if settings.get("effort"):
+            agent.set_effort(settings["effort"])
+
+    def list_models(self) -> dict[str, Any]:
+        return {"setups": providers.list_setups(), "default_setup": providers.default_setup()}
+
+    async def configure_conversation(
+        self,
+        conversation_id: str,
+        setup: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+        effort: str | None = None,
+    ) -> dict[str, Any]:
+        """Choose the conversation's model and/or effort; with no changes,
+        return the current model info. The choice is persisted and applied to
+        a loaded runtime immediately (it takes effect at the next API step)."""
+        settings = self.repository.get_model_settings(conversation_id)
+        changed = bool(setup or model or effort)
+        if setup or model:
+            # A new model starts from its own default effort.
+            settings = {"setup": setup, "model": model, "provider": provider, "effort": None}
+        if effort:
+            settings["effort"] = effort
+        spec = providers.resolve(settings.get("setup"), model=settings.get("model"), provider=settings.get("provider"))
+        if settings.get("effort"):
+            providers.validate_effort(spec, settings["effort"])
+        if changed:
+            self.repository.set_model_settings(conversation_id, settings)
+        runtime = self.get_runtime(conversation_id)
+        if runtime is not None and hasattr(runtime.agent, "model_info"):
+            with runtime.state_lock:
+                if changed:
+                    self._apply_model_settings(runtime.agent, settings)
+                return runtime.agent.model_info()
+        return spec.info(settings.get("effort") or spec.default_effort)
 
     def visible_messages(self, conversation_id: str, include_internal: bool = False, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return [m.to_dict(include_internal=include_internal) for m in self.repository.list_messages(conversation_id, include_internal, limit, offset)]

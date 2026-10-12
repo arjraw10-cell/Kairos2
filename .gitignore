@@ -16,3 +16,5 @@ kairos.bat
 kairos_nold.bat
 kairoscli.bat
 temp.py
+# Model provider config holds API keys; see provider.example.json.
+provider.json
