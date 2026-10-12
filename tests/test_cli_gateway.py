@@ -259,7 +259,8 @@ class GatewayBackendTests(unittest.TestCase):
         self.assertGreater(names.count("assistant.token"), 3)
         self.assertIn("assistant.stream_ended", names)
         token_updates = [d for e, d in events if e == "token.updated"]
-        self.assertEqual(token_updates[-1]["subagent_id"], "sub1")
+        # Sub-agent usage now arrives in subagent.status, not token.updated.
+        self.assertNotIn("subagent_id", token_updates[-1])
         streamed = "".join(d["delta"] for e, d in events if e == "assistant.token")
         self.assertEqual(streamed.strip(), "Hello from the [gateway] (hi, image=True)")
 

@@ -20,6 +20,7 @@ from typing import Any, Callable, Awaitable
 from .. import providers
 from ..agent import Agent
 from ..config import Config
+from ..wake import WakeScheduler, format_notifications
 from ..workspaces import new_workspace
 from .history import sanitize_for_resume
 from .models import Conversation, Run
@@ -42,6 +43,8 @@ class AgentRuntime:
     control_busy: bool = False
     last_activity: float = field(default_factory=time.time)
     subscribers: set[str] = field(default_factory=set)
+    scheduler: WakeScheduler | None = None
+    loop: asyncio.AbstractEventLoop | None = None
 
 
 class GatewayManager:
@@ -53,7 +56,13 @@ class GatewayManager:
         default_workspace: str | None = None,
         max_concurrent_runs: int | None = None,
         agent_factory: AgentFactory | None = None,
+        wake_debounce: float = 2.0,
+        wake_cap: int = 10,
     ):
+        # Background events on an idle conversation are batched for
+        # wake_debounce seconds; at most wake_cap wakes without a user message.
+        self.wake_debounce = wake_debounce
+        self.wake_cap = wake_cap
         self.repository = repository or GatewayRepository(Config.KAIROS_DATA_DIR() or None)
         self.default_workspace = default_workspace or Config.KAIROS_DEFAULT_WORKSPACE()
         configured_workers = (
@@ -157,7 +166,84 @@ class GatewayManager:
                         tokens.finish_turn()
                 except Exception:
                     log.exception("Could not restore token counters for %s", conversation.id)
+        # Notifications saved when the runtime was last unloaded ride along
+        # with the next run.
+        pending = self.repository.take_pending_notifications(conversation.id)
+        if pending and hasattr(agent, "add_background_events"):
+            agent.add_background_events(pending)
         return AgentRuntime(conversation.id, conversation.workspace_path, agent)
+
+    def _attach_background(self, runtime: AgentRuntime) -> None:
+        """Route the Agent's background events and sub-agent statuses.
+
+        These callbacks live as long as the runtime (events arrive while it
+        is idle). Idle events go through a WakeScheduler that starts a wake
+        run; events during a run are injected by the Agent itself.
+        """
+        cid = runtime.conversation_id
+        scheduler = WakeScheduler(
+            start_wake=lambda events: self._start_wake(runtime, events),
+            is_idle=lambda: self._runtime_is_idle(runtime),
+            debounce=self.wake_debounce,
+            cap=self.wake_cap,
+            on_paused=lambda pending: self.emit(cid, "wake.paused", {"conversation_id": cid, "pending": pending}),
+        )
+        runtime.scheduler = scheduler
+
+        def on_background_event(event: dict[str, Any]) -> None:
+            self.emit(cid, "background.notification", {"conversation_id": cid, "notifications": [event]})
+            scheduler.push(event)
+
+        def on_subagent_status(status: dict[str, Any]) -> None:
+            # Per-tool progress is live-only; final states are replayable.
+            self.emit(cid, "subagent.status", {"conversation_id": cid, **status}, persist=status.get("state") != "running")
+
+        setattr(runtime.agent, "on_background_event", on_background_event)
+        setattr(runtime.agent, "on_subagent_status", on_subagent_status)
+
+    def _runtime_is_idle(self, runtime: AgentRuntime) -> bool:
+        with runtime.state_lock:
+            if runtime.is_running or runtime.closing or runtime.control_busy:
+                return False
+        with self._run_tasks_lock:
+            return not self._pending_runs.get(runtime.conversation_id)
+
+    def _start_wake(self, runtime: AgentRuntime, events: list[dict[str, Any]]) -> None:
+        """WakeScheduler callback (timer thread): queue a wake run."""
+        def give_back() -> None:
+            # Not lost: the next run (or the unload snapshot) picks them up.
+            add = getattr(runtime.agent, "add_background_events", None)
+            if add:
+                add(events)
+
+        def enqueue() -> None:
+            try:
+                self._enqueue_run(runtime, format_notifications(events), None, "wake", None, None, origin="wake")
+            except Exception:
+                log.warning("Could not start a wake run for %s", runtime.conversation_id, exc_info=True)
+                give_back()
+
+        try:
+            runtime.loop.call_soon_threadsafe(enqueue)
+        except Exception:
+            give_back()
+
+    @staticmethod
+    def _has_background_work(runtime: AgentRuntime) -> bool:
+        busy = getattr(runtime.agent, "has_background_work", None)
+        return bool(busy and busy())
+
+    def list_subagents(self, conversation_id: str) -> list[dict[str, Any]]:
+        self.get_conversation(conversation_id)
+        runtime = self.get_runtime(conversation_id)
+        statuses = getattr(runtime.agent, "subagent_statuses", None) if runtime else None
+        return statuses() if statuses else []
+
+    def stop_subagents(self, conversation_id: str) -> int:
+        self.get_conversation(conversation_id)
+        runtime = self.get_runtime(conversation_id)
+        stop = getattr(runtime.agent, "stop_subagents", None) if runtime else None
+        return stop() if stop else 0
 
     async def load_runtime(self, conversation_id: str) -> AgentRuntime:
         conversation = self.get_conversation(conversation_id)
@@ -176,6 +262,8 @@ class GatewayManager:
             # loads and unloads cannot construct duplicate Agents or tear down
             # a runtime between construction and registration.
             runtime = self._create_runtime(conversation)
+            runtime.loop = asyncio.get_running_loop()
+            self._attach_background(runtime)
             self._runtimes[conversation_id] = runtime
             loaded = True
         if loaded:
@@ -241,8 +329,16 @@ class GatewayManager:
                             await self.cancel_run(run_id)
                         except KeyError:
                             pass
+                if runtime.scheduler:
+                    runtime.scheduler.close()
+                # Running sub-agents cannot survive the runtime: mark them lost
+                # (status + a notification for the next run).
+                mark_lost = getattr(getattr(runtime.agent, "subagent_tool", None), "mark_lost", None)
+                if mark_lost:
+                    mark_lost()
                 self._persist_runtime(runtime)
                 self._close_agent_resources(runtime.agent)
+                self._save_pending_notifications(runtime)
                 with self._lifecycle_lock, self._runtimes_lock:
                     self._runtimes.pop(conversation_id, None)
                 removed = True
@@ -258,8 +354,20 @@ class GatewayManager:
                 with runtime.state_lock:
                     runtime.closing = False
 
+    def _save_pending_notifications(self, runtime: AgentRuntime) -> None:
+        """Keep undelivered background events for the next load."""
+        events = runtime.scheduler.take_pending() if runtime.scheduler else []
+        drain = getattr(runtime.agent, "drain_background_events", None)
+        if drain:
+            events += drain()
+        if events:
+            self.repository.add_pending_notifications(runtime.conversation_id, events)
+
     @staticmethod
     def _close_agent_resources(agent: Agent) -> None:
+        child_agents = getattr(getattr(agent, "subagent_tool", None), "child_agents", None)
+        for child in child_agents() if child_agents else []:
+            GatewayManager._close_agent_resources(child)
         try:
             browser = getattr(agent, "browser_manager", None)
             if browser is not None and bool(getattr(browser, "is_open", False)):
@@ -397,6 +505,7 @@ class GatewayManager:
         client_id: str | None,
         on_event: Callable[[dict[str, Any]], Awaitable[None]] | None,
         allow_control: bool = False,
+        origin: str = "user",
     ) -> Run:
         """Persist and schedule one run without yielding to the event loop.
 
@@ -418,6 +527,7 @@ class GatewayManager:
                     image_url,
                     source,
                     client_id,
+                    origin,
                 )
                 pending = self._pending_runs.setdefault(
                     runtime.conversation_id, deque()
@@ -439,7 +549,7 @@ class GatewayManager:
             self.emit(
                 runtime.conversation_id,
                 "run.queued",
-                {"run": run.to_dict()},
+                {"run": run.to_dict(), "origin": run.origin},
                 run.id,
             )
         except Exception:
@@ -463,6 +573,8 @@ class GatewayManager:
         if not self.repository.get_conversation(conversation_id):
             raise KeyError(f"Conversation not found: {conversation_id}")
         runtime = await self.load_runtime(conversation_id)
+        if runtime.scheduler:
+            runtime.scheduler.user_message_sent()
         return self._enqueue_run(
             runtime, content, image_url, source, client_id, on_event
         )
@@ -523,7 +635,7 @@ class GatewayManager:
                     self.emit(
                         runtime.conversation_id,
                         "run.cancelled",
-                        {"run": cancelled.to_dict()},
+                        {"run": cancelled.to_dict(), "origin": run.origin},
                         run.id,
                     )
                 return
@@ -542,7 +654,7 @@ class GatewayManager:
                     runtime.active_run_id = None
                 return
             self.repository.update_conversation(runtime.conversation_id, status="running", active_run_id=run.id)
-            self.emit(runtime.conversation_id, "run.started", {"run": started.to_dict()}, run.id)
+            self.emit(runtime.conversation_id, "run.started", {"run": started.to_dict(), "origin": run.origin}, run.id)
             loop = asyncio.get_running_loop()
 
             def send_event(event: str, data: dict[str, Any], persist: bool = True) -> None:
@@ -571,16 +683,13 @@ class GatewayManager:
                 setattr(agent, "on_tool_result", lambda name, result, raw: send_event("tool.finished", {"name": name, "success": bool(result.get("success")), "error": result.get("error")}))
                 setattr(agent, "on_token_update", lambda tokens: send_event("token.updated", token_data(tokens)))
                 setattr(agent, "on_compact", lambda message: send_event("conversation.compacted", {"message": message}))
-                setattr(agent, "on_background_notification", lambda message: send_event("terminal.completed", {"message": message}))
-                subagent_tool = getattr(agent, "subagent_tool", None)
-                if subagent_tool:
-                    subagent_tool._tool_printer = lambda summary: send_event("tool.started", {"name": "subagent", "summary": summary})
-                    subagent_tool._stream_start = lambda: send_event("assistant.stream_started", {"subagent": True})
-                    subagent_tool._stream_token = lambda token: send_event("assistant.token", {"delta": token, "subagent": True}, persist=False)
-                    subagent_tool._stream_end = lambda text, has_tools: send_event("assistant.stream_ended", {"content": text, "has_tool_calls": has_tools, "subagent": True})
-                    subagent_tool._token_update = lambda subagent_id, tokens: send_event("token.updated", {**token_data(tokens), "subagent_id": subagent_id})
 
             configure_callbacks()
+            # Notifications that arrived while this run was queued ride along
+            # with it (after its input) instead of starting a separate wake.
+            pending = runtime.scheduler.take_pending() if runtime.scheduler else []
+            if pending:
+                runtime.agent.add_background_events(pending)
             try:
                 response = await loop.run_in_executor(
                     self._executor,
@@ -601,7 +710,7 @@ class GatewayManager:
                         status="queued" if next_id else "idle",
                         active_run_id=next_id,
                     )
-                send_event("run.interrupted" if final_status == "interrupted" else "run.completed", {"response": response, "run": self.repository.get_run(run.id).to_dict()})
+                send_event("run.interrupted" if final_status == "interrupted" else "run.completed", {"response": response, "run": self.repository.get_run(run.id).to_dict(), "origin": run.origin})
             except Exception as exc:
                 log.exception("Run %s failed", run.id)
                 self.repository.update_run(run.id, "failed", str(exc), expected_status="running")
@@ -615,7 +724,7 @@ class GatewayManager:
                         status="queued" if next_id else "idle",
                         active_run_id=next_id,
                     )
-                send_event("run.failed", {"error": str(exc), "run": self.repository.get_run(run.id).to_dict()})
+                send_event("run.failed", {"error": str(exc), "run": self.repository.get_run(run.id).to_dict(), "origin": run.origin})
             finally:
                 with runtime.state_lock:
                     runtime.is_running = False
@@ -630,17 +739,9 @@ class GatewayManager:
                     "on_tool_result",
                     "on_token_update",
                     "on_compact",
-                    "on_background_notification",
                 ):
                     if hasattr(runtime.agent, callback_name):
                         setattr(runtime.agent, callback_name, None)
-                subagent_tool = getattr(runtime.agent, "subagent_tool", None)
-                if subagent_tool:
-                    subagent_tool._tool_printer = None
-                    subagent_tool._stream_start = None
-                    subagent_tool._stream_token = None
-                    subagent_tool._stream_end = None
-                    subagent_tool._token_update = None
 
     async def interrupt_run(self, conversation_id: str, run_id: str | None = None) -> bool:
         runtime = self.get_runtime(conversation_id)
@@ -681,7 +782,7 @@ class GatewayManager:
                     status="queued" if next_id else "idle",
                     active_run_id=next_id,
                 )
-            self.emit(run.conversation_id, "run.cancelled", {"run": cancelled.to_dict()}, run_id)
+            self.emit(run.conversation_id, "run.cancelled", {"run": cancelled.to_dict(), "origin": run.origin}, run_id)
             return True
         if run.status == "running":
             return await self.interrupt_run(run.conversation_id, run_id)
@@ -713,6 +814,8 @@ class GatewayManager:
             raise KeyError(f"Conversation not found: {conversation_id}")
         runtime = await self.load_runtime(conversation_id)
         self._reserve_control(runtime)
+        if runtime.scheduler:
+            runtime.scheduler.user_message_sent()
         try:
             # Reload the durable raw history rather than using the already-
             # sanitized runtime history. Normal runtime loading intentionally
@@ -758,6 +861,8 @@ class GatewayManager:
                     for sid, runtime in self._runtimes.items()
                     if not self._runtime_is_running(runtime)
                     and now - runtime.last_activity > limit
+                    # Unloading would kill running sub-agents/background commands.
+                    and not self._has_background_work(runtime)
                 ]
             for sid in candidates:
                 try:

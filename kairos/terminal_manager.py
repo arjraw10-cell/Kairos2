@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -19,6 +20,9 @@ class _BackgroundCommand:
     command: str
     started_at: float
     output: str = ""
+    until: Optional["re.Pattern[str]"] = None  # notify once when a line matches
+    matched: bool = False
+    stopped: bool = False  # set by stop_command
 
 
 @dataclass
@@ -45,6 +49,8 @@ class TerminalManager:
     # context or the visible CLI. The complete terminal output remains in the
     # terminal's read_logs buffer.
     MAX_NOTIFICATION_OUTPUT = 12_000
+    MATCH_TAIL_LINES = 20
+    DEFAULT_LOG_TAIL = 100
 
     def __init__(self):
         self.terminals: Dict[int, Terminal] = {}
@@ -57,22 +63,21 @@ class TerminalManager:
         self._active_blocking: Dict[int, subprocess.Popen] = {}
 
     def set_completion_callback(self, callback) -> None:
-        """Set a callback for asynchronous background-command completions.
+        """Set the consumer of background-command events.
 
-        When a callback is configured, new completions are delivered to it
-        immediately in addition to remaining in the manager's polling queue.
-        Completions that arrived before the callback was configured are also
-        delivered immediately.
+        With a callback, every event (completion or ``until`` match) is
+        delivered to it exactly once; events queued before it was set are
+        handed over immediately. Without one, events wait in the queue for
+        ``drain_completed_background_commands()``.
         """
         with self._lock:
             self._completion_callback = callback
             queued = list(self._completed_background_commands) if callback else []
+            if callback:
+                self._completed_background_commands.clear()
 
-        if callback:
-            # These events remain queued for the next API turn; this callback
-            # is only an availability/CLI notification.
-            for event in queued:
-                self._emit_completion((event, callback))
+        for event in queued:
+            self._emit_completion((event, callback))
 
     def create_terminal(self, background: bool) -> int:
         with self._lock:
@@ -207,30 +212,44 @@ class TerminalManager:
         exit_code: Optional[int],
         error: Optional[str] = None,
     ):
-        """Queue a completion or return a callback delivery.
-
-        This method is called while ``self._lock`` is held. The callback is
-        returned to the caller and invoked after releasing the lock.
-        """
-        output = command.output
+        """Build a completion event and deliver it (see ``_deliver_locked``)."""
         event = {
             "completion_id": uuid.uuid4().hex,
+            "kind": "terminal_finished",
             "terminal_id": term.id,
             "command": command.command,
-            "success": error is None and (exit_code is None or exit_code == 0),
+            "success": error is None and not command.stopped and (exit_code is None or exit_code == 0),
+            "stopped": command.stopped,
             "exit_code": exit_code,
-            "output": output,
+            "output": command.output,
             "duration_seconds": max(0.0, time.monotonic() - command.started_at),
         }
         if error:
             event["error"] = error
+        return self._deliver_locked(event)
 
-        # Always retain the event for the agent's next API turn. The callback
-        # is only an immediate visibility notification and must never consume
-        # the context-delivery queue.
-        self._completed_background_commands.append(event)
+    def _queue_match_locked(self, term: Terminal, command: _BackgroundCommand, line: str):
+        """Deliver the one-time ``until`` match of a still-running command."""
+        command.matched = True
+        return self._deliver_locked({
+            "completion_id": uuid.uuid4().hex,
+            "kind": "terminal_matched",
+            "terminal_id": term.id,
+            "command": command.command,
+            "line": line.rstrip("\r\n"),
+            "tail": "\n".join(command.output.splitlines()[-self.MATCH_TAIL_LINES:]),
+            "duration_seconds": max(0.0, time.monotonic() - command.started_at),
+        })
+
+    def _deliver_locked(self, event: dict):
+        """Queue an event, or return a callback delivery when a consumer is set.
+
+        Called while ``self._lock`` is held; the caller invokes the returned
+        callback after releasing the lock.
+        """
         callback = self._completion_callback
         if callback is None:
+            self._completed_background_commands.append(event)
             return None
         return event, callback
 
@@ -272,6 +291,12 @@ class TerminalManager:
                                 )
                             else:
                                 command.output += line
+                                if (
+                                    command.until is not None
+                                    and not command.matched
+                                    and command.until.search(line)
+                                ):
+                                    delivery = self._queue_match_locked(term, command, line)
 
                         if not is_internal_marker:
                             # Keep complete terminal output while excluding
@@ -323,6 +348,7 @@ class TerminalManager:
         command: str,
         timeout: Optional[float] = None,
         is_background: Optional[bool] = None,
+        until: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Execute a command in a terminal.
@@ -332,6 +358,8 @@ class TerminalManager:
         intentionally ignored because the persistent shell may run commands
         for an arbitrary length of time. Completion is returned later through
         the configured callback or drain_completed_background_commands().
+        ``until`` (background only) is a regex: the first output line that
+        matches produces a one-time ``terminal_matched`` event.
         """
         with self._lock:
             term = self.terminals.get(terminal_id)
@@ -357,6 +385,15 @@ class TerminalManager:
                 f"{'background' if is_background else 'blocking'}"
             )
 
+        until_pattern = None
+        if until:
+            if not term.background:
+                return False, "until is only supported for background terminals."
+            try:
+                until_pattern = re.compile(until)
+            except re.error as e:
+                return False, f"Invalid until regex: {e}"
+
         if term.background:
             # Send the command to the persistent shell and append a unique
             # marker. The reader thread uses the marker to know when this
@@ -372,6 +409,7 @@ class TerminalManager:
                 marker=marker,
                 command=command,
                 started_at=time.monotonic(),
+                until=until_pattern,
             )
             if sys.platform == "win32":
                 # `cmd /Q` suppresses command echo. Keep the user's command
@@ -412,8 +450,9 @@ class TerminalManager:
                     return False, f"Failed to send command: {str(e)}"
 
             return True, (
-                "Command sent to background terminal; it will remain running "
-                "as needed and report its completion asynchronously."
+                "Command sent to background terminal. You will be notified when it finishes"
+                + (" or its output matches `until`" if until else "")
+                + "; end your turn or keep working instead of polling."
             )
 
         # Blocking execution: timeout is required and capped at 20 seconds.
@@ -487,6 +526,116 @@ class TerminalManager:
             self._terminate_process_tree(process)
         return len(processes)
 
+    def running_background_commands(self) -> int:
+        """Number of submitted background commands that have not finished."""
+        with self._lock:
+            return sum(len(t.pending_commands) for t in self.terminals.values() if t.background)
+
+    def stop_command(self, terminal_id: int) -> Tuple[bool, str]:
+        """Kill the running command's process tree but keep the shell.
+
+        The shell then reports the command finished (marked stopped) through
+        the usual completion event.
+        """
+        with self._lock:
+            term = self.terminals.get(terminal_id)
+            if not term:
+                return False, f"Terminal {terminal_id} not found"
+            if not term.background:
+                return False, f"Terminal {terminal_id} is not a background terminal"
+            if term.closed or not term.process:
+                return False, f"Terminal {terminal_id} is closed"
+            if not term.pending_commands:
+                return False, f"No command is running in terminal {terminal_id}."
+            command = term.pending_commands[0]
+            command.stopped = True
+            shell_pid = term.process.pid
+
+        children = self._child_pids(shell_pid)
+        if not children:
+            with self._lock:
+                command.stopped = False
+            return False, (
+                f"Found no process for the running command in terminal {terminal_id} "
+                "(it may be a shell built-in). Use close_terminal to stop it."
+            )
+        for pid in children:
+            self._kill_pid_tree(pid)
+        return True, (
+            f"Stopped the running command in terminal {terminal_id}; the terminal stays "
+            "open. A notification follows when the shell reports the command finished."
+        )
+
+    @staticmethod
+    def _child_pids(pid: int) -> List[int]:
+        """Direct child processes of ``pid`` (the commands a shell is running)."""
+        if sys.platform != "win32":
+            try:
+                out = subprocess.run(
+                    ["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=2
+                ).stdout
+            except Exception:
+                return []
+            return [int(p) for p in out.split()]
+
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+            return []
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        children = []
+        try:
+            ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while ok:
+                # conhost.exe hosts the shell's console; killing it kills the shell.
+                if entry.th32ParentProcessID == pid and entry.szExeFile.lower() != "conhost.exe":
+                    children.append(entry.th32ProcessID)
+                ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return children
+
+    @classmethod
+    def _kill_pid_tree(cls, pid: int) -> None:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            return
+        for child in cls._child_pids(pid):
+            cls._kill_pid_tree(child)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+
     def drain_completed_background_commands(self) -> List[dict]:
         """Return and remove background completions in finish order."""
         with self._lock:
@@ -496,7 +645,7 @@ class TerminalManager:
 
     @classmethod
     def format_background_completion(cls, event: dict) -> str:
-        """Format one completion for the agent and the user-facing CLI.
+        """Format one completion or ``until`` match for the agent and the UI.
 
         The event keeps the captured output, but this rendered notification is
         capped so a noisy background process cannot consume the conversation
@@ -505,17 +654,27 @@ class TerminalManager:
         """
         terminal_id = event.get("terminal_id", "?")
         command = event.get("command", "")
+        duration = event.get("duration_seconds")
+        if event.get("kind") == "terminal_matched":
+            return "\n".join([
+                f"Terminal {terminal_id}: output matched `until` after "
+                f"{float(duration or 0):.1f}s; the command is still running.",
+                f"Command: {command}",
+                f"Matched line: {event.get('line', '')}",
+                "Recent output:",
+                str(event.get("tail") or "")[-cls.MAX_NOTIFICATION_OUTPUT:],
+            ])
         success = bool(event.get("success"))
         exit_code = event.get("exit_code")
-        duration = event.get("duration_seconds")
         status = "finished successfully" if success else "finished with errors"
+        if event.get("stopped"):
+            status = "was stopped by stop_command"
         if exit_code is not None:
             status += f" (exit code {exit_code})"
         if duration is not None:
             status += f" in {float(duration):.1f}s"
 
         lines = [
-            "[Background terminal notification]",
             f"Terminal {terminal_id}: command {status}",
             f"Command: {command}",
         ]
@@ -537,13 +696,17 @@ class TerminalManager:
     def read_logs(
         self,
         terminal_id: int,
-        start_line: int,
+        start_line: Optional[int] = None,
         end_line: Optional[int] = None,
+        tail: Optional[int] = None,
     ) -> Tuple[bool, str]:
         """
-        Read logs from a background terminal by line numbers.
-        start_line: 1-indexed line number to start reading from
-        end_line: 1-indexed line number to end at (optional, defaults to end of buffer)
+        Read a background terminal's output.
+
+        ``tail`` returns the last N lines; ``start_line``/``end_line`` select a
+        1-indexed inclusive range (end defaults to the last line). With
+        neither, the last ``DEFAULT_LOG_TAIL`` lines are returned. Output
+        starts with a ``[lines A-B of N]`` header.
         """
         with self._lock:
             term = self.terminals.get(terminal_id)
@@ -559,19 +722,28 @@ class TerminalManager:
 
             lines = term.output_buffer.splitlines()
 
-        if start_line < 1:
-            return False, "start_line must be >= 1"
-
-        if start_line > len(lines):
-            return False, f"start_line ({start_line}) exceeds available lines ({len(lines)})"
-
-        if end_line is None:
-            end_line = len(lines)
+        total = len(lines)
+        if tail is not None and (start_line is not None or end_line is not None):
+            return False, "Pass either tail or start_line/end_line, not both."
+        if start_line is None and end_line is None:
+            tail = self.DEFAULT_LOG_TAIL if tail is None else tail
+            if tail < 1:
+                return False, "tail must be >= 1"
+            start_line, end_line = max(1, total - tail + 1), total
         else:
-            end_line = min(end_line, len(lines))
+            start_line = 1 if start_line is None else start_line
+            end_line = total if end_line is None else min(end_line, total)
+            if start_line < 1:
+                return False, "start_line must be >= 1"
+            if total and start_line > total:
+                return False, f"start_line ({start_line}) exceeds available lines ({total})"
+            if total and end_line < start_line:
+                return False, f"end_line ({end_line}) is before start_line ({start_line})"
+        if total == 0:
+            return True, "[no output yet]"
 
         selected_lines = lines[start_line - 1:end_line]
-        return True, "\n".join(selected_lines)
+        return True, f"[lines {start_line}-{end_line} of {total}]\n" + "\n".join(selected_lines)
 
     def close_terminal(self, terminal_id: int) -> Tuple[bool, str]:
         deliveries: List[tuple] = []

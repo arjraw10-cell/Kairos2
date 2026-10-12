@@ -29,10 +29,11 @@ class ExecuteCommandTool:
         command: str,
         timeout: Optional[float] = None,
         is_background: Optional[bool] = None,
+        until: Optional[str] = None,
     ) -> ToolResult:
         try:
             success, output = self.terminal_manager.execute_command(
-                terminal_id, command, timeout, is_background
+                terminal_id, command, timeout, is_background, until
             )
             return ToolResult(success, output)
         except Exception as e:
@@ -40,7 +41,7 @@ class ExecuteCommandTool:
 
 
 class ReadLogsTool:
-    """Read output from a background terminal by line numbers."""
+    """Read output from a background terminal: the last lines or a line range."""
 
     def __init__(self, terminal_manager):
         self.terminal_manager = terminal_manager
@@ -48,16 +49,31 @@ class ReadLogsTool:
     def __call__(
         self,
         terminal_id: int,
-        start_line: int,
+        start_line: Optional[int] = None,
         end_line: Optional[int] = None,
+        tail: Optional[int] = None,
     ) -> ToolResult:
         try:
             success, output = self.terminal_manager.read_logs(
-                terminal_id, start_line, end_line
+                terminal_id, start_line, end_line, tail
             )
             return ToolResult(success, output)
         except Exception as e:
             return ToolResult(False, "", f"Read logs error: {str(e)}")
+
+
+class StopCommandTool:
+    """Stop the running command in a background terminal, keeping the terminal."""
+
+    def __init__(self, terminal_manager):
+        self.terminal_manager = terminal_manager
+
+    def __call__(self, terminal_id: int) -> ToolResult:
+        try:
+            success, output = self.terminal_manager.stop_command(terminal_id)
+            return ToolResult(success, output)
+        except Exception as e:
+            return ToolResult(False, "", f"Stop command error: {str(e)}")
 
 
 class CloseTerminalTool:

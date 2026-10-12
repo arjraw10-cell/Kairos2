@@ -1,5 +1,7 @@
 import json
 import threading
+import time
+from collections import deque
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable, Tuple, Generator
 import httpx
@@ -14,7 +16,7 @@ from .tokens import TokenCounter
 from .tools import (
     ReadTool, WriteTool, EditTool,
     NewTerminalTool, ExecuteCommandTool, ReadLogsTool, CloseTerminalTool, GetTerminalInfoTool,
-    SearchTool, GitTool, SubAgentTool, WebSearchTool,
+    StopCommandTool, SearchTool, GitTool, SubAgentTool, WebSearchTool,
     BrowserTool, BrowserScreenshotTool,
     DesktopDoctorTool, DesktopListWindowsTool, DesktopWindowStateTool, DesktopScreenshotTool,
     DesktopLaunchAppTool, DesktopClickTool, DesktopTypeTool, DesktopPressKeyTool,
@@ -22,6 +24,12 @@ from .tools import (
 )
 from .tools.skills import SkillManager
 from .resume import _repair_trailing_tool_chain
+from .wake import format_notifications
+
+# Sub-agents never get these (schema and dispatch both refuse them).
+SUBAGENT_TOOL_NAMES = frozenset(
+    ("spawn_subagent", "message_subagent", "terminate_subagent", "list_subagents")
+)
 
 
 class APIRequestError(Exception):
@@ -54,8 +62,11 @@ class Agent:
         self._active_stream = None
         self._partial_stream_content = ""
         self._interrupted_pending = False
-        self._background_ui_lock = threading.Lock()
-        self._background_ui_notified_ids = set()
+        # Background events (sub-agents, terminals) owned by the Agent: those
+        # that arrive during a run (injected before its next API step) and,
+        # without a host callback, those waiting for the next run. Guarded by
+        # _processing_lock so ownership flips atomically when a run ends.
+        self._background_events: deque = deque()
 
         # Token counter
         self.tokens = TokenCounter(self.model, self.spec.context_window)
@@ -72,6 +83,7 @@ class Agent:
         self.read_logs_tool = ReadLogsTool(self.terminal_manager)
         self.close_terminal_tool = CloseTerminalTool(self.terminal_manager)
         self.get_terminal_info_tool = GetTerminalInfoTool(self.terminal_manager)
+        self.stop_command_tool = StopCommandTool(self.terminal_manager)
         self.search_tool = SearchTool()
         self.web_search_tool = WebSearchTool()
         self.git_tool = GitTool()
@@ -82,6 +94,8 @@ class Agent:
         self.subagent_tool: Optional[SubAgentTool] = SubAgentTool(
             workspace=str(self.cwd),
             model_config=lambda: (self.spec, self.effort),
+            on_event=self._push_background_event,
+            on_status=self._emit_subagent_status,
         )
 
         # Browser tools: each forwards to one BrowserManager method
@@ -142,30 +156,74 @@ class Agent:
         self.on_tool_result: Optional[Callable[[str, dict, str], None]] = None
         self.on_token_update: Optional[Callable[[TokenCounter], None]] = None
         self.on_compact: Optional[Callable[[str], None]] = None
-        self.on_background_notification: Optional[Callable[[str], None]] = None
+        # Hosts set these; they fire whether or not a run is active.
+        # on_background_event(event): {"id", "kind", "subagent_id"?,
+        # "terminal_id"?, "text", "created_at", "in_run"?}. With in_run the
+        # active run receives the event itself; otherwise the host owns its
+        # delivery (WakeScheduler: wake run or the next user message).
+        self.on_background_event: Optional[Callable[[dict], None]] = None
+        self.on_subagent_status: Optional[Callable[[dict], None]] = None
 
-        # Keep this callback installed for the lifetime of the agent. It only
-        # prints a visible notification; completed events are retained until
-        # the next API turn drains them into the conversation.
-        self.terminal_manager.set_completion_callback(self._on_background_completion)
+        self.terminal_manager.set_completion_callback(self._on_terminal_event)
 
         self.conversation_history: List[Dict[str, Any]] = []
         self._setup_system_prompt()
 
-    def _on_background_completion(self, event: dict) -> None:
-        """Show active completions; leave idle completions queued for next input."""
-        if not self.is_processing or not self.on_background_notification:
-            return
+    # ------------------------------------------------------------------ #
+    #  Background events                                                   #
+    # ------------------------------------------------------------------ #
 
-        completion_id = event.get("completion_id")
-        with self._background_ui_lock:
-            if completion_id and completion_id in self._background_ui_notified_ids:
-                return
-            if completion_id:
-                self._background_ui_notified_ids.add(completion_id)
-        notification = self.terminal_manager.format_background_completion(event)
-        if self.on_background_notification:
-            self.on_background_notification(notification)
+    def _on_terminal_event(self, event: dict) -> None:
+        self._push_background_event({
+            "id": event["completion_id"],
+            "kind": event.get("kind", "terminal_finished"),
+            "terminal_id": event.get("terminal_id"),
+            "text": TerminalManager.format_background_completion(event),
+            "created_at": time.time(),
+        })
+
+    def _push_background_event(self, event: dict) -> None:
+        """Route one event: to the active run, or to the host when idle."""
+        with self._processing_lock:
+            in_run = self._is_processing
+            if in_run or self.on_background_event is None:
+                # The active run (or, with no host, the next run) delivers it.
+                self._background_events.append(event)
+        callback = self.on_background_event
+        if callback:
+            try:
+                callback({**event, "in_run": True} if in_run else event)
+            except Exception:
+                pass  # a host callback must never break a terminal reader or sub-agent
+
+    def add_background_events(self, events: List[dict]) -> None:
+        """Hand events to the next run (hosts: ``WakeScheduler.take_pending()``)."""
+        with self._processing_lock:
+            self._background_events.extend(events)
+
+    def drain_background_events(self) -> List[dict]:
+        """Remove and return the events the Agent still holds."""
+        with self._processing_lock:
+            events = list(self._background_events)
+            self._background_events.clear()
+        return events
+
+    def has_background_work(self) -> bool:
+        """True while sub-agents or background terminal commands are running."""
+        if self.subagent_tool and self.subagent_tool.running_count():
+            return True
+        return self.terminal_manager.running_background_commands() > 0
+
+    def stop_subagents(self) -> int:
+        """Terminate every running sub-agent (the user's /stop); returns the count."""
+        return self.subagent_tool.stop_all() if self.subagent_tool else 0
+
+    def subagent_statuses(self) -> List[dict]:
+        return self.subagent_tool.statuses() if self.subagent_tool else []
+
+    def _emit_subagent_status(self, status: dict) -> None:
+        if self.on_subagent_status:
+            self.on_subagent_status(status)
 
     def _set_processing(self, value: bool) -> None:
         """Track whether a user request is actively running."""
@@ -178,18 +236,22 @@ class Agent:
             return self._is_processing
 
     def _drain_background_notifications(self) -> Optional[str]:
-        """Format completed background commands for insertion into the API turn."""
-        completions = self.terminal_manager.drain_completed_background_commands()
-        if not completions:
-            return None
-        # An idle completion was intentionally not displayed by the callback;
-        # display it now when the next request drains the queue.
-        for event in completions:
-            self._on_background_completion(event)
-        return "\n\n".join(
-            self.terminal_manager.format_background_completion(event)
-            for event in completions
-        )
+        """Format held background events for insertion into the API turn."""
+        events = self.drain_background_events()
+        return format_notifications(events) if events else None
+
+    def _finish_run_unless_background(self) -> bool:
+        """End the run unless events arrived during its final step.
+
+        Checking the queue and clearing the processing flag under one lock
+        makes the hand-off to the host atomic: an event is either held here
+        (and the run continues to show it to the model) or goes to the host.
+        """
+        with self._processing_lock:
+            if self._background_events:
+                return False
+            self._is_processing = False
+            return True
 
     def _setup_system_prompt(self):
         base = (
@@ -200,7 +262,9 @@ class Agent:
             "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, it will not automatically be injected, so you will have to look for the AGENTS.md file in that directory. Note that the AGENTS.md does not always exist.\n\n"
             "When you finish a task, the final message (that has no tool calls) will be showm to user as your message to them.\n\n"
             "## Terminal Tools\n"
-            "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call requires a finite positive timeout; values above 20 seconds are capped at 20 seconds. Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately, the persistent shell stays alive, and a completion notification containing capped output is delivered while the agent is active or queued for the next user message when the agent is idle. The full output remains available through read_logs.\n\n"
+            "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call requires a finite positive timeout; values above 20 seconds are capped at 20 seconds. Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately and the persistent shell stays alive. The full output remains available through read_logs.\n\n"
+            "## Background Work\n"
+            "Background terminal commands and sub-agents report back with a `[Background notification]` message: when a command finishes (or its `until` pattern matches) and when a sub-agent finishes or fails. If your turn has already ended, you are woken with the notification. Never poll, sleep or wait for background work: start it, tell the user what is running, and end your turn or keep working on something else.\n\n"
             f"## Tool Result Limits\nText returned by tools is capped before it is added to conversation history: up to {self.max_tool_result_chars:,} characters per tool result. Oversized results contain a truncation marker and preserve both the beginning and end. Use narrower commands or queries; for complete background-terminal output, use read_logs.\n\n"
             "## Web Search\n"
             "Use `web_search` for quick facts and current events. Use the browser for pages that need interaction, or when web_search is unavailable.\n\n"
@@ -374,7 +438,12 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "execute_command",
-                    "description": "Execute a shell command in a terminal.",
+                    "description": (
+                        "Execute a shell command in a terminal. In a background terminal the call returns "
+                        "immediately and you will be woken with a notification when the command finishes, "
+                        "or when a line of its output matches `until`; end your turn or keep working instead "
+                        "of polling."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -382,6 +451,7 @@ class Agent:
                             "command": {"type": "string", "description": "Shell command to execute"},
                             "timeout": {"type": "number", "description": "Required finite positive timeout for blocking terminals; values above 20 seconds are capped at 20. Ignored for background terminals."},
                             "is_background": {"type": "boolean", "description": "Must match terminal type"},
+                            "until": {"type": "string", "description": "Background terminals only: a regular expression. The first output line that matches notifies you once (with that line and recent output) while the command keeps running, e.g. 'Listening on' for a dev server."},
                         },
                         "required": ["terminal_id", "command", "is_background"],
                         "oneOf": [
@@ -400,15 +470,30 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "read_logs",
-                    "description": "Read output from a background terminal by line number range.",
+                    "description": "Read a background terminal's output. With no range, returns the last 100 lines; tail sets the number of last lines; start_line/end_line select a 1-indexed inclusive range. Output starts with a [lines A-B of N] header.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "terminal_id": {"type": "integer", "description": "Background terminal ID"},
+                            "tail": {"type": "integer", "description": "Return the last N lines (do not combine with start_line/end_line)"},
                             "start_line": {"type": "integer", "description": "First line to read (1-indexed)"},
-                            "end_line": {"type": "integer", "description": "Last line (optional)"},
+                            "end_line": {"type": "integer", "description": "Last line to read, inclusive (default: the last line)"},
                         },
-                        "required": ["terminal_id", "start_line"],
+                        "required": ["terminal_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "stop_command",
+                    "description": "Stop the command running in a background terminal (kills its process tree) without closing the terminal. You then get a notification that it was stopped.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "terminal_id": {"type": "integer", "description": "Background terminal ID"},
+                        },
+                        "required": ["terminal_id"],
                     },
                 },
             },
@@ -444,12 +529,17 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "spawn_subagent",
-                    "description": "Spawn a sub-agent to work on a task autonomously.",
+                    "description": (
+                        "Start a sub-agent on a task. It runs in the background with its own context and your "
+                        "tools (except browser and sub-agent tools), and this call returns its ID immediately. "
+                        "Then end your turn or keep working on something else: you will be woken with its result "
+                        "when it finishes. Do not poll or wait for it. Sub-agents share your workspace, so give "
+                        "parallel sub-agents separate files or tasks. At most 5 run at once."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "prompt": {"type": "string", "description": "The task / instruction to give the sub-agent"},
-                            "mode": {"type": "string", "description": "'blocking' (default) or 'non-blocking'"},
+                            "prompt": {"type": "string", "description": "Complete, self-contained instructions; the sub-agent sees nothing of this conversation"},
                         },
                         "required": ["prompt"],
                     },
@@ -458,15 +548,42 @@ class Agent:
             {
                 "type": "function",
                 "function": {
-                    "name": "get_subagent_result",
-                    "description": "Retrieve the result of a non-blocking sub-agent.",
+                    "name": "message_subagent",
+                    "description": (
+                        "Send a follow-up message to a sub-agent that has finished; it continues with its previous "
+                        "context, in the background, and you will be woken with its reply. Refused while it is "
+                        "still running."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "subagent_id": {"type": "string", "description": "The ID returned by spawn_subagent"},
+                            "subagent_id": {"type": "string", "description": "ID returned by spawn_subagent"},
+                            "message": {"type": "string", "description": "The follow-up instruction"},
+                        },
+                        "required": ["subagent_id", "message"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "terminate_subagent",
+                    "description": "Stop a running sub-agent. Its context is kept, so message_subagent can continue it later.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "subagent_id": {"type": "string", "description": "ID returned by spawn_subagent"},
                         },
                         "required": ["subagent_id"],
                     },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_subagents",
+                    "description": "List sub-agents: ID, state (running, idle, failed, terminated, lost), current tool, elapsed time, task and their last 3 tool calls (to tell progress from a stuck sub-agent). Use it to check on them, not to wait: results arrive as notifications.",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
                 },
             },
             # ---- Browser Tools ----
@@ -776,7 +893,7 @@ class Agent:
         ]
 
         if self._is_subagent:
-            tools = [t for t in tools if t["function"]["name"] not in ("spawn_subagent", "get_subagent_result")
+            tools = [t for t in tools if t["function"]["name"] not in SUBAGENT_TOOL_NAMES
                      and not t["function"]["name"].startswith("browser_")]
         return tools
 
@@ -851,12 +968,15 @@ class Agent:
             "web_search": lambda a: self.web_search_tool(a["query"], a.get("max_results", 5)).to_dict(),
             "git": lambda a: self.git_tool(a["command"], path=a.get("path"), count=a.get("count", 10), message=a.get("message", "")).to_dict(),
             "new_terminal": lambda a: self.new_terminal_tool(a["background"]).to_dict(),
-            "execute_command": lambda a: self.execute_command_tool(a["terminal_id"], a["command"], a.get("timeout"), a.get("is_background")).to_dict(),
-            "read_logs": lambda a: self.read_logs_tool(a["terminal_id"], a["start_line"], a.get("end_line")).to_dict(),
+            "execute_command": lambda a: self.execute_command_tool(a["terminal_id"], a["command"], a.get("timeout"), a.get("is_background"), a.get("until")).to_dict(),
+            "read_logs": lambda a: self.read_logs_tool(a["terminal_id"], a.get("start_line"), a.get("end_line"), a.get("tail")).to_dict(),
+            "stop_command": lambda a: self.stop_command_tool(a["terminal_id"]).to_dict(),
             "close_terminal": lambda a: self.close_terminal_tool(a["terminal_id"]).to_dict(),
             "get_terminal_info": lambda a: self.get_terminal_info_tool(a["terminal_id"]).to_dict(),
-            "spawn_subagent": lambda a: self.subagent_tool.spawn(a["prompt"], a.get("mode", "blocking")).to_dict(),
-            "get_subagent_result": lambda a: self.subagent_tool.get_result(a["subagent_id"]).to_dict(),
+            "spawn_subagent": lambda a: self.subagent_tool.spawn(a["prompt"]).to_dict(),
+            "message_subagent": lambda a: self.subagent_tool.message(a["subagent_id"], a["message"]).to_dict(),
+            "terminate_subagent": lambda a: self.subagent_tool.terminate(a["subagent_id"]).to_dict(),
+            "list_subagents": lambda a: self.subagent_tool.list().to_dict(),
             # Browser tools: schema parameter names match BrowserManager keyword arguments
             **{name: (lambda a, tool=tool: tool(**a).to_dict()) for name, tool in self.browser_tools.items()},
             "browser_screenshot": lambda a: self.browser_screenshot_tool(**a).to_dict(),
@@ -889,6 +1009,12 @@ class Agent:
                 }, max_chars=max_chars),
                 ensure_ascii=False,
             )
+        if name in SUBAGENT_TOOL_NAMES and (self._is_subagent or self.subagent_tool is None):
+            return json.dumps({
+                "success": False,
+                "output": "",
+                "error": "Sub-agents cannot spawn, message, terminate or list sub-agents.",
+            })
 
         try:
             result = dispatch[name](args)
@@ -923,11 +1049,11 @@ class Agent:
         if name == "read_logs": return f"read terminal {args.get('terminal_id', '?')} logs"
         if name == "close_terminal": return f"closed terminal {args.get('terminal_id', '?')}"
         if name == "get_terminal_info": return f"info on terminal {args.get('terminal_id', '?')}"
-        if name == "spawn_subagent":
-            mode = args.get("mode", "blocking")
-            prompt_preview = args.get("prompt", "")[:40]
-            return f"spawn {mode} subagent: {prompt_preview}"
-        if name == "get_subagent_result": return f"get subagent result: {args.get('subagent_id', '?')}"
+        if name == "stop_command": return f"stop command in terminal {args.get('terminal_id', '?')}"
+        if name == "spawn_subagent": return f"spawn subagent: {args.get('prompt', '')[:40]}"
+        if name == "message_subagent": return f"message subagent {args.get('subagent_id', '?')}: {args.get('message', '')[:40]}"
+        if name == "terminate_subagent": return f"terminate subagent {args.get('subagent_id', '?')}"
+        if name == "list_subagents": return "list subagents"
         # Browser tool summaries
         if name == "desktop_doctor": return "check native desktop automation"
         if name == "desktop_list_windows": return "list native desktop windows"
@@ -1641,29 +1767,11 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             else:
                 user_msg = {"role": "user", "content": user_message}
             self.conversation_history.append(user_msg)
-            # Keep completions as a separate user message immediately after
-            # the real user message, preserving both the request and the
-            # asynchronous notification in their natural order.
-            if background_notifications:
-                self.conversation_history.append({
-                    "role": "user",
-                    "content": (
-                        "Background terminal notifications arrived since the previous turn. "
-                        "Process them as context for the user's request:\n\n"
-                        f"{background_notifications}"
-                    ),
-                })
-        elif background_notifications:
-            # If the agent is still in a tool-call loop, deliver completions
-            # before the next API request as a synthetic user event.
-            self.conversation_history.append({
-                "role": "user",
-                "content": (
-                    "Background terminal notifications arrived while you were working. "
-                    "Process them before taking your next step:\n\n"
-                    f"{background_notifications}"
-                ),
-            })
+        # Notifications go in their own "[Background notification]" user
+        # message: after the real user message when there is one, otherwise
+        # before the next API request of a tool-call loop.
+        if background_notifications:
+            self.conversation_history.append({"role": "user", "content": background_notifications})
         normalized_count = self._normalize_history_for_context()
         recovery = self._validate_history_before_api()
         if (normalized_count or recovery) and self.on_compact:
@@ -1805,7 +1913,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                         continue
                     return response if response else "Agent returned without a response."
                 if response:
-                    return response
+                    if self._finish_run_unless_background():
+                        return response
+                    # Background events arrived during the final step: one
+                    # more step shows them to the model instead of a wake.
         except InterruptedError:
             # Convert an interrupted in-memory suffix into the same valid
             # repairable shape used by /resume. This is especially important

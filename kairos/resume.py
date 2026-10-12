@@ -12,7 +12,8 @@ from typing import Any
 
 _SCREENSHOT_PREFIX = "[Screenshot captured"
 _COMPACTION_PREFIX = "[Conversation compacted"
-_BACKGROUND_PREFIX = "Background terminal notifications arrived"
+_BACKGROUND_PREFIX = "Background terminal notifications arrived"  # older saved chats
+_NOTIFICATION_PREFIX = "[Background notification]"  # kairos.wake.NOTIFICATION_PREFIX
 
 
 def _text_content(content: Any) -> str:
@@ -45,7 +46,7 @@ def _is_synthetic_user_message(msg: dict) -> bool:
     if is_screenshot_injection(msg):
         return True
     text = _text_content(msg.get("content", ""))
-    return text.startswith((_COMPACTION_PREFIX, _BACKGROUND_PREFIX))
+    return text.startswith((_COMPACTION_PREFIX, _BACKGROUND_PREFIX, _NOTIFICATION_PREFIX))
 
 
 def _is_real_user_message(msg: dict) -> bool:
