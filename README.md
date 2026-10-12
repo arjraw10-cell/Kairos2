@@ -6,11 +6,11 @@ A minimal personal coding agent in Python.
 
 - **52 Tools**: File operations, terminals, search, web search, git, background sub-agents, skills, a browser automation suite (including console/network inspection), and optional native desktop automation through Cua Driver
 - **Direct Model Access**: Talks to OpenAI (Responses API), OpenRouter or any Chat Completions server, and Anthropic (Messages API) directly; providers, named model setups and API keys live in `provider.json`. Several keys per provider rotate on 401/402/429 with a 60-second cooldown. Model and reasoning effort are chosen per conversation with `/model` and `/effort`.
-- **Gateway**: One gateway process owns conversations (SQLite), Agents, terminals and the browser. The CLI is a client of it; `--offline` runs the agent inside the CLI instead.
+- **Gateway**: One gateway process owns conversations (SQLite), Agents, terminals and the browser. The CLI is a client of it; `--offline` runs the agent inside the CLI instead. It refuses cross-site browser requests, and only one gateway can use a data folder at a time.
 - **Background Work, No Polling**: Sub-agents always run in the background, and background terminal commands notify when they finish or when their output matches a pattern. Results arrive as notifications; if the agent is idle, it is woken to handle them, and the wake turn prints above your prompt without disturbing what you are typing.
 - **Web Search**: Tavily search with a short answer and compact results; when it is unavailable the agent is told to use the browser
 - **Workspaces**: `kairos <path>` or `kairos .` works in a folder; `kairos` alone starts in a fresh folder under `Documents/kairos_workspace`
-- **Absolute Paths**: All file operations use absolute paths — no workspace restrictions
+- **Workspace-relative Paths**: Relative paths in file tools resolve against the conversation's workspace, and terminals start there; absolute paths reach anywhere — no workspace restrictions
 - **Streaming First**: Tokens print as they arrive; no waiting for full responses
 - **Token Aware**: Session, context window, and per-turn token counts displayed after every turn, using provider-reported usage when available and tiktoken estimates otherwise
 - **Auto-Compaction**: History is summarized when the context passes 80% of the budget; estimates include tool schemas and tool-call metadata, and the compaction request itself is bounded
@@ -19,7 +19,7 @@ A minimal personal coding agent in Python.
 - **Skills**: Self-extensible skill system — the agent can create/load skills stored as `SKILL.md` files in the workspace's `skills/` directory
 - **Paste System**: Bracketed paste and Ctrl+V insert text as a `(Pasted Text #1)` token; Alt+V pastes a clipboard image as `(Pasted Image #1)`. Backspace removes a whole token. Copying never counts as pasting.
 - **`/resume`**: Continue a saved conversation from a numbered picker; an interrupted turn is repaired and continued automatically
-- **Immediate Stop**: Esc and Ctrl+C stop the main agent and return to the prompt at once (stream closed, blocking commands killed, browser call cancelled); sub-agents keep running until `/stop`. Interrupted turns stay repairable so the next message continues them.
+- **Immediate Stop**: Esc and Ctrl+C stop the main agent and return to the prompt at once (stream closed, blocking commands killed, browser call cancelled), also while a message is still being sent or auto-compaction is summarizing (your message is kept); sub-agents keep running until `/stop`. Interrupted turns stay repairable so the next message continues them. Text typed while the agent works is pre-filled into the next prompt, never sent on its own.
 - **Bounded Tool Results**: Tool text is capped at 20,000 characters per result (beginning and end kept); images go to the model as vision input, not text
 - **Retries and Clean Errors**: Transient API failures (rate limits, overload, connection errors, 5xx) are retried twice with backoff; a final failure shows a short `API Error` summary without a traceback
 - **Clean CLI**: `rich` and `prompt_toolkit`; one-line banner, model and effort at the right of the prompt, sub-agents in the bottom toolbar, and Markdown tables with rounded boxes and alternating rows
@@ -86,7 +86,7 @@ The Anthropic format is implemented and unit-tested but has not yet been used ag
 | `KAIROS_CONTEXT_WINDOW` | 300000 | Context cap; each model uses min(cap, its `max_context`) and auto-compacts at 80% of that |
 | `KAIROS_MAX_TOOL_RESULT_CHARS` | 20000 | Text cap per tool result |
 | `KAIROS_GATEWAY_HOST` / `KAIROS_GATEWAY_PORT` | 127.0.0.1 / 8765 | Gateway address (CLI and gateway) |
-| `KAIROS_AUTH_TOKEN` | none | Bearer token required by the gateway and sent by the CLI |
+| `KAIROS_AUTH_TOKEN` | none | Bearer token required by the gateway and sent by the CLI; needed to listen on a non-loopback address |
 | `KAIROS_DATA_DIR` | `~/.kairos` | Gateway database folder |
 | `KAIROS_MAX_CONCURRENT_RUNS` | 8 | Runs executing at once across conversations |
 | `KAIROS_RUNTIME_IDLE_SECONDS` | 1800 | Unload idle conversations after this many seconds (0 = never) |
@@ -94,6 +94,10 @@ The Anthropic format is implemented and unit-tested but has not yet been used ag
 | `KAIROS_CUA_DRIVER_PATH` | PATH lookup | `cua-driver` executable or folder |
 
 There is no `.env` file; set these in the environment.
+
+### Gateway security
+
+The gateway listens on `127.0.0.1` by default. Browser requests from other sites (a non-loopback `Origin`) are refused, so a web page cannot drive the agent; the CLI sends no `Origin` and is allowed. Without `KAIROS_AUTH_TOKEN`, requests whose `Host` is not loopback are refused too (DNS rebinding), and the gateway will not start on a non-loopback address. With a token, every request except `/healthz` and `/readyz` must carry it (`Authorization: Bearer`, or `?token=` on the WebSocket, which is kept out of the logs), and any `Host` is accepted. Only one gateway can use a data folder (`<data dir>/gateway.lock`); a second one exits with an error.
 
 ## Usage
 
@@ -104,7 +108,7 @@ kairos C:\path\to\app   # that folder as the workspace
 kairos_offline .        # same, with the agent running inside the CLI (no gateway)
 ```
 
-`kairos.bat` keeps your current folder, checks the gateway's `/healthz`, starts `python -m kairos.gateway_main` in a minimized "Kairos Gateway" window if it is not running, and then opens the CLI. `kairos_offline.bat` runs `main.py --offline`. Without the launchers: `python main.py [path] [--offline]`, and start the gateway yourself with `python -m kairos.gateway_main`.
+`kairos.bat` keeps your current folder, checks the gateway's `/healthz`, starts `python -m kairos.gateway_main` in a minimized "Kairos Gateway" window if it is not running (the window stays open with the error if the gateway fails), waits up to about 30 seconds for it, and then opens the CLI. `kairos_offline.bat` runs `main.py --offline`. Without the launchers: `python main.py [path] [--offline]`, and start the gateway yourself with `python -m kairos.gateway_main`.
 
 Without a path, each conversation gets a new folder such as `Documents/kairos_workspace/2026-10-11_143005`. With a path, `/reset` starts a new conversation in the same folder; without one, in a new folder.
 
@@ -144,7 +148,7 @@ Unknown commands are reported instead of being sent to the agent; a path such as
 
 ### Resume behavior
 
-`/resume` lists saved conversations and loads the one you pick, showing its last reply. If it ended in the middle of a turn, the unfinished tool calls are repaired (missing results become failed results) and the agent continues with "Continue where you left off". In gateway mode conversations live in the gateway database; in offline mode chats are saved per workspace in `~/.kairos/chats/<folder>--<id>/chats.json` (older `<workspace>/chats/chats.json` files are still read), after every turn, every 60 seconds, and when the window closes.
+`/resume` lists saved conversations and loads the one you pick, showing its last reply; when Kairos was started without a path, the conversation continues in its own folder. If it ended in the middle of a turn, the unfinished tool calls are repaired (missing results become failed results) and the agent continues with "Continue where you left off". In gateway mode conversations live in the gateway database; in offline mode chats are saved per workspace in `~/.kairos/chats/<folder>--<id>/chats.json` (older `<workspace>/chats/chats.json` files are still read), after every turn, every 60 seconds (a failed save is logged and retried at the next interval), and when the window closes (on Windows also at logoff or shutdown).
 
 ## Tools
 
@@ -152,15 +156,17 @@ Unknown commands are reported instead of being sent to the agent; a path such as
 
 | Tool | Description |
 |------|-------------|
-| `read(path)` | Read UTF-8 text or supported images (png, jpg, jpeg, gif, webp, bmp, tiff, tif, svg); images are returned as vision data for visual analysis |
-| `write(path, content)` | Write or create a file (parent directories created automatically) |
-| `edit(path, oldText, newText)` | Strict find-and-replace — must match exactly once |
+| `read(path)` | Read UTF-8 text (up to 100 KB; SVG is read as text) or a PNG, JPEG, GIF or WebP image (detected from its content, up to 3,932,160 bytes so the encoded image stays under 5 MB), returned as vision data; other image formats are refused |
+| `write(path, content)` | Write or create a file as UTF-8, byte for byte (parent directories created automatically) |
+| `edit(path, oldText, newText)` | Strict find-and-replace — must match exactly once; keeps the file's line endings (CRLF files stay CRLF) and refuses files that are not UTF-8 |
+
+Relative paths resolve against the conversation's workspace.
 
 ### Search, Web & Git
 
 | Tool | Description |
 |------|-------------|
-| `search(pattern, path?, include?, max_results?, timeout?)` | Regex file content search (like ripgrep) — skips binary files and non-source directories; defaults to a 10-second timeout and returns partial matches if the deadline is reached |
+| `search(pattern, path?, include?, max_results?, timeout?)` | Regex file content search (like ripgrep) in `path` or the workspace — skips binary files and non-source directories; defaults to a 10-second timeout, which also bounds a single slow regex match, and returns partial matches if the deadline is reached |
 | `web_search(query, max_results?)` | Tavily web search: a short answer plus title, URL and snippet per result (1-10 results, default 5). A rate limit is retried once; when Tavily is out of credits, search is disabled until Kairos restarts and the agent is told to use the browser |
 | `git(command, **kwargs)` | Git operations: `status`, `diff`, `log`, `commit`, `branch` |
 
@@ -177,18 +183,18 @@ Tool results are capped before they are stored or sent: 20,000 characters per re
 | `close_terminal(terminal_id)` | Close a terminal and release resources |
 | `get_terminal_info(terminal_id)` | Terminal status (type, closed, line count, pending commands) |
 
-Blocking commands kill their whole process tree on timeout; a missing or invalid timeout is rejected before the command starts. Background shells keep their state (folder, environment) between commands and keep the full output for `read_logs`; notifications include up to 12,000 characters of output.
+Terminals start in the workspace. Blocking commands kill their whole process tree on timeout; a missing or invalid timeout is rejected before the command starts. Background commands get an empty stdin, so a command that reads input gets end-of-file instead of swallowing the shell's next lines. Background shells keep their state (folder, environment) between commands and keep the full output for `read_logs`; notifications include up to 12,000 characters of output.
 
 ### Sub-Agent Tools
 
 | Tool | Description |
 |------|-------------|
 | `spawn_subagent(prompt)` | Start a sub-agent in the background; returns its ID at once |
-| `message_subagent(subagent_id, message)` | Continue a finished sub-agent with its previous context |
+| `message_subagent(subagent_id, message)` | Continue a finished sub-agent with its previous context (after `terminate_subagent`, waits up to 2 s for the stopped run to finish) |
 | `terminate_subagent(subagent_id)` | Stop a running sub-agent (its context is kept) |
 | `list_subagents()` | ID, state, current tool, elapsed time, task and last 3 tool calls of each sub-agent |
 
-Sub-agents use the parent's current model and effort and share its workspace. They have every tool except the browser and the sub-agent tools.
+Sub-agents use the parent's current model and effort and share its workspace. They have every tool except the browser and the sub-agent tools, and their own system prompt that describes only those tools.
 
 ### Skill Tools
 
@@ -198,7 +204,7 @@ Sub-agents use the parent's current model and effort and share its workspace. Th
 | `load_skill(skill_name)` | Load and return a skill's full `SKILL.md` content |
 | `write_skill(skill_name, content, overwrite?)` | Create or update a skill's `SKILL.md` (default: refuses if exists; `overwrite=true` to replace) |
 
-Skills are stored in `skills/<skill-name>/SKILL.md`. Only skill names are injected into the system prompt — full content is loaded on demand via `load_skill`.
+Skills are stored in `skills/<skill-name>/SKILL.md`; the `skills/` folder is created when the first skill is written. Only skill names are injected into the system prompt — full content is loaded on demand via `load_skill`.
 
 ### Browser Tools
 
@@ -217,13 +223,13 @@ The browser is a headed, humanized CloakBrowser that launches automatically on t
 | `browser_press_key(key)` | Press a key or combination (Enter, Escape, Control+A) |
 | `browser_scroll(direction?, pages?, ref?)` | Scroll by viewport heights, optionally inside the pane under `ref` |
 | `browser_wait_for(text?, text_gone?, seconds?, timeout?)` | Wait for text to appear or disappear, or for a number of seconds |
-| `browser_screenshot(full_page?, ref?)` | Screenshot returned as vision data and saved to `~/.kairos/screenshots/` |
+| `browser_screenshot(full_page?, ref?)` | Screenshot returned as vision data and saved to `~/.kairos/screenshots/screenshot_YYYYmmdd_HHMMSS_ffffff.png` |
 | `browser_evaluate(expression, ref?)` | Run JavaScript; an expression or a function (with `ref`, the function receives the element) |
 | `browser_search_page(pattern, regex?, case_sensitive?, max_results?)` | Find text in the page's visible text with context |
 | `browser_tabs(action, index?, url?)` | `list` / `new` / `select` / `close` tabs |
 | `browser_handle_dialog(accept, prompt_text?)` | Answer an open alert/confirm/prompt |
 | `browser_console(index?, errors_only?, max_results?)` | Console messages and uncaught errors of the current page |
-| `browser_network(index?, filter?, max_results?)` | Network requests of the current tab; `index` shows headers and timing |
+| `browser_network(index?, filter?, max_results?)` | Network requests of the current tab (long URLs shortened in the middle); `index` shows headers and timing |
 | `browser_profile(action, name?, proxy?)` | `list` / `use <name>` / `ephemeral`; switching relaunches the browser |
 | `browser_close()` | Close the browser; the next browser tool relaunches it |
 
@@ -233,14 +239,14 @@ Browser features:
 - **Diff snapshots**: actions on the same page return only the snapshot lines that changed (refs are stable across snapshots), so a click on a large page returns a few hundred characters instead of the whole page.
 - **Dialogs**: actions race against `dialog` events. An alert/confirm/prompt is reported to the agent and answered with `browser_handle_dialog`, instead of hanging the call or being silently dismissed.
 - **Stale refs**: a ref that no longer exists fails immediately with a fresh snapshot.
-- **Lazy launch and recovery**: the browser starts on the first call, a failed launch can be retried, and closing the window by hand makes the next call relaunch.
+- **Lazy launch and recovery**: the browser starts on the first call, a failed or cancelled launch (Esc, timeout) releases its profile and can be retried, and closing the window by hand makes the next call relaunch.
 - **Persistent profiles**: `browser_profile use <name>` keeps cookies and logins under `~/.kairos/profiles/<name>` and pins a fingerprint seed in `.kairos-browser.json`, so a logged-in identity always presents the same device. A profile can be open in only one browser at a time; a second conversation gets a clear error.
 - **New tabs**: when an action opens a tab, Kairos switches to it and says so.
 - **Console and network**: network requests are captured from tab creation with status, timing and headers. CloakBrowser suppresses the live console stream (enabling the CDP Runtime domain is a bot signal), so `browser_console` briefly enables it on demand, which makes Chrome replay the current page's console messages and uncaught exceptions.
 
 ### Native desktop tools
 
-When `cua-driver` is installed, Kairos also exposes native desktop automation through Cua Driver. Use `desktop_window_state(pid, window_id)` before interacting with a window and again afterward to verify the result. Accessibility `element_index` values from the latest state are the primary interaction method for supported actions; pixel coordinates are required for cursor movement and dragging. If both addressing forms are accidentally supplied, Kairos prefers the accessibility address to match Cua's mutually exclusive contract. Kairos maps drag coordinates to Cua's `from_x/from_y/to_x/to_y` fields, supplies scroll defaults, maps `activate_window` to `bring_to_front`, and reports minimize/maximize/close as unsupported because the current driver does not expose those tools. Desktop tools are available to sub-agents. Set `KAIROS_CUA_DRIVER_PATH` to override PATH discovery; on Windows the official per-user install under `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin` is also checked. The Cua daemon starts when a desktop tool is first used.
+When `cua-driver` is installed, Kairos also exposes native desktop automation through Cua Driver. Use `desktop_window_state(pid, window_id)` before interacting with a window and again afterward to verify the result. Accessibility `element_index` values from the latest state are the primary interaction method for supported actions; pixel coordinates are required for cursor movement and dragging. If both addressing forms are accidentally supplied, Kairos prefers the accessibility address to match Cua's mutually exclusive contract. Kairos maps drag coordinates to Cua's `from_x/from_y/to_x/to_y` fields, supplies scroll defaults, maps `activate_window` to `bring_to_front`, and reports minimize/maximize/close as unsupported because the current driver does not expose those tools. Desktop tools are available to sub-agents. Set `KAIROS_CUA_DRIVER_PATH` to override PATH discovery; on Windows the official per-user install under `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin` is also checked. The Cua daemon starts when a desktop tool is first used; its error output goes to `~/.kairos/cua-driver.log`.
 
 | Tool | Description |
 |------|-------------|
@@ -265,7 +271,6 @@ gateway_main.py             # Gateway entry point
 kairos.bat                  # CLI launcher; starts the gateway when needed
 kairos_offline.bat          # CLI launcher without the gateway
 provider.example.json       # Template for provider.json (models, keys)
-run_temp_cli.py             # Legacy Textual frontend launcher
 kairos/
 ├── main.py                 # CLI: arguments, REPL, commands, gateway and offline backends
 ├── cli.py                  # Terminal UI (streaming panel, wake output above the prompt, toolbar, paste)
@@ -281,7 +286,6 @@ kairos/
 ├── terminal_manager.py     # Terminals (blocking, background, until, stop)
 ├── browser_manager.py      # CloakBrowser via async Playwright on a worker thread
 ├── desktop_manager.py      # Cua Driver integration
-├── temp_cli.py             # Legacy Textual frontend
 └── tools/                  # read, write, edit, search, web_search, git, terminal, subagent,
                             # browser, desktop, skills, session
 tests/                      # unittest/pytest suites and tests/run_gateway_tests.py
@@ -312,7 +316,7 @@ Kairos auto-loads an `AGENTS.md` file from the workspace root into the system pr
 ## Design Principles
 
 1. **Streaming First** — Tokens print as they arrive; no waiting for full response
-2. **Absolute Paths** — No workspace containment, just use full paths
+2. **Workspace-relative, not contained** — Relative paths resolve against the workspace; absolute paths reach anywhere
 3. **One Tool Per File** — Easy to add new tools
 4. **Interruptible** — Esc and Ctrl+C stop the main agent and hand control back at once; `/stop` stops sub-agents
 5. **Never Poll** — Background work reports back through notifications and wakes
@@ -328,7 +332,7 @@ python -m pytest tests                    # also runs the pytest-style gateway t
 python tests/run_gateway_tests.py         # dependency-light gateway checks
 ```
 
-The suites cover the provider adapters and key rotation, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway, desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it). No test calls a live model.
+The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 177 unittest tests, 18 skipped). No test calls a live model.
 
 ## License
 
