@@ -367,6 +367,8 @@ class FakeClient:
                 {"name": "fast", "provider": "openai", "model": "gpt-5-mini"},
                 {"name": "smart", "provider": "anthropic", "model": "claude-opus"},
             ], "default_setup": "fast"}
+        if command == "subagent.stop_all":
+            return {"stopped": 3}
         if command == "conversation.configure":
             payload = payload or {}
             if "setup" in payload:
@@ -443,6 +445,9 @@ class FakeOfflineAgent:
         self.browser_manager = SimpleNamespace(is_open=False)
         self.subagent_tool = SimpleNamespace()
         self.configured = []
+        self.received = []
+        self.stopped_subagents = 0
+        self.interrupts = 0
         self._stop = threading.Event()
 
     @staticmethod
@@ -452,10 +457,18 @@ class FakeOfflineAgent:
     def get_history(self):
         return list(self.conversation_history)
 
+    def stop_subagents(self):
+        self.stopped_subagents += 1
+        return 2
+
+    def list_subagents(self):
+        return []
+
     def run(self, text, image_url=None):
+        self.received.append(text)
         self.on_tool_call("read", {"path": "a"})
         self.on_stream_start()
-        if text == "slow":
+        if text.endswith("slow"):  # also a wake turn for a "slow" notification
             self.on_stream_token("partial")
             self._stop.wait(10)
             self.on_stream_end("", False)
@@ -467,6 +480,7 @@ class FakeOfflineAgent:
         return "done"
 
     def interrupt(self):
+        self.interrupts += 1
         self._stop.set()
 
     def compact(self):
@@ -485,7 +499,27 @@ class FakeOfflineAgent:
         return {"setup": "fast", "provider": "openai", "model": "m", "effort": "low", "reasoning_efforts": ["low"]}
 
 
-class OfflineBackendTests(unittest.TestCase):
+class FakeScheduler:
+    """kairos.wake.WakeScheduler stand-in (subagent D's contract)."""
+
+    def __init__(self, start_wake, is_idle, debounce=2.0, cap=10, on_paused=None):
+        self.start_wake, self.is_idle, self.on_paused = start_wake, is_idle, on_paused
+        self.pushed, self.pending, self.user_messages = [], [], 0
+
+    def push(self, event):
+        self.pushed.append(event)
+
+    def take_pending(self):
+        pending, self.pending = self.pending, []
+        return pending
+
+    def user_message_sent(self):
+        self.user_messages += 1
+
+
+class OfflineCase(unittest.TestCase):
+    """Stubs the Agent, kairos.workspaces and kairos.wake for OfflineBackend."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -502,6 +536,7 @@ class OfflineBackendTests(unittest.TestCase):
         stubs = {
             "kairos.workspaces": types.SimpleNamespace(new_workspace=new_workspace),
             "kairos.agent": types.SimpleNamespace(Agent=FakeOfflineAgent),
+            "kairos.wake": types.SimpleNamespace(WakeScheduler=FakeScheduler),
         }
         saved = {name: sys.modules.get(name) for name in stubs}
         sys.modules.update(stubs)
@@ -520,6 +555,8 @@ class OfflineBackendTests(unittest.TestCase):
             else:
                 os.environ[key] = value
 
+
+class OfflineBackendTests(OfflineCase):
     def test_run_escape_reset_and_resume(self):
         backend = kmain.OfflineBackend(None)
         self.assertEqual(Path(backend.workspace), self.created[0])
@@ -545,6 +582,351 @@ class OfflineBackendTests(unittest.TestCase):
         last, mid_execution = backend.resume(sessions[0]["id"])
         self.assertEqual(last, "done")
         backend.close()
+
+
+# ---------------------------------------------------------------------- #
+#  Background work: wake turns, sub-agent status, /stop                    #
+# ---------------------------------------------------------------------- #
+
+SUBAGENT_DONE = {"id": "n1", "kind": "subagent_finished", "subagent_id": "a3f2", "text": "sub-agent a3f2 result: 42", "created_at": "t"}
+TERMINAL_HIT = {"id": "n2", "kind": "terminal_matched", "terminal_id": 2, "text": "terminal 2 printed READY", "created_at": "t"}
+
+
+def _wait_for(condition, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition not reached")
+        time.sleep(0.01)
+
+
+class BackgroundRenderingTests(unittest.TestCase):
+    def test_wake_turn_header_reply_and_end(self):
+        cli, out = _recording_cli(width=100)
+        cli.handle_event("wake.started", {"notifications": [SUBAGENT_DONE, TERMINAL_HIT]})
+        self.assertTrue(cli._wake)
+        cli.handle_event("tool.started", {"name": "read", "summary": "read C:/result.txt"})
+        cli.handle_event("assistant.stream_started", {})
+        cli.handle_event("assistant.token", {"delta": "The sub-agent found 42."})
+        cli.handle_event("assistant.stream_ended", {"content": "The sub-agent found 42.", "has_tool_calls": False})
+        cli.handle_event("wake.ended", {"outcome": "completed", "payload": "The sub-agent found 42."})
+        text = out.getvalue()
+        self.assertIn("» woke: sub-agent a3f2 finished, terminal 2 matched", text)
+        self.assertIn("→ read C:/result.txt", text)
+        self.assertEqual(text.count("The sub-agent found 42."), 1)  # not printed twice
+        self.assertFalse(cli._wake)
+        self.assertFalse(cli._skip_print_response)
+
+    def test_stopped_wake_and_generic_header(self):
+        cli, out = _recording_cli(width=100)
+        cli.handle_event("wake.started", {"notifications": []})
+        cli.handle_event("assistant.stream_started", {})
+        cli.handle_event("assistant.token", {"delta": "half an answer"})
+        cli.handle_event("wake.ended", {"outcome": "interrupted"})
+        cli.handle_event("wake.ended", {"outcome": "interrupted"})  # ignored: already ended
+        text = out.getvalue()
+        self.assertIn("» woke: background work finished", text)
+        self.assertIn("half an answer", text)  # the stopped reply stays as a grey trace
+        self.assertEqual(text.count("Interrupted."), 1)
+        self.assertIsNone(cli._live)
+
+    def test_paused_line(self):
+        cli, out = _recording_cli(width=100)
+        cli.handle_event("wake.paused", {"conversation_id": "c", "pending": 3})
+        cli.handle_event("wake.paused", {"conversation_id": "c", "pending": 1})
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines, [
+            "paused auto-wake: 3 background results will be sent with your next message",
+            "paused auto-wake: 1 background result will be sent with your next message",
+        ])
+
+    def test_subagent_status_lines_in_the_toolbar(self):
+        cli, out = _recording_cli()
+        session = cli._prompt_session
+        status = {"conversation_id": "c", "subagent_id": "a3f2", "state": "running", "current_tool": "read",
+                  "elapsed_s": 65, "prompt": "find it"}
+        cli.handle_event("subagent.status", status)
+        cli.handle_event("subagent.status", {**status, "subagent_id": "b7c1", "current_tool": None, "elapsed_s": 3})
+        self.assertEqual(session.bottom_toolbar, cli._toolbar)
+        lines = cli._toolbar()[0][1].splitlines()
+        self.assertEqual(lines, ["●  a3f2  running  read  1m05s", "●  b7c1  running  3s"])
+        # Elapsed time keeps counting between status events.
+        cli._subagents["b7c1"]["_seen"] -= 10
+        self.assertEqual(cli._toolbar()[0][1].splitlines()[1], "●  b7c1  running  13s")
+        cli.handle_event("subagent.status", {**status, "state": "idle"})
+        self.assertEqual(list(cli._subagents), ["b7c1"])
+        cli.handle_event("subagent.status", {**status, "subagent_id": "b7c1", "state": "terminated"})
+        self.assertIsNone(session.bottom_toolbar)
+        cli.handle_event("subagent.list", {"subagents": [status]})
+        self.assertEqual(list(cli._subagents), ["a3f2"])
+        cli.handle_event("subagent.list", {"subagents": []})
+        self.assertIsNone(session.bottom_toolbar)
+        self.assertEqual(out.getvalue(), "")  # no sub-agent text is printed
+
+
+class StopCommandTests(OfflineCase):
+    def test_stop_through_the_gateway(self):
+        client = FakeClient()
+        backend = kmain.GatewayBackend(None, client)
+        cli, out = _recording_cli(width=100)
+        self.assertFalse(kmain.handle_command(cli, backend, "/stop", []))
+        self.assertIn(("subagent.stop_all", "conv1", {"conversation_id": "conv1"}), client.requests)
+        self.assertIn("Stopped 3 sub-agents.", out.getvalue())
+        self.assertIn("/stop", kmain.COMMANDS)
+
+    def test_stop_offline(self):
+        backend = kmain.OfflineBackend(None)
+        cli, out = _recording_cli(width=100)
+        kmain.handle_command(cli, backend, "/stop", [])
+        self.assertEqual(backend.agent.stopped_subagents, 1)
+        self.assertIn("Stopped 2 sub-agents.", out.getvalue())
+
+
+class OfflineWakeTests(OfflineCase):
+    def setUp(self):
+        super().setUp()
+        self.backend = kmain.OfflineBackend(None)
+        self.addCleanup(self.backend.close)
+        self.events = []
+        self.backend.start_background(lambda name, data: self.events.append((name, data)))
+        self.scheduler = self.backend._scheduler
+        self.agent = self.backend.agent
+
+    def names(self):
+        return [name for name, _ in self.events]
+
+    def test_scheduler_wiring(self):
+        self.assertIsInstance(self.scheduler, FakeScheduler)
+        self.agent.on_background_event(SUBAGENT_DONE)
+        self.assertEqual(self.scheduler.pushed, [SUBAGENT_DONE])
+        self.assertTrue(self.scheduler.is_idle())
+        self.agent.on_subagent_status({"subagent_id": "a3f2", "state": "running"})
+        self.scheduler.on_paused(2)
+        self.assertEqual(self.events, [
+            ("subagent.status", {"subagent_id": "a3f2", "state": "running"}),
+            ("wake.paused", {"pending": 2}),
+        ])
+
+    def test_wake_turn_renders_like_a_run(self):
+        self.scheduler.start_wake([SUBAGENT_DONE])
+        _wait_for(lambda: "wake.ended" in self.names())
+        self.assertEqual(self.events[0], ("wake.started", {"notifications": [SUBAGENT_DONE]}))
+        self.assertEqual(self.names()[1:4], ["tool.started", "assistant.stream_started", "assistant.token"])
+        self.assertEqual(self.events[-1], ("wake.ended", {"outcome": "completed", "payload": "done"}))
+        message = self.agent.received[-1]
+        self.assertTrue(message.startswith(kmain.WAKE_INSTRUCTION))
+        self.assertIn("sub-agent a3f2 result: 42", message)
+        # /resume does not mistake the wake message for something the user typed.
+        from kairos.resume import _is_synthetic_user_message
+        self.assertTrue(_is_synthetic_user_message({"role": "user", "content": message}))
+
+    def test_one_run_at_a_time_and_pending_results_join_the_next_message(self):
+        stop = threading.Event()
+        started = threading.Event()
+        idle_during_run = []
+
+        def on_event(name, data):
+            if name == "assistant.token":
+                idle_during_run.append(self.scheduler.is_idle())
+                started.set()
+
+        self.scheduler.pending = [TERMINAL_HIT]
+        outcome = self.backend.run("hi", None, stop, on_event)
+        self.assertEqual(outcome, ("completed", "done"))
+        self.assertEqual(idle_during_run, [False])
+        self.assertEqual(self.scheduler.user_messages, 1)
+        self.assertTrue(self.agent.received[-1].startswith("hi\n\n" + kmain.PENDING_INSTRUCTION))
+        self.assertIn("terminal 2 printed READY", self.agent.received[-1])
+        _wait_for(self.scheduler.is_idle)
+
+        # A wake that fires while a user turn runs waits for it.
+        thread = threading.Thread(target=self.backend.run, args=("slow", None, threading.Event(), lambda *_: None))
+        thread.start()
+        _wait_for(lambda: not self.scheduler.is_idle())
+        self.scheduler.start_wake([SUBAGENT_DONE])
+        time.sleep(0.2)
+        self.assertNotIn("wake.started", self.names())
+        self.agent.interrupt()  # end the slow turn
+        thread.join(5)
+        _wait_for(lambda: "wake.ended" in self.names())
+
+    def test_esc_stops_the_wake_turn_once_and_the_agent_is_free_again(self):
+        self.agent._stop.clear()
+        self.scheduler.start_wake([{"kind": "subagent_finished", "subagent_id": "x", "text": "slow"}])
+        _wait_for(lambda: "assistant.token" in self.names())
+        self.assertTrue(self.backend.stop_wake())
+        self.assertFalse(self.backend.stop_wake())
+        self.assertEqual(self.events[-1], ("wake.ended", {"outcome": "interrupted", "payload": None}))
+        self.assertEqual(self.agent.interrupts, 1)
+        _wait_for(self.scheduler.is_idle)
+        self.assertEqual(self.names().count("wake.ended"), 1)
+        self.agent._stop.clear()
+        self.assertEqual(self.backend.run("hi", None, threading.Event(), lambda *_: None)[0], "completed")
+
+    def test_esc_while_a_wake_turn_holds_the_agent_drops_the_message(self):
+        self.agent._stop.clear()
+        self.scheduler.start_wake([{"kind": "subagent_finished", "subagent_id": "x", "text": "slow"}])
+        _wait_for(lambda: "assistant.token" in self.names())
+        stop = threading.Event()
+        threading.Timer(0.2, stop.set).start()
+        self.assertEqual(self.backend.run("hi", None, stop, lambda *_: None), ("interrupted", None))
+        self.assertNotIn("hi", self.agent.received)
+        self.assertEqual(self.agent.interrupts, 0)  # the wake turn keeps going
+        self.backend.stop_wake()
+
+
+class GatewayWakeTests(unittest.TestCase):
+    def setUp(self):
+        self.client = FakeClient()
+        self.backend = kmain.GatewayBackend(None, self.client)
+        self.events = []
+        self.backend._view = lambda name, data: self.events.append((name, data))
+
+    def feed(self, name, data=None, run_id=None, conversation_id="conv1"):
+        self.backend._background({"event": name, "data": data or {}, "run_id": run_id, "conversation_id": conversation_id})
+
+    def test_wake_run_is_rendered_with_a_header_from_the_notifications(self):
+        self.feed("background.notification", {"notifications": [SUBAGENT_DONE]})
+        self.feed("background.notification", {"notifications": [TERMINAL_HIT]})
+        self.feed("run.queued", {"origin": "wake"}, "run_w")
+        self.feed("run.started", {"origin": "wake", "run": {"id": "run_w"}}, "run_w")
+        self.feed("assistant.token", {"delta": "hi"}, "run_w")
+        self.feed("assistant.token", {"delta": "other client"}, "run_other")
+        self.feed("subagent.status", {"subagent_id": "a3f2", "state": "idle"})
+        self.feed("wake.paused", {"pending": 1})
+        self.feed("subagent.status", {"subagent_id": "zz", "state": "running"}, conversation_id="old_conv")
+        self.feed("run.completed", {"response": "ok"}, "run_w")
+        self.assertEqual(self.events, [
+            ("wake.started", {"notifications": [SUBAGENT_DONE, TERMINAL_HIT]}),
+            ("assistant.token", {"delta": "hi"}),
+            ("subagent.status", {"subagent_id": "a3f2", "state": "idle"}),
+            ("wake.paused", {"pending": 1}),
+            ("wake.ended", {"outcome": "completed", "payload": "ok"}),
+        ])
+        self.assertEqual(self.backend._notes, [])
+
+    def test_user_runs_are_not_wake_runs_and_sending_clears_notes(self):
+        self.feed("background.notification", {"notifications": [SUBAGENT_DONE]})
+        self.feed("run.started", {"origin": "user"}, "run_u")
+        self.feed("assistant.token", {"delta": "x"}, "run_u")
+        self.assertEqual(self.events, [])
+        self.client.request = lambda *a, **k: {"run_id": "run_mine"}
+        self.client.next_event = lambda timeout: {"event": "run.completed", "run_id": "run_mine", "data": {"response": "r"}}
+        self.assertEqual(self.backend.run("hi", None, threading.Event(), lambda *_: None), ("completed", "r"))
+        self.assertEqual(self.backend._notes, [])
+
+    def test_esc_interrupts_the_wake_run_and_drops_its_output(self):
+        self.feed("run.started", {"origin": "wake"}, "run_w")
+        self.assertTrue(self.backend.stop_wake())
+        self.assertFalse(self.backend.stop_wake())
+        self.assertEqual(self.events[-1], ("wake.ended", {"outcome": "interrupted", "payload": None}))
+        self.feed("assistant.token", {"delta": "late"}, "run_w")
+        self.feed("run.interrupted", {}, "run_w")
+        self.assertEqual([name for name, _ in self.events], ["wake.started", "wake.ended"])
+        _wait_for(lambda: ("run.interrupt", "conv1", {"run_id": "run_w"}) in self.client.requests)
+        self.assertFalse(self.backend._abandoned)  # its end event arrived
+
+    def test_wake_output_while_waiting_for_an_own_queued_run(self):
+        queue_ = [
+            {"event": "run.started", "run_id": "run_w", "conversation_id": "conv1", "data": {"origin": "wake"}},
+            {"event": "assistant.token", "run_id": "run_w", "conversation_id": "conv1", "data": {"delta": "w"}},
+            {"event": "run.completed", "run_id": "run_w", "conversation_id": "conv1", "data": {"response": "w"}},
+            {"event": "assistant.token", "run_id": "run_mine", "conversation_id": "conv1", "data": {"delta": "m"}},
+            {"event": "run.completed", "run_id": "run_mine", "conversation_id": "conv1", "data": {"response": "m"}},
+        ]
+        self.client.request = lambda *a, **k: {"run_id": "run_mine"}
+        self.client.next_event = lambda timeout: queue_.pop(0) if queue_ else None
+        own = []
+        outcome = self.backend.run("hi", None, threading.Event(), lambda name, data: own.append(name))
+        self.assertEqual(outcome, ("completed", "m"))
+        self.assertEqual(own, ["assistant.token"])
+        self.assertEqual([name for name, _ in self.events], ["wake.started", "assistant.token", "wake.ended"])
+
+    def test_subagents_are_listed_when_background_starts_and_on_reset(self):
+        self.client.next_event = lambda timeout: time.sleep(timeout)
+        self.backend._view = None
+        self.backend.start_background(lambda name, data: self.events.append((name, data)))
+        self.addCleanup(setattr, self.client, "closed", True)
+        self.assertEqual(self.events, [("subagent.list", {"subagents": []})])
+        self.backend.reset()
+        self.assertEqual(self.events[-1], ("subagent.list", {"subagents": []}))
+        self.assertEqual(sum(1 for c, _, _ in self.client.requests if c == "subagent.list"), 2)
+
+
+class PromptCoexistenceTests(unittest.TestCase):
+    """Background output prints above an open prompt; typed text survives."""
+
+    def test_wake_output_above_the_prompt_keeps_the_typed_text(self):
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.data_structures import Size
+        from prompt_toolkit.input import create_pipe_input
+        from prompt_toolkit.output.vt100 import Vt100_Output
+
+        class Screen(Vt100_Output):
+            # A real console knows the rows below the cursor; the toolbar
+            # is drawn only then.
+            def get_rows_below_cursor_position(self):
+                return 20
+
+        screen = io.StringIO()
+        with create_pipe_input() as pipe, create_app_session(
+            input=pipe, output=Screen(screen, lambda: Size(rows=40, columns=90), enable_cpr=False)
+        ):
+            cli = CLI()
+            cli.console = Console(file=io.StringIO(), width=90, color_system=None)
+            escapes = []
+            cli.on_prompt_escape = lambda: escapes.append(True) or cli.handle_event(
+                "wake.ended", {"outcome": "interrupted"})
+            seen = {}
+            buffer = cli._prompt_session.default_buffer
+            app = cli._prompt_session.app
+
+            def background():
+                try:
+                    _wait_for(lambda: app.is_running)
+                    pipe.send_text("hello wor")
+                    _wait_for(lambda: buffer.text == "hello wor")
+                    cli.handle_event("subagent.status", {"subagent_id": "a3f2", "state": "running",
+                                                         "current_tool": "search", "elapsed_s": 5})
+                    cli.handle_event("wake.started", {"notifications": [SUBAGENT_DONE]})
+                    cli.handle_event("tool.started", {"name": "read", "summary": "read C:/notes.txt"})
+                    cli.handle_event("assistant.stream_started", {})
+                    for word in "Wake answer: the sub-agent found 42".split():
+                        cli.handle_event("assistant.token", {"delta": word + " "})
+                    _wait_for(lambda: "Wake answer" in "".join(t for _, t, *_ in cli._render_preview()))
+                    cli.handle_event("assistant.stream_ended", {"content": "Wake answer: **the sub-agent found 42**",
+                                                                "has_tool_calls": False})
+                    cli.handle_event("wake.ended", {"outcome": "completed", "payload": "x"})
+                    _wait_for(lambda: "the sub-agent found 42" in screen.getvalue())
+                    seen["after_output"] = (buffer.text, buffer.cursor_position)
+                    # Esc stops a running wake turn (and only then).
+                    cli.handle_event("wake.started", {"notifications": [TERMINAL_HIT]})
+                    pipe.send_text("\x1b")
+                    _wait_for(lambda: escapes)
+                    _wait_for(lambda: "Interrupted." in screen.getvalue())
+                    seen["after_escape"] = buffer.text
+                    pipe.send_text("ld\r")
+                except Exception as exc:  # surface failures in the main thread
+                    seen["error"] = exc
+                    app.exit(result="")
+
+            helper = threading.Thread(target=background, daemon=True)
+            helper.start()
+            result = cli.get_user_input()
+            helper.join(5)
+
+        self.assertNotIn("error", seen, seen.get("error"))
+        self.assertEqual(seen["after_output"], ("hello wor", 9))
+        self.assertEqual(seen["after_escape"], "hello wor")
+        self.assertEqual(result, "hello world")
+        text = screen.getvalue()
+        self.assertIn("» woke: sub-agent a3f2 finished", text)
+        self.assertIn("→ read C:/notes.txt", text)
+        self.assertIn("the sub-agent found 42", text)
+        self.assertIn("a3f2  running  search", text)  # the toolbar line
+        self.assertEqual(len(escapes), 1)
+        self.assertFalse(cli._wake)
+        self.assertIsNone(cli._above)
 
 
 if __name__ == "__main__":

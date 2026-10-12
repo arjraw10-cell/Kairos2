@@ -12,6 +12,7 @@ import signal
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -25,10 +26,39 @@ from kairos.resume import sanitize_history_for_resume
 # helper from kairos.main before the shared resume module was introduced.
 _sanitize_history_for_resume = sanitize_history_for_resume
 
-COMMANDS = ("/quit", "/clear", "/reset", "/compact", "/resume", "/model", "/effort")
+COMMANDS = ("/quit", "/clear", "/reset", "/compact", "/resume", "/model", "/effort", "/stop")
 PROVIDERS = ("openai", "anthropic", "openrouter")
 CONTINUE_INSTRUCTION = "Continue where you left off. Pick up the next step."
 _RUN_ENDED = frozenset(("run.completed", "run.interrupted", "run.failed", "run.cancelled"))
+# Offline wake turns and pending results use the agent's notification
+# wording; the "Background terminal notifications arrived" prefix is what
+# kairos.resume treats as an internal (not user-typed) message.
+WAKE_INSTRUCTION = (
+    "Background terminal notifications arrived while you were idle (from the "
+    "sub-agents and background terminals you started). The user has not sent "
+    "a new message. Process them and continue:"
+)
+PENDING_INSTRUCTION = (
+    "Background terminal notifications arrived since the previous turn. "
+    "Process them as context for the user's request:"
+)
+
+
+def _notification_texts(notifications: list[dict]) -> str:
+    return "\n\n".join(str(n.get("text") or "") for n in notifications)
+
+
+def _run_outcome(name: str, data: dict) -> tuple[str, str | None]:
+    """``(outcome, payload)`` for a gateway run-ended event."""
+    if name == "run.completed":
+        return "completed", data.get("response")
+    if name == "run.failed":
+        return "failed", data.get("error") or "Run failed."
+    return "interrupted", None
+
+
+def _origin(data: dict) -> str | None:
+    return data.get("origin") or (data.get("run") or {}).get("origin")
 
 
 def _resolve_paste_input(user_input: str) -> tuple[str, str | None]:
@@ -118,6 +148,7 @@ def _remember(configured: dict, changes: dict) -> None:
 
 
 def _close_agent(agent) -> None:
+    agent.stop_subagents()
     for terminal_id in list(agent.terminal_manager.terminals):
         agent.terminal_manager.close_terminal(terminal_id)
     if agent.browser_manager.is_open:
@@ -153,8 +184,16 @@ class OfflineBackend:
         self._configured: dict = {}
         self._on_event = None
         self._muted = False
-        self._worker: threading.Thread | None = None
         self._save_lock = threading.Lock()
+        # One agent run (user or wake) or agent command at a time. A run's
+        # worker releases it when the run has really finished, so a run
+        # stopped with Esc still reaches its cleanup before the next one.
+        self._agent_lock = threading.Lock()
+        self._view = None  # renders background events (CLI.handle_event)
+        self._scheduler = None
+        self._wake_lock = threading.Lock()
+        self._waking = False
+        self._closed = False
         self.agent = self._new_agent(workspace)
 
     def _new_agent(self, workspace: str):
@@ -186,19 +225,85 @@ class OfflineBackend:
         # Background completions show immediately; the agent also keeps them
         # queued for the next API turn.
         agent.on_background_notification = lambda message: emit("terminal.completed", {"message": message})
-        subagents = agent.subagent_tool
-        subagents._tool_printer = lambda summary: emit("tool.started", {"name": "subagent", "summary": summary})
-        subagents._stream_start = lambda: emit("assistant.stream_started", {"subagent": True})
-        subagents._stream_token = lambda token: emit("assistant.token", {"delta": token, "subagent": True})
-        subagents._stream_end = lambda text, has_tools: emit(
-            "assistant.stream_ended", {"content": text, "has_tool_calls": has_tools, "subagent": True}
-        )
-        subagents._token_update = lambda subagent_id, counter: emit(
-            "token.updated", {**tokens(counter), "subagent_id": subagent_id}
-        )
+        # Finished background work wakes the agent; sub-agents report status
+        # lines instead of streaming their text.
+        agent.on_background_event = self._on_background_event
+        agent.on_subagent_status = lambda status: self._show("subagent.status", status)
         if self._configured:
             self._apply(agent, **self._configured)
         return agent
+
+    # -- background work: wake turns -------------------------------------- #
+
+    def start_background(self, on_event) -> None:
+        """Render background work through *on_event* and wake the agent."""
+        from kairos.wake import WakeScheduler
+
+        self._view = on_event
+        self._scheduler = WakeScheduler(
+            start_wake=self._start_wake,
+            is_idle=lambda: not self._agent_lock.locked(),
+            on_paused=lambda pending: self._show("wake.paused", {"pending": pending}),
+        )
+
+    def _show(self, event: str, data: dict) -> None:
+        if self._view:
+            self._view(event, data)
+
+    def _on_background_event(self, event: dict) -> None:
+        if self._scheduler is not None:
+            self._scheduler.push(event)
+
+    def _start_wake(self, events: list[dict]) -> None:
+        # Called on the scheduler's thread; the turn runs on its own thread.
+        threading.Thread(target=self._wake, args=(list(events),), daemon=True).start()
+
+    def _wake(self, events: list[dict]) -> None:
+        with self._agent_lock:  # waits for a user turn that started meanwhile
+            if self._closed:
+                return
+            with self._wake_lock:
+                self._waking = True
+                self._on_event, self._muted = self._view, False
+            self._show("wake.started", {"notifications": events})
+            result: dict = {}
+            try:
+                result["response"] = self.agent.run(f"{WAKE_INSTRUCTION}\n\n{_notification_texts(events)}")
+            except Exception as exc:
+                result["error"] = exc
+            try:
+                self.save()
+            finally:
+                self._end_wake(*self._outcome(result))
+
+    def _end_wake(self, outcome: str, payload: str | None) -> bool:
+        """Report the wake turn's end once (it ends, or Esc stops it)."""
+        with self._wake_lock:
+            if not self._waking:
+                return False
+            self._waking = False
+        self._show("wake.ended", {"outcome": outcome, "payload": payload})
+        return True
+
+    def stop_wake(self) -> bool:
+        """Esc at the prompt: stop the main agent's wake turn, not sub-agents."""
+        with self._wake_lock:
+            if not self._waking:
+                return False
+            self._waking = False
+            self._muted = True  # the prompt is already back; drop the rest
+        self._show("wake.ended", {"outcome": "interrupted", "payload": None})
+        self.agent.interrupt()
+        return True
+
+    def stop_subagents(self) -> int:
+        return self.agent.stop_subagents()
+
+    def _forget_pending(self) -> None:
+        """A new or resumed conversation must not get the old one's results."""
+        if self._scheduler is not None:
+            self._scheduler.take_pending()
+        self._show("subagent.list", {"subagents": self.agent.list_subagents()})
 
     @staticmethod
     def _apply(agent, setup=None, model=None, provider=None, effort=None) -> None:
@@ -212,19 +317,39 @@ class OfflineBackend:
         if not self._muted and self._on_event:
             self._on_event(event, data)
 
-    def _wait_previous(self) -> None:
-        """Let a run stopped with Esc reach its cleanup before reusing the Agent."""
-        if self._worker is not None:
-            self._worker.join()
-            self._worker = None
-            self.save()
-
     def save(self) -> None:
         with self._save_lock:
             self.sessions.save_chat(self.agent.get_history())
 
+    @staticmethod
+    def _outcome(result: dict) -> tuple[str, str | None]:
+        if "error" in result:
+            return "failed", _error_text(result["error"])
+        response = result.get("response") or ""
+        if response == "[Interrupted]" or response.startswith("[Stopped"):
+            return "interrupted", None
+        return "completed", response
+
+    def _acquire(self, stop: threading.Event) -> bool:
+        """Take the agent once a wake turn is done; False if Esc came first."""
+        while True:
+            try:
+                if self._agent_lock.acquire(timeout=0.05):
+                    return True
+                if stop.is_set():
+                    return False
+            except KeyboardInterrupt:
+                stop.set()
+
     def run(self, text: str, image_url: str | None, stop: threading.Event, on_event):
-        self._wait_previous()
+        if not self._acquire(stop):
+            return "interrupted", None
+        if self._scheduler is not None:
+            # A user message resets auto-wake and carries results not yet sent.
+            self._scheduler.user_message_sent()
+            pending = self._scheduler.take_pending()
+            if pending:
+                text = f"{text}\n\n{PENDING_INSTRUCTION}\n\n{_notification_texts(pending)}"
         self._on_event, self._muted = on_event, False
         result: dict = {}
 
@@ -233,9 +358,13 @@ class OfflineBackend:
                 result["response"] = self.agent.run(text, image_url=image_url)
             except Exception as exc:
                 result["error"] = exc
+            finally:
+                try:
+                    self.save()
+                finally:
+                    self._agent_lock.release()
 
         worker = threading.Thread(target=work, daemon=True)
-        self._worker = worker
         worker.start()
         while worker.is_alive():
             try:
@@ -244,57 +373,52 @@ class OfflineBackend:
             except KeyboardInterrupt:
                 stop.set()
         if worker.is_alive():
-            # Return to the prompt at once; the next command joins the worker.
+            # Return to the prompt at once; the worker frees the agent later.
             self._muted = True
             self.agent.interrupt()
             return "interrupted", None
-        self._worker = None
-        self.save()
-        if "error" in result:
-            return "failed", _error_text(result["error"])
-        response = result.get("response") or ""
-        if response == "[Interrupted]" or response.startswith("[Stopped"):
-            return "interrupted", None
-        return "completed", response
+        return self._outcome(result)
 
     def continue_run(self, stop: threading.Event, on_event):
         return self.run(CONTINUE_INSTRUCTION, None, stop, on_event)
 
     def compact(self) -> str:
-        self._wait_previous()
-        result = self.agent.compact()
-        self.save()
-        return result
+        with self._agent_lock:
+            result = self.agent.compact()
+            self.save()
+            return result
 
     def reset(self) -> None:
-        self._wait_previous()
-        self.save()
-        self.sessions.new_session()
-        if self._explicit:
-            self.agent.reset()
-            return
-        from kairos.workspaces import new_workspace
+        with self._agent_lock:
+            self.save()
+            self.sessions.new_session()
+            if self._explicit:
+                self.agent.reset()
+            else:
+                from kairos.workspaces import new_workspace
 
-        _close_agent(self.agent)
-        self.workspace = str(new_workspace())
-        self.agent = self._new_agent(self.workspace)
+                _close_agent(self.agent)
+                self.workspace = str(new_workspace())
+                self.agent = self._new_agent(self.workspace)
+            self._forget_pending()
 
     def list_conversations(self) -> list[dict]:
         return self.sessions.list_sessions()
 
     def resume(self, conversation_id: str) -> tuple[str, bool]:
-        self._wait_previous()
-        history = self.sessions.load_session(conversation_id)
-        sanitized, last, mid_execution = (
-            sanitize_history_for_resume(history) if history else (None, "", False)
-        )
-        if sanitized is None:
-            raise ValueError("That chat has no resumable state.")
-        self.save()
-        self.agent.reset()
-        self.agent.conversation_history = sanitized
-        self.sessions.set_current_session(conversation_id)
-        return last, mid_execution
+        with self._agent_lock:
+            history = self.sessions.load_session(conversation_id)
+            sanitized, last, mid_execution = (
+                sanitize_history_for_resume(history) if history else (None, "", False)
+            )
+            if sanitized is None:
+                raise ValueError("That chat has no resumable state.")
+            self.save()
+            self.agent.reset()
+            self.agent.conversation_history = sanitized
+            self.sessions.set_current_session(conversation_id)
+            self._forget_pending()
+            return last, mid_execution
 
     def models(self) -> tuple[list[dict], dict]:
         from kairos.providers import list_setups
@@ -305,18 +429,20 @@ class OfflineBackend:
         return self.agent.model_info()
 
     def configure(self, **changes) -> dict:
-        self._wait_previous()
-        self._apply(self.agent, **changes)
-        _remember(self._configured, changes)
-        return self.agent.model_info()
+        with self._agent_lock:
+            self._apply(self.agent, **changes)
+            _remember(self._configured, changes)
+            return self.agent.model_info()
 
     def close(self) -> None:
-        self._wait_previous()
-        self.save()
-        # Background shells are owned by the agent and should not survive
-        # CLI shutdown. Close them only after the final save.
-        _close_agent(self.agent)
-        self.sessions.new_session()
+        self.stop_wake()
+        with self._agent_lock:
+            self._closed = True
+            self.save()
+            # Background shells and sub-agents are owned by the agent and
+            # should not survive CLI shutdown. Close them after the final save.
+            _close_agent(self.agent)
+            self.sessions.new_session()
 
 
 class GatewayBackend:
@@ -331,6 +457,13 @@ class GatewayBackend:
         self._configured: dict = {}
         self._abandoned: set[str] = set()
         self.conversation: dict | None = None
+        # Background work: a pump thread reads events while the CLI is not
+        # waiting on its own run; run()/_settle() take the stream over.
+        self._view = None  # renders background events (CLI.handle_event)
+        self._notes: list[dict] = []  # notifications for the next wake header
+        self._wake_run: str | None = None
+        self._events_lock = threading.Lock()
+        self._claim = threading.Event()
         self._open(self._create())
 
     @property
@@ -349,13 +482,101 @@ class GatewayBackend:
     def _open(self, conversation: dict) -> None:
         """Make *conversation* current and subscribe to its new events."""
         if self.conversation is not None:
+            self.stop_wake()  # its output would never end on screen
             self.client.request("conversation.unsubscribe", self._id)
         self._abandoned.clear()
+        self._notes = []
         self.conversation = conversation
         self.client.request(
             "conversation.subscribe", self._id,
             {"after_event_id": conversation.get("last_event_id", 0)},
         )
+        self._list_subagents()
+
+    # -- background work: wake runs, sub-agent status ---------------------- #
+
+    def start_background(self, on_event) -> None:
+        """Render background work through *on_event*, also while at the prompt."""
+        self._view = on_event
+        self._list_subagents()
+        threading.Thread(target=self._pump, name="kairos-events", daemon=True).start()
+
+    def _list_subagents(self) -> None:
+        if self._view is None:
+            return
+        try:
+            data = self.client.request("subagent.list", self._id, {"conversation_id": self._id})
+        except GatewayError:
+            data = {}  # an older gateway has no sub-agent commands
+        self._view("subagent.list", {"subagents": data.get("subagents") or []})
+
+    @contextmanager
+    def _events(self):
+        """Take the event stream from the pump (run, settle, Esc)."""
+        self._claim.set()
+        with self._events_lock:
+            self._claim.clear()
+            yield
+
+    def _pump(self) -> None:
+        while not self.client.closed:
+            if self._claim.is_set():
+                time.sleep(0.01)  # let the claimer take the lock
+                continue
+            with self._events_lock:
+                try:
+                    event = self.client.next_event(0.05)
+                except GatewayError:
+                    return  # the REPL reports the lost connection
+                if event:
+                    self._background(event)
+
+    def _background(self, event: dict) -> None:
+        """Handle an event that is not part of the CLI's own run."""
+        name, data, run_id = event.get("event"), event.get("data") or {}, event.get("run_id")
+        if name in _RUN_ENDED:
+            self._abandoned.discard(run_id)
+        if self._view is None or event.get("conversation_id") not in (None, self._id):
+            return
+        if name == "background.notification":
+            self._notes.extend(data.get("notifications") or [])
+        elif name in ("subagent.status", "wake.paused"):
+            self._view(name, data)
+        elif name == "run.started" and _origin(data) == "wake":
+            self._wake_run = run_id
+            notes, self._notes = self._notes, []
+            self._view("wake.started", {"notifications": notes})
+        elif run_id is not None and run_id == self._wake_run:
+            if name in _RUN_ENDED:
+                self._wake_run = None
+                outcome, payload = _run_outcome(name, data)
+                self._view("wake.ended", {"outcome": outcome, "payload": payload})
+            else:
+                self._view(name, data)
+
+    def stop_wake(self) -> bool:
+        """Esc at the prompt: interrupt the wake run (the main agent only)."""
+        with self._events():
+            run_id, self._wake_run = self._wake_run, None
+            if run_id is None:
+                return False
+            self._abandoned.add(run_id)
+            self._view("wake.ended", {"outcome": "interrupted", "payload": None})
+        # Off the prompt's thread: the prompt is back at once.
+        threading.Thread(target=self._interrupt, args=(run_id,), daemon=True).start()
+        return True
+
+    def _interrupt(self, run_id: str) -> None:
+        try:
+            self.client.request("run.interrupt", self._id, {"run_id": run_id})
+        except GatewayError:
+            pass
+
+    def stop_subagents(self) -> int:
+        data = self.client.request("subagent.stop_all", self._id, {"conversation_id": self._id})
+        return int(data.get("stopped") or 0)
+
+    # -- the CLI's own runs ------------------------------------------------- #
 
     def _wait(self, run_id: str, stop: threading.Event, on_event):
         """Render this run's events until it ends or the user stops it."""
@@ -378,38 +599,39 @@ class GatewayBackend:
                 continue
             name, data = event.get("event"), event.get("data") or {}
             if event.get("run_id") != run_id:
-                if name in _RUN_ENDED:
-                    self._abandoned.discard(event.get("run_id"))
+                self._background(event)  # e.g. a wake run this message queued behind
                 continue
-            if name == "run.completed":
-                return "completed", data.get("response")
-            if name == "run.failed":
-                return "failed", data.get("error") or "Run failed."
             if name in _RUN_ENDED:
-                return "interrupted", None
+                return _run_outcome(name, data)
             on_event(name, data)
 
     def _settle(self, timeout: float = 30.0) -> None:
         """Wait for runs stopped with Esc to end before a control command."""
         deadline = time.monotonic() + timeout
-        while self._abandoned and time.monotonic() < deadline:
-            event = self.client.next_event(0.1)
-            if event and event.get("event") in _RUN_ENDED:
-                self._abandoned.discard(event.get("run_id"))
+        with self._events():
+            while self._abandoned and time.monotonic() < deadline:
+                event = self.client.next_event(0.1)
+                if event:
+                    self._background(event)
 
     def run(self, text: str, image_url: str | None, stop: threading.Event, on_event):
         payload = {"content": text, "source": "cli"}
         if image_url:
             payload["image_url"] = image_url
-        ack = self.client.request("message.send", self._id, payload)
-        return self._wait(ack["run_id"], stop, on_event)
+        self._notes = []  # the gateway sends pending results with this message
+        # Hold the stream from before the send, so the pump cannot take
+        # this run's first events.
+        with self._events():
+            ack = self.client.request("message.send", self._id, payload)
+            return self._wait(ack["run_id"], stop, on_event)
 
     def continue_run(self, stop: threading.Event, on_event):
-        ack = self.client.request(
-            "conversation.continue", self._id,
-            {"instruction": CONTINUE_INSTRUCTION, "source": "cli"},
-        )
-        return self._wait(ack["run_id"], stop, on_event)
+        with self._events():
+            ack = self.client.request(
+                "conversation.continue", self._id,
+                {"instruction": CONTINUE_INSTRUCTION, "source": "cli"},
+            )
+            return self._wait(ack["run_id"], stop, on_event)
 
     def compact(self) -> str:
         self._settle()
@@ -554,14 +776,7 @@ def run_turn(cli: CLI, start) -> None:
     finally:
         cli.stop_escape_listener()
         cli.stop_thinking()
-    if outcome == "completed":
-        if payload and not cli._skip_print_response:
-            cli.print_response(payload)
-    elif outcome == "failed":
-        cli.print_error(payload or "Request failed.")
-    else:
-        cli.print_info("Interrupted.")
-    cli._skip_print_response = False
+    cli.finish_turn(outcome, payload)
 
 
 def _resume(cli: CLI, backend, args: list[str]) -> None:
@@ -652,6 +867,10 @@ def handle_command(cli: CLI, backend, name: str, args: list[str]) -> bool:
     if name == "/effort":
         _effort(cli, backend, args)
         return True
+    if name == "/stop":
+        stopped = backend.stop_subagents()
+        cli.print_info(f"Stopped {stopped} sub-agent{'s' if stopped != 1 else ''}.")
+        return False
     cli.print_error(f"Unknown command {name}. Commands: {' '.join(COMMANDS)}")
     return False
 
@@ -685,6 +904,10 @@ def main(argv: list[str] | None = None):
 
     cli.print_banner(backend.workspace, backend.mode)
     status = _status_text(backend)
+    # Wake turns and sub-agent status render while the user types; Esc at
+    # the prompt stops a wake turn.
+    backend.start_background(cli.handle_event)
+    cli.on_prompt_escape = backend.stop_wake
 
     while True:
         if backend.mode == "gateway" and backend.client.closed:

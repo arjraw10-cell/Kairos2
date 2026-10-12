@@ -2,7 +2,9 @@ import threading
 import time
 import sys
 import os
+import io
 import base64
+from contextlib import contextmanager
 from typing import Optional, Callable, Dict
 
 import subprocess
@@ -88,9 +90,11 @@ class KairosMarkdown(Markdown):
     elements = dict(Markdown.elements)
     elements["table_open"] = _EnhancedTableElement
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import run_in_terminal
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.styles import Style
-from prompt_toolkit.formatted_text import HTML, FormattedText
-from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.formatted_text import ANSI, HTML, FormattedText, to_formatted_text
+from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
 from prompt_toolkit.keys import Keys
 
 console = Console()
@@ -98,8 +102,83 @@ console = Console()
 PROMPT_STYLE = Style.from_dict({
     "prompt": "ansicyan bold",
     "rprompt": "ansibrightblack",
+    "bottom-toolbar": "noreverse ansibrightblack",
     "": "ansidefault",
 })
+
+# Lines of a wake reply previewed above the input while it streams.
+PREVIEW_HEIGHT = 10
+
+
+def describe_notification(notification: dict) -> str:
+    """``sub-agent a3f2 finished`` from a background notification."""
+    if notification.get("subagent_id"):
+        who = f"sub-agent {notification['subagent_id']}"
+    elif notification.get("terminal_id") is not None:
+        who = f"terminal {notification['terminal_id']}"
+    else:
+        who = "background work"
+    # subagent_finished -> finished, terminal_matched -> matched, ...
+    verb = str(notification.get("kind") or "finished").rsplit("_", 1)[-1]
+    return f"{who} {verb}"
+
+
+def subagent_line(status: dict, now: float) -> str:
+    """One compact status line: id, state, current tool, elapsed time."""
+    elapsed = int(float(status.get("elapsed_s") or 0) + now - status.get("_seen", now))
+    minutes, seconds = divmod(max(elapsed, 0), 60)
+    parts = ["●", str(status.get("subagent_id")), str(status.get("state") or "")]
+    if status.get("current_tool"):
+        parts.append(str(status["current_tool"]))
+    parts.append(f"{minutes}m{seconds:02d}s" if minutes else f"{seconds}s")
+    return "  ".join(parts)
+
+
+class _AbovePrompt:
+    """Rich's output file while a prompt is open.
+
+    Rich renders as usual; each flush prints the text above the prompt with
+    prompt_toolkit's ``run_in_terminal`` on the prompt's event loop, which
+    redraws the input line (and the user's half-typed text) below it. Text
+    whose flush could not be scheduled is written by ``drain()`` once the
+    prompt has closed.
+    """
+
+    def __init__(self, app, original):
+        self._app = app
+        self._original = original
+        self._parts: list[str] = []
+        self._lock = threading.Lock()
+
+    def write(self, text: str) -> int:
+        with self._lock:
+            self._parts.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        try:
+            self._app.loop.call_soon_threadsafe(
+                lambda: run_in_terminal(self.drain, in_executor=False)
+            )
+        except (AttributeError, RuntimeError):
+            pass  # the prompt is not running; drain() prints it later
+
+    def drain(self) -> None:
+        with self._lock:
+            text, self._parts = "".join(self._parts), []
+        if text:
+            output = self._app.output
+            # Same steps as prompt_toolkit's StdoutProxy (Windows resets autowrap).
+            output.enable_autowrap()
+            output.write_raw(text)
+            output.flush()
+
+    def isatty(self) -> bool:
+        return self._original.isatty()
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._original, "encoding", None) or "utf-8"
 
 
 class _StreamView:
@@ -438,12 +517,32 @@ class CLI:
         self._live: Optional[Live] = None
         self._stream_view: Optional[_StreamView] = None
         self._stream_text = ""
+        self._streaming = False
         self._skip_print_response = False
+
+        # Background work (wake turns, sub-agent status) renders from other
+        # threads, also while the user is typing at the prompt.
+        self._lock = threading.RLock()
+        self._above: Optional[_AbovePrompt] = None  # set while a prompt is open
+        self._wake = False  # a wake turn is rendering
+        self._subagents: Dict[str, dict] = {}  # running sub-agents by id
+        self._preview_key = None
+        self._preview: list = []
+        # Esc at the prompt while a wake turn runs (set by main.py).
+        self.on_prompt_escape: Optional[Callable[[], None]] = None
+
+        wake_keys = KeyBindings()
+
+        @wake_keys.add("escape", filter=Condition(lambda: self._wake))
+        def _stop_wake(event):
+            if self.on_prompt_escape:
+                self.on_prompt_escape()
 
         # PromptSession with paste support (Alt+V for images)
         self._prompt_session = PromptSession(
-            key_bindings=_kb,
+            key_bindings=merge_key_bindings([_kb, wake_keys]),
             enable_open_in_editor=False,
+            refresh_interval=1.0,  # sub-agent elapsed times in the toolbar
         )
 
         # Escape key listener (active during agent execution). The listener
@@ -510,6 +609,8 @@ class CLI:
     # ------------------------------------------------------------------ #
 
     def start_thinking(self):
+        if self._wake:
+            return  # a wake turn's output owns the screen until it ends
         self._stop_thinking.clear()
         self._thinking_thread = threading.Thread(target=self._thinking_animation, daemon=True)
         self._thinking_thread.start()
@@ -523,11 +624,14 @@ class CLI:
             # Live panel is active printed a stray blank line above it.
             sys.stdout.write("\r" + " " * 30 + "\r")
             sys.stdout.flush()
-        if self._live:
-            self._stream_view.full = True
-            self._live.stop()
-            self._live = None
-            self._stream_text = ""
+        with self._lock:
+            # A wake reply keeps streaming; it moves to the prompt preview.
+            if self._live and not self._wake:
+                self._stream_view.full = True
+                self._live.stop()
+                self._live = None
+                self._stream_text = ""
+                self._streaming = False
 
     def _thinking_animation(self):
         dots = 0
@@ -543,8 +647,17 @@ class CLI:
     # ------------------------------------------------------------------ #
 
     def start_stream(self):
-        self.stop_thinking()
-        self._stream_text = ""
+        with self._lock:
+            self._stream_text = ""
+            self._streaming = True
+            if self._above is not None:
+                # At the prompt the reply streams in a preview above the input.
+                self._invalidate()
+                return
+            self.stop_thinking()
+            self._start_live()
+
+    def _start_live(self):
         self._stream_view = _StreamView(self)
         self._live = Live(
             self._stream_view,
@@ -555,36 +668,116 @@ class CLI:
         self._live.start()
 
     def on_stream_token(self, token: str):
-        # Live's refresh thread re-renders the view; no per-token work here.
+        # Live's refresh thread (or the prompt's redraw) renders the text.
         self._stream_text += token
+        self._invalidate()
 
     def finish_stream(self) -> str:
-        text = self._stream_text
-        if self._live:
-            if not text.strip() or text.strip() == "...":
-                self._live.update(Text(""))
-            else:
-                self._stream_view.full = True
-            self._live.stop()
-            self._live = None
-        self._stream_text = ""
-        return text
+        with self._lock:
+            text = self._stream_text
+            if self._above is not None:
+                if text.strip():
+                    view = _StreamView(self)
+                    view.full = True
+                    self.console.print(view)
+            elif self._live:
+                if not text.strip() or text.strip() == "...":
+                    self._live.update(Text(""))
+                else:
+                    self._stream_view.full = True
+                self._live.stop()
+                self._live = None
+            self._stream_text = ""
+            self._streaming = False
+            self._invalidate()
+            return text
 
     def finalize_stream_as_response(self):
-        text = self._stream_text
-        if self._live:
-            try:
-                display = KairosMarkdown(text) if text else Text("")
-            except Exception:
-                display = Text(text)
-            self._live.update(Panel(display, border_style="green", padding=(1, 2)))
-            self._live.stop()
-            self._live = None
-            self._skip_print_response = True
-        self._stream_text = ""
+        with self._lock:
+            text = self._stream_text
+            if self._above is not None:
+                self.print_response(text)
+                self._skip_print_response = True
+            elif self._live:
+                try:
+                    display = KairosMarkdown(text) if text else Text("")
+                except Exception:
+                    display = Text(text)
+                self._live.update(Panel(display, border_style="green", padding=(1, 2)))
+                self._live.stop()
+                self._live = None
+                self._skip_print_response = True
+            self._stream_text = ""
+            self._streaming = False
+            self._invalidate()
+
+    def finish_turn(self, outcome: str, payload: Optional[str]):
+        """Print how a turn ended (user turns and wake turns alike)."""
+        if outcome == "completed":
+            if payload and not self._skip_print_response:
+                self.print_response(payload)
+        elif outcome == "failed":
+            self.print_error(payload or "Request failed.")
+        else:
+            self.print_info("Interrupted.")
+        self._skip_print_response = False
+
+    # ------------------------------------------------------------------ #
+    #  Background work: wake turns, sub-agent status                      #
+    # ------------------------------------------------------------------ #
+
+    def _begin_wake(self, notifications: list):
+        with self._lock:
+            self._wake = True
+            self._skip_print_response = False
+            what = ", ".join(describe_notification(n) for n in notifications) or "background work finished"
+            self.console.print(Text.assemble(("» woke: ", "cyan"), (what, "dim")))
+            self._invalidate()
+
+    def _end_wake(self, outcome: str, payload: Optional[str]):
+        with self._lock:
+            if not self._wake:
+                return
+            if self._streaming:
+                self.finish_stream()  # a stopped reply stays as the grey trace
+            self._wake = False
+            self.finish_turn(outcome, payload)
+            self._invalidate()
+
+    def _update_subagents(self, statuses: list, replace: bool = False):
+        with self._lock:
+            if replace:
+                self._subagents.clear()
+            for status in statuses:
+                subagent_id = status.get("subagent_id")
+                if status.get("state") == "running":
+                    self._subagents[subagent_id] = {**status, "_seen": time.monotonic()}
+                else:
+                    # Finished ones drop off; their notification says how it went.
+                    self._subagents.pop(subagent_id, None)
+            self._prompt_session.bottom_toolbar = self._toolbar if self._subagents else None
+            self._invalidate()
+
+    def _toolbar(self):
+        now = time.monotonic()
+        lines = [subagent_line(status, now) for status in list(self._subagents.values())]
+        return FormattedText([("", "\n".join(lines))])
+
+    def _invalidate(self):
+        """Redraw the open prompt (preview, toolbar); thread-safe."""
+        if self._above is not None:
+            self._prompt_session.app.invalidate()
 
     def handle_event(self, event: str, data: dict):
-        """Render one agent event; offline and gateway modes share this."""
+        """Render one event; offline and gateway modes share this.
+
+        Background threads call it too (wake turns, sub-agent status), so it
+        is serialized with the prompt's open/close.
+        """
+        with self._lock:
+            self._handle_event(event, data)
+
+    def _handle_event(self, event: str, data: dict):
         if event == "assistant.stream_started":
             self.start_stream()
         elif event == "assistant.token":
@@ -609,6 +802,20 @@ class CLI:
             self.print_info(str(data.get("message") or ""))
         elif event == "terminal.completed":
             self.print_background_notification(str(data.get("message") or ""))
+        elif event == "wake.started":
+            self._begin_wake(data.get("notifications") or [])
+        elif event == "wake.ended":
+            self._end_wake(data.get("outcome") or "interrupted", data.get("payload"))
+        elif event == "wake.paused":
+            pending = int(data.get("pending") or 0)
+            self.print_info(
+                f"paused auto-wake: {pending} background result{'s' if pending != 1 else ''} "
+                "will be sent with your next message"
+            )
+        elif event == "subagent.status":
+            self._update_subagents([data])
+        elif event == "subagent.list":
+            self._update_subagents(data.get("subagents") or [], replace=True)
 
     # ------------------------------------------------------------------ #
     #  Tool call summary                                                   #
@@ -727,13 +934,78 @@ class CLI:
         if pending_line is not None:
             return pending_line.strip()
         try:
-            return self._prompt_session.prompt(
+            return self._prompt(
                 FormattedText([("class:prompt", label)]),
-                style=PROMPT_STYLE,
                 default=pending_default,
             ).strip()
         except (EOFError, KeyboardInterrupt):
             return None
+
+    # ------------------------------------------------------------------ #
+    #  Prompt that coexists with background output                        #
+    # ------------------------------------------------------------------ #
+
+    def _prompt(self, message, **kwargs) -> str:
+        """``PromptSession.prompt`` while background output prints above it."""
+        with self._prompting():
+            return self._prompt_session.prompt(
+                self._prompt_message(message),
+                style=PROMPT_STYLE,
+                pre_run=self._above.flush,  # output that came before the loop ran
+                **kwargs,
+            )
+
+    @contextmanager
+    def _prompting(self):
+        with self._lock:
+            if self._live:
+                # A wake reply streaming directly continues in the preview;
+                # erase the Live tail instead of leaving a duplicate.
+                self._live.transient = True
+                self._live.stop()
+                self._live = None
+            original = self.console.file
+            self._above = _AbovePrompt(self._prompt_session.app, original)
+            self.console.file = self._above
+        try:
+            yield
+        finally:
+            with self._lock:
+                self.console.file = original
+                above, self._above = self._above, None
+                above.drain()
+                if self._streaming:
+                    self._start_live()  # the wake reply keeps streaming below
+
+    def _prompt_message(self, message):
+        fragments = to_formatted_text(message)
+
+        def get():
+            # The final frame (left in the scrollback) shows just the prompt.
+            if not self._wake or self._prompt_session.app.is_done:
+                return fragments
+            return self._render_preview() + fragments
+
+        return get
+
+    def _render_preview(self) -> list:
+        """The streaming wake reply (or "Thinking...") rendered by Rich."""
+        width = self.console.width
+        streaming = self._streaming
+        key = (streaming, len(self._stream_text), width)
+        if key != self._preview_key:
+            out = io.StringIO()
+            preview = Console(
+                file=out, width=width, height=PREVIEW_HEIGHT, force_terminal=True,
+                color_system=self.console.color_system, legacy_windows=False,
+            )
+            if streaming:
+                preview.print(_StreamView(self))
+            else:
+                preview.print(Text("Thinking...", style="italic dim"))
+            self._preview_key = key
+            self._preview = to_formatted_text(ANSI(out.getvalue()))
+        return self._preview
 
     # ------------------------------------------------------------------ #
     #  Escape key listener                                                 #
@@ -876,10 +1148,9 @@ class CLI:
             # new content changes that number without performing a paste.
 
             # ---- Run the prompt ----
-            result = self._prompt_session.prompt(
+            result = self._prompt(
                 HTML(f'<style class="prompt">{prefix}</style>'),
                 rprompt=FormattedText([("class:rprompt", status)]),
-                style=PROMPT_STYLE,
                 default=pending_default,
             ).strip()
 
