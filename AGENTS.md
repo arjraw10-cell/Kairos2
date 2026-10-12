@@ -2,6 +2,12 @@
 
 **MANDATORY: Whenever you make any code change (edit, add, or remove code), you MUST also update this AGENTS.md file AND README.md to reflect the change. This ensures the documentation stays in sync with the code. Failure to update documentation after a code change is not acceptable.**
 
+## Vision
+
+Kairos is meant to become my personal agent: like Claude Code in the terminal, but simpler, with everything I need built in and understood (tools, stealth browser, computer use, system prompt, long-term memory). It is a hybrid of agent and chatbot, used for coding and for everyday questions as I use the Claude app, and it should know me through memory. One gateway serves every surface: a good terminal CLI, a desktop app, and a personal phone app that connects to the gateway. The motivation: Claude Max 20x from YC Startup School runs for six months, after which I'll have API credits that the Claude app can't use. The big build is deliberately deferred until then, when models will be better, cheaper and faster. Capabilities are built as code, not MCP.
+
+Read `VISION.md` for the full vision, the branch map, current status, and the ordered list of what's left. Work should move Kairos toward it: keep the gateway as the single owner of conversations, memory, tools and the browser, and keep clients thin.
+
 ## Overview
 
 Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 48 tools, including optional native desktop automation through Cua Driver. All file operations use absolute paths — no workspace containment.
