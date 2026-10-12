@@ -25,7 +25,7 @@ from ..tokens import status_payload
 from ..workspaces import new_workspace
 from .history import sanitize_for_resume
 from .models import Conversation, Run
-from .repository import GatewayRepository
+from .repository import DataDirLock, GatewayRepository
 
 log = logging.getLogger("kairos.gateway")
 AgentFactory = Callable[[str], Agent]
@@ -40,12 +40,17 @@ class AgentRuntime:
     state_lock: threading.RLock = field(default_factory=threading.RLock)
     is_running: bool = False
     active_run_id: str | None = None
+    # True from run start until Agent.run returns (cleared on the worker
+    # thread); only then may run.interrupt/run.cancel stop the Agent.
+    agent_active: bool = False
     closing: bool = False
     control_busy: bool = False
     last_activity: float = field(default_factory=time.time)
-    subscribers: set[str] = field(default_factory=set)
     scheduler: WakeScheduler | None = None
     loop: asyncio.AbstractEventLoop | None = None
+    # Model settings chosen while the Agent was in use; applied before its
+    # next run or compaction.
+    pending_model_settings: dict[str, Any] | None = None
 
 
 class GatewayManager:
@@ -81,16 +86,20 @@ class GatewayManager:
         self._pending_runs: dict[str, deque[str]] = {}
         self._subscribers: dict[str, dict[str, tuple[asyncio.AbstractEventLoop, Callable[[dict[str, Any]], Awaitable[None]]]]] = {}
         self._subscribers_lock = threading.RLock()
+        self._emit_locks: dict[str, threading.Lock] = {}
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, self.max_concurrent_runs),
             thread_name_prefix="kairos-agent",
         )
         self._closed = False
-        self._startup_recovery: list[str] = self.repository.mark_stale_runs_interrupted()
-        self._legacy_import: dict[str, Any] | None = None
+        # One gateway per data directory: the recovery below marks every
+        # queued/running run interrupted, which would corrupt a live gateway's
+        # runs. Held until shutdown().
+        self._data_dir_lock = DataDirLock(self.repository.data_dir)
+        self.repository.mark_stale_runs_interrupted()
         legacy_file = Config.KAIROS_LEGACY_CHAT_FILE()
         if legacy_file and self.default_workspace:
-            self._legacy_import = self.repository.import_legacy_chats(legacy_file, self.default_workspace)
+            self.repository.import_legacy_chats(legacy_file, self.default_workspace)
 
     def resolve_workspace(self, workspace: str | None) -> str:
         # A conversation created without a workspace gets its own fresh folder.
@@ -153,7 +162,10 @@ class GatewayManager:
             # A setup removed from provider.json must not block loading.
             log.warning("Stored model settings for %s are invalid; using the default setup", conversation.id, exc_info=True)
         if history:
-            sanitized, _needs_continue = sanitize_for_resume(history)
+            # Repair an interrupted suffix instead of cutting back to the last
+            # clean reply: the next save overwrites the stored history, so a
+            # truncated load would erase the user's request and executed tools.
+            sanitized, _needs_continue = sanitize_for_resume(history, prefer_incomplete=True)
             if sanitized:
                 # Rebuild the workspace-specific system prompt in Agent, then
                 # replace it with the persisted history's system prompt and
@@ -213,9 +225,15 @@ class GatewayManager:
         """WakeScheduler callback (timer thread): queue a wake run."""
         def give_back() -> None:
             # Not lost: the next run (or the unload snapshot) picks them up.
-            add = getattr(runtime.agent, "add_background_events", None)
-            if add:
-                add(events)
+            # When the runtime is already gone (a wake racing an unload), they
+            # go to the database for the next load. Unload saves and
+            # deregisters under the same locks, so neither path misses them.
+            with self._lifecycle_lock, self._runtimes_lock:
+                add = getattr(runtime.agent, "add_background_events", None)
+                if add and self._runtimes.get(runtime.conversation_id) is runtime:
+                    add(events)
+                    return
+            self.repository.add_pending_notifications(runtime.conversation_id, events)
 
         def enqueue() -> None:
             try:
@@ -332,16 +350,9 @@ class GatewayManager:
                             pass
                 if runtime.scheduler:
                     runtime.scheduler.close()
-                # Running sub-agents cannot survive the runtime: mark them lost
-                # (status + a notification for the next run).
-                mark_lost = getattr(getattr(runtime.agent, "subagent_tool", None), "mark_lost", None)
-                if mark_lost:
-                    mark_lost()
-                self._persist_runtime(runtime)
-                self._close_agent_resources(runtime.agent)
-                self._save_pending_notifications(runtime)
-                with self._lifecycle_lock, self._runtimes_lock:
-                    self._runtimes.pop(conversation_id, None)
+                # Teardown blocks (browser close up to 30 s, process kills,
+                # SQLite writes): keep it off the event loop.
+                await asyncio.to_thread(self._teardown_runtime, runtime)
                 removed = True
                 with runtime.state_lock:
                     runtime.is_running = False
@@ -354,6 +365,18 @@ class GatewayManager:
             if not removed:
                 with runtime.state_lock:
                     runtime.closing = False
+
+    def _teardown_runtime(self, runtime: AgentRuntime) -> None:
+        # Running sub-agents cannot survive the runtime: mark them lost
+        # (status + a notification for the next run).
+        mark_lost = getattr(getattr(runtime.agent, "subagent_tool", None), "mark_lost", None)
+        if mark_lost:
+            mark_lost()
+        self._persist_runtime(runtime)
+        self._close_agent_resources(runtime.agent)
+        with self._lifecycle_lock, self._runtimes_lock:
+            self._save_pending_notifications(runtime)
+            self._runtimes.pop(runtime.conversation_id, None)
 
     def _save_pending_notifications(self, runtime: AgentRuntime) -> None:
         """Keep undelivered background events for the next load."""
@@ -370,11 +393,19 @@ class GatewayManager:
         for child in child_agents() if child_agents else []:
             GatewayManager._close_agent_resources(child)
         try:
-            browser = getattr(agent, "browser_manager", None)
-            if browser is not None and bool(getattr(browser, "is_open", False)):
-                browser.close()
+            # Unconditionally: the browser worker can be alive while is_open
+            # is False, and close() also stops it.
+            close_browser = getattr(getattr(agent, "browser_manager", None), "close", None)
+            if close_browser is not None:
+                close_browser()
         except Exception:
             log.exception("Failed to close browser manager")
+        try:
+            close_desktop = getattr(getattr(agent, "desktop_manager", None), "close", None)
+            if close_desktop is not None:
+                close_desktop()
+        except Exception:
+            log.exception("Failed to close desktop manager")
         try:
             terminal_manager = getattr(agent, "terminal_manager", None)
             terminals = getattr(terminal_manager, "terminals", {})
@@ -420,6 +451,16 @@ class GatewayManager:
         if settings.get("effort"):
             agent.set_effort(settings["effort"])
 
+    def _apply_pending_model_settings(self, runtime: AgentRuntime) -> None:
+        """Apply a deferred model choice; call only while the Agent is unused."""
+        settings, runtime.pending_model_settings = runtime.pending_model_settings, None
+        if settings is None:
+            return
+        try:
+            self._apply_model_settings(runtime.agent, settings)
+        except ValueError:
+            log.warning("Could not apply model settings for %s", runtime.conversation_id, exc_info=True)
+
     def list_models(self) -> dict[str, Any]:
         return {"setups": providers.list_setups(), "default_setup": providers.default_setup()}
 
@@ -433,7 +474,8 @@ class GatewayManager:
     ) -> dict[str, Any]:
         """Choose the conversation's model and/or effort; with no changes,
         return the current model info. The choice is persisted and applied to
-        a loaded runtime immediately (it takes effect at the next API step)."""
+        a loaded runtime between runs: at once when idle, otherwise before its
+        next run or compaction (a run reads the adapter and effort throughout)."""
         settings = self.repository.get_model_settings(conversation_id)
         changed = bool(setup or model or effort)
         if setup or model:
@@ -448,9 +490,13 @@ class GatewayManager:
             self.repository.set_model_settings(conversation_id, settings)
         runtime = self.get_runtime(conversation_id)
         if runtime is not None and hasattr(runtime.agent, "model_info"):
-            with runtime.state_lock:
-                if changed:
-                    self._apply_model_settings(runtime.agent, settings)
+            if changed:
+                runtime.pending_model_settings = settings
+            # Runs and compaction hold the runtime lock while they use the
+            # Agent. This check and the apply run on the event loop without
+            # yielding, so neither can start in between.
+            if not runtime.lock.locked():
+                self._apply_pending_model_settings(runtime)
                 return runtime.agent.model_info()
         return spec.info(settings.get("effort") or spec.default_effort)
 
@@ -459,27 +505,34 @@ class GatewayManager:
 
     def emit(self, conversation_id: str, event: str, data: dict[str, Any], run_id: str | None = None, persist: bool = True) -> dict[str, Any]:
         payload = None
-        # ``persist=False`` is used for streamed token deltas: storing each one
-        # cost a SQLite transaction (~14 ms) on the Agent worker thread, and
-        # ``assistant.stream_ended`` still persists the full text for replay.
-        if persist:
-            try:
-                payload = self.repository.append_event(conversation_id, event, data, run_id)
-            except Exception:
-                # Event persistence must not turn a successful Agent operation
-                # into a failed run. The event is still delivered to live clients
-                # when possible, but the failure is logged for diagnosis.
-                log.exception("Could not persist gateway event %s", event)
-        if payload is None:
-            payload = {"event_id": None, "event": event, "conversation_id": conversation_id, "run_id": run_id, "created_at": None, "data": data}
         with self._subscribers_lock:
-            subscribers = list(self._subscribers.get(conversation_id, {}).values())
-        for loop, callback in subscribers:
-            try:
-                future = asyncio.run_coroutine_threadsafe(callback(payload), loop)
-                future.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
-            except Exception:
-                log.debug("Subscriber delivery failed", exc_info=True)
+            emit_lock = self._emit_locks.setdefault(conversation_id, threading.Lock())
+        # Emitters run on several threads. Assigning the event ID and
+        # scheduling delivery under one per-conversation lock makes live
+        # delivery follow ID order: a subscriber drops IDs at or below the last
+        # one it sent, so an earlier ID delivered late would be lost.
+        with emit_lock:
+            # ``persist=False`` is used for streamed token deltas: storing each
+            # one cost a SQLite transaction (~14 ms) on the Agent worker thread,
+            # and ``assistant.stream_ended`` still persists the full text.
+            if persist:
+                try:
+                    payload = self.repository.append_event(conversation_id, event, data, run_id)
+                except Exception:
+                    # Event persistence must not turn a successful Agent
+                    # operation into a failed run. The event is still delivered
+                    # to live clients when possible; the failure is logged.
+                    log.exception("Could not persist gateway event %s", event)
+            if payload is None:
+                payload = {"event_id": None, "event": event, "conversation_id": conversation_id, "run_id": run_id, "created_at": None, "data": data}
+            with self._subscribers_lock:
+                subscribers = list(self._subscribers.get(conversation_id, {}).values())
+            for loop, callback in subscribers:
+                try:
+                    future = asyncio.run_coroutine_threadsafe(callback(payload), loop)
+                    future.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+                except Exception:
+                    log.debug("Subscriber delivery failed", exc_info=True)
         return payload
 
     def subscribe(self, conversation_id: str, subscriber_id: str, loop: asyncio.AbstractEventLoop, callback: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
@@ -607,6 +660,7 @@ class GatewayManager:
                 if not closing:
                     runtime.is_running = True
                     runtime.active_run_id = run.id
+                    runtime.agent_active = True
                     runtime.last_activity = time.time()
             if closing:
                 # A forced unload may be waiting for this queued task to reach
@@ -653,7 +707,27 @@ class GatewayManager:
                 with runtime.state_lock:
                     runtime.is_running = False
                     runtime.active_run_id = None
+                    runtime.agent_active = False
+                # The run's status changed while it was queued. Clients wait
+                # for a terminal run event, so publish one.
+                current_run = self.repository.get_run(run.id)
+                if current_run:
+                    current = self.repository.get_conversation(runtime.conversation_id)
+                    if current and current.active_run_id == run.id:
+                        self.repository.update_conversation(
+                            runtime.conversation_id,
+                            status="queued" if next_id else "idle",
+                            active_run_id=next_id,
+                        )
+                    event = {"interrupted": "run.interrupted", "cancelled": "run.cancelled"}.get(current_run.status, "run.failed")
+                    self.emit(
+                        runtime.conversation_id,
+                        event,
+                        {"run": current_run.to_dict(), "origin": run.origin, "error": f"The run could not start: its status is {current_run.status}."},
+                        run.id,
+                    )
                 return
+            self._apply_pending_model_settings(runtime)
             self.repository.update_conversation(runtime.conversation_id, status="running", active_run_id=run.id)
             self.emit(runtime.conversation_id, "run.started", {"run": started.to_dict(), "origin": run.origin}, run.id)
             loop = asyncio.get_running_loop()
@@ -691,11 +765,21 @@ class GatewayManager:
             pending = runtime.scheduler.take_pending() if runtime.scheduler else []
             if pending:
                 runtime.agent.add_background_events(pending)
+
+            def execute() -> str:
+                try:
+                    return runtime.agent.run(content, image_url=image_url)
+                finally:
+                    # interrupt_run stops the Agent only under state_lock while
+                    # agent_active is set. A stop that landed after Agent.run
+                    # cleared its stop flag belongs to this finished run and
+                    # would make the next run return "[Stopped ...]".
+                    with runtime.state_lock:
+                        runtime.agent_active = False
+                        self._clear_stale_stop(runtime.agent)
+
             try:
-                response = await loop.run_in_executor(
-                    self._executor,
-                    lambda: runtime.agent.run(content, image_url=image_url),
-                )
+                response = await loop.run_in_executor(self._executor, execute)
                 with runtime.state_lock:
                     history = copy.deepcopy(runtime.agent.get_history())
                 self.repository.replace_messages(runtime.conversation_id, history, run.id)
@@ -731,6 +815,7 @@ class GatewayManager:
                 with runtime.state_lock:
                     runtime.is_running = False
                     runtime.active_run_id = None
+                    runtime.agent_active = False
                     runtime.last_activity = time.time()
                 # Do not retain callbacks to a disconnected client.
                 for callback_name in (
@@ -749,15 +834,25 @@ class GatewayManager:
         runtime = self.get_runtime(conversation_id)
         if not runtime:
             return False
+        # Only while this run's Agent.run is executing (see execute() in
+        # _run_message); a late stop must not reach the next run.
         with runtime.state_lock:
-            is_running = runtime.is_running
-            active_run_id = runtime.active_run_id
-        if not is_running:
-            return False
-        if run_id and active_run_id != run_id:
-            return False
-        runtime.agent.interrupt()
+            if not runtime.agent_active:
+                return False
+            if run_id and runtime.active_run_id != run_id:
+                return False
+            runtime.agent.interrupt()
         return True
+
+    @staticmethod
+    def _clear_stale_stop(agent: Agent) -> None:
+        # Agent has no public way to drop a pending stop; this mirrors the
+        # reset at the end of Agent.run.
+        event = getattr(agent, "_interrupt_event", None)
+        if event is not None:
+            event.clear()
+        if hasattr(agent, "_stop_requested"):
+            agent._stop_requested = False
 
     async def cancel_run(self, run_id: str) -> bool:
         run = self.repository.get_run(run_id)
@@ -798,6 +893,7 @@ class GatewayManager:
                 with runtime.state_lock:
                     if runtime.closing:
                         raise RuntimeError("Conversation runtime is shutting down.")
+                self._apply_pending_model_settings(runtime)
                 result = await asyncio.get_running_loop().run_in_executor(
                     self._executor, runtime.agent.compact
                 )
@@ -819,10 +915,8 @@ class GatewayManager:
         if runtime.scheduler:
             runtime.scheduler.user_message_sent()
         try:
-            # Reload the durable raw history rather than using the already-
-            # sanitized runtime history. Normal runtime loading intentionally
-            # discards a dirty suffix; explicit continuation must still be able
-            # to repair that suffix after a gateway restart.
+            # Reload the durable raw history and repair its interrupted suffix
+            # (the same repair runtime loading applies).
             history = self.repository.load_history(conversation_id)
             if not history:
                 with runtime.state_lock:
@@ -931,3 +1025,4 @@ class GatewayManager:
             except Exception:
                 log.exception("Failed to unload %s", sid)
         self._executor.shutdown(wait=True, cancel_futures=True)
+        self._data_dir_lock.release()

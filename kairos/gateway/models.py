@@ -57,7 +57,6 @@ class Run:
     status: str = "queued"
     source: str = "api"
     client_id: Optional[str] = None
-    input_message_id: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     error: Optional[str] = None
@@ -73,7 +72,6 @@ class Run:
             "source": self.source,
             "origin": self.origin,
             "client_id": self.client_id,
-            "input_message_id": self.input_message_id,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "error": self.error,
