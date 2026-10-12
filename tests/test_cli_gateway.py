@@ -228,12 +228,18 @@ class GatewayBackendTests(unittest.TestCase):
         root = Path(cls.tmp.name)
         cls.workspace = root / "project"
         cls.workspace.mkdir()
-        cls.scratch = root / "kairos_workspace" / "fresh-1"
-        cls.scratch.mkdir(parents=True)
-        cls.gateway = GatewayServer(root / "data", default_workspace=str(cls.scratch))
+        # The gateway gives workspace-less conversations a fresh folder from
+        # kairos.workspaces; point it at the temp dir so tests never touch ~/Documents.
+        from kairos import workspaces
+        cls._workspace_root = workspaces.WORKSPACE_ROOT
+        cls.scratch_root = root / "kairos_workspace"
+        workspaces.WORKSPACE_ROOT = cls.scratch_root
+        cls.gateway = GatewayServer(root / "data")
 
     @classmethod
     def tearDownClass(cls):
+        from kairos import workspaces
+        workspaces.WORKSPACE_ROOT = cls._workspace_root
         cls.gateway.stop()
         cls.tmp.cleanup()
 
@@ -294,7 +300,7 @@ class GatewayBackendTests(unittest.TestCase):
 
     def test_new_conversation_without_path_and_listing_by_folder(self):
         backend = self.backend(None)
-        self.assertEqual(Path(backend.workspace), self.scratch.resolve())
+        self.assertEqual(Path(backend.workspace).parent, self.scratch_root.resolve())
         backend.run("scratch question", None, threading.Event(), lambda *_: None)
         explicit = self.backend(str(self.workspace))
         explicit.run("project question", None, threading.Event(), lambda *_: None)
