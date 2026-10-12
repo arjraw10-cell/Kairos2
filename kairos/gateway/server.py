@@ -634,6 +634,12 @@ def create_app(manager: GatewayManager | None = None) -> FastAPI:
                             effort=payload.get("effort"),
                         )
                         await send(ack(request_id, info))
+                    elif command == Command.SUBAGENT_LIST:
+                        subagents = gateway.list_subagents(conversation_id)
+                        await send(ack(request_id, {"subagents": subagents}))
+                    elif command == Command.SUBAGENT_STOP_ALL:
+                        stopped = gateway.stop_subagents(conversation_id)
+                        await send(ack(request_id, {"stopped": stopped}))
                     elif command == Command.PING:
                         await send(ack(request_id, {"pong": True}))
                     else:

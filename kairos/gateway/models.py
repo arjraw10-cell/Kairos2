@@ -63,6 +63,7 @@ class Run:
     error: Optional[str] = None
     request_content: Optional[str] = None
     request_image_url: Optional[str] = None
+    origin: str = "user"  # "user" | "wake" (started by background notifications)
 
     def to_dict(self, include_request: bool = False) -> dict[str, Any]:
         result = {
@@ -70,6 +71,7 @@ class Run:
             "conversation_id": self.conversation_id,
             "status": self.status,
             "source": self.source,
+            "origin": self.origin,
             "client_id": self.client_id,
             "input_message_id": self.input_message_id,
             "started_at": self.started_at,

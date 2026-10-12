@@ -443,6 +443,210 @@ def fresh_workspace_test() -> None:
             workspaces.WORKSPACE_ROOT = previous_root
 
 
+class BackgroundFakeAgent(FakeAgent):
+    """FakeAgent with the Agent background-event API (see kairos/agent.py)."""
+
+    instances: list = []
+
+    def __init__(self, workspace: str):
+        super().__init__(workspace)
+        self.on_background_event = None
+        self.on_subagent_status = None
+        self.held: list = []
+        self.busy = False
+        self.runs: list = []
+        self.subagent_tool = type("Subagents", (), {
+            "mark_lost": lambda _self: self._lose(),
+            "child_agents": lambda _self: [],
+        })()
+        type(self).instances.append(self)
+
+    def _lose(self):
+        if self.busy:
+            self.busy = False
+            self.on_subagent_status({"subagent_id": "s1", "state": "lost", "elapsed_s": 1.0, "prompt": "p", "recent_actions": []})
+            self.on_background_event(bg_event("lost"))
+        return 0
+
+    def add_background_events(self, events):
+        self.held.extend(events)
+
+    def drain_background_events(self):
+        events, self.held = self.held, []
+        return events
+
+    def has_background_work(self):
+        return self.busy
+
+    def subagent_statuses(self):
+        return [{"subagent_id": "s1", "state": "running" if self.busy else "idle", "elapsed_s": 1.0, "prompt": "p", "recent_actions": []}]
+
+    def stop_subagents(self):
+        stopped, self.busy = int(self.busy), False
+        return stopped
+
+    def run(self, content, image_url=None):
+        self.runs.append((content, [e["id"] for e in self.drain_background_events()]))
+        return super().run(content, image_url)
+
+
+def bg_event(name: str) -> dict:
+    return {"id": name, "kind": "subagent_finished", "subagent_id": "s1", "text": f"result {name}", "created_at": 0.0}
+
+
+async def wait_until(predicate, timeout: float = 5.0) -> bool:
+    for _ in range(int(timeout / 0.01)):
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return predicate()
+
+
+def background_manager(directory: str, **kwargs) -> GatewayManager:
+    BackgroundFakeAgent.instances = []
+    return GatewayManager(
+        GatewayRepository(Path(directory) / "data"),
+        max_concurrent_runs=1,
+        agent_factory=BackgroundFakeAgent,
+        wake_debounce=kwargs.pop("wake_debounce", 0.05),
+        **kwargs,
+    )
+
+
+def wake_run_test() -> None:
+    from kairos.wake import NOTIFICATION_PREFIX
+
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            manager = background_manager(directory, wake_debounce=0.2)
+            conversation = manager.create_conversation(directory)
+            runtime = await manager.load_runtime(conversation.id)
+            agent = runtime.agent
+            # Two events inside one debounce window: one wake run with both.
+            agent.on_background_event(bg_event("e1"))
+            agent.on_background_event(bg_event("e2"))
+            assert await wait_until(lambda: agent.runs and manager.get_runtime(conversation.id).is_running is False and len(agent.conversation_history) == 3)
+            await asyncio.sleep(0.3)
+            assert len(agent.runs) == 1, agent.runs
+            content, _held = agent.runs[0]
+            assert content.startswith(NOTIFICATION_PREFIX) and "result e1" in content and "result e2" in content
+            events = manager.events_after(conversation.id)
+            names = [e["event"] for e in events]
+            assert names.count("background.notification") == 2
+            note = next(e for e in events if e["event"] == "background.notification")["data"]
+            assert note["conversation_id"] == conversation.id and note["notifications"][0]["id"] == "e1"
+            started = next(e for e in events if e["event"] == "run.started")["data"]
+            assert started["origin"] == "wake" and started["run"]["origin"] == "wake"
+            completed = next(e for e in events if e["event"] == "run.completed")["data"]
+            assert completed["origin"] == "wake"
+
+            # A user message sent while the conversation is busy takes the
+            # pending notification with it instead of a separate wake.
+            runtime.is_running = True  # simulate an active run
+            agent.on_background_event(bg_event("e3"))
+            await asyncio.sleep(0.3)
+            assert len(agent.runs) == 1
+            runtime.is_running = False
+            run = await manager.submit_message(conversation.id, "hi")
+            assert await wait_until(lambda: manager.repository.get_run(run.id).status == "completed")
+            assert agent.runs[-1] == ("hi", ["e3"]), agent.runs
+            assert manager.repository.get_run(run.id).origin == "user"
+            await asyncio.sleep(0.3)
+            assert len(agent.runs) == 2  # e3 was not also delivered by a wake
+            await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def wake_cap_test() -> None:
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            manager = background_manager(directory, wake_cap=1)
+            conversation = manager.create_conversation(directory)
+            agent = (await manager.load_runtime(conversation.id)).agent
+            agent.on_background_event(bg_event("e1"))
+            assert await wait_until(lambda: len(agent.runs) == 1)
+            assert await wait_until(lambda: not manager.get_runtime(conversation.id).is_running)
+            agent.on_background_event(bg_event("e2"))
+            assert await wait_until(lambda: any(e["event"] == "wake.paused" for e in manager.events_after(conversation.id)))
+            paused = next(e for e in manager.events_after(conversation.id) if e["event"] == "wake.paused")["data"]
+            assert paused == {"conversation_id": conversation.id, "pending": 1}, paused
+            await asyncio.sleep(0.2)
+            assert len(agent.runs) == 1
+            run = await manager.submit_message(conversation.id, "back")
+            assert await wait_until(lambda: manager.repository.get_run(run.id).status == "completed")
+            assert agent.runs[-1] == ("back", ["e2"]), agent.runs
+            # The user message reset the counter: waking works again.
+            agent.on_background_event(bg_event("e3"))
+            assert await wait_until(lambda: len(agent.runs) == 3)
+            await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def unload_protection_and_lost_test() -> None:
+    from unittest import mock
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(seconds, *args, **kwargs):
+        await real_sleep(0.01)
+
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            manager = background_manager(directory)
+            conversation = manager.create_conversation(directory)
+            agent = (await manager.load_runtime(conversation.id)).agent
+            agent.busy = True
+            manager.get_runtime(conversation.id).last_activity = 0
+            with mock.patch("kairos.gateway.manager.asyncio.sleep", fast_sleep):
+                task = asyncio.create_task(manager.cleanup_idle(max_idle_seconds=1))
+                await real_sleep(0.2)
+                assert manager.get_runtime(conversation.id) is not None  # busy: kept
+                agent.busy = False
+                assert await wait_until(lambda: manager.get_runtime(conversation.id) is None)
+                task.cancel()
+
+            # Shutdown with a running sub-agent: lost status + saved notification.
+            agent = (await manager.load_runtime(conversation.id)).agent
+            agent.busy = True
+            await manager.shutdown()
+            names = [e["event"] for e in manager.events_after(conversation.id)]
+            assert "subagent.status" in names and "background.notification" in names
+            status = next(e for e in manager.events_after(conversation.id) if e["event"] == "subagent.status")["data"]
+            assert status["state"] == "lost" and status["conversation_id"] == conversation.id
+            restarted = background_manager(directory)
+            agent = (await restarted.load_runtime(conversation.id)).agent
+            assert [e["id"] for e in agent.held] == ["lost"], agent.held
+            await restarted.shutdown()
+
+    asyncio.run(scenario())
+
+
+def subagent_commands_test() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        manager = background_manager(directory)
+        with TestClient(create_app(manager)) as client, client.websocket_connect("/api/v1/ws") as ws:
+            def command(name, conversation_id=None, **payload):
+                ws.send_json({"type": "command", "command": name, "request_id": name,
+                              "conversation_id": conversation_id, "payload": payload})
+                return ws.receive_json()
+
+            created = command("conversation.create", workspace=directory)["data"]["conversation"]
+            reply = command("subagent.list", created["id"])
+            assert reply["ok"] and reply["data"] == {"subagents": []}, reply  # not loaded
+            command("conversation.load", created["id"])
+            BackgroundFakeAgent.instances[-1].busy = True
+            reply = command("subagent.list", created["id"])
+            assert reply["data"]["subagents"][0]["state"] == "running", reply
+            reply = command("subagent.stop_all", created["id"])
+            assert reply["ok"] and reply["data"] == {"stopped": 1}, reply
+            reply = command("subagent.stop_all", created["id"])
+            assert reply["data"] == {"stopped": 0}, reply
+            reply = command("subagent.list", "conv_missing")
+            assert reply["type"] == "error" and reply["code"] == "not_found", reply
+
+
 def main() -> None:
     tests = [
         terminal_test,
@@ -458,6 +662,10 @@ def main() -> None:
         model_config_test,
         model_settings_migration_test,
         fresh_workspace_test,
+        wake_run_test,
+        wake_cap_test,
+        unload_protection_and_lost_test,
+        subagent_commands_test,
     ]
     for test in tests:
         print(f"running {test.__name__}", flush=True)

@@ -19,6 +19,8 @@ class Command:
     CANCEL = "run.cancel"
     MODEL_LIST = "model.list"
     CONFIGURE = "conversation.configure"
+    SUBAGENT_LIST = "subagent.list"
+    SUBAGENT_STOP_ALL = "subagent.stop_all"
     PING = "ping"
 
 

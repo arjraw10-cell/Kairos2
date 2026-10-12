@@ -8,6 +8,7 @@ from .terminal import (
     ReadLogsTool,
     CloseTerminalTool,
     GetTerminalInfoTool,
+    StopCommandTool,
 )
 from .search import SearchTool
 from .git import GitTool
@@ -33,6 +34,7 @@ __all__ = [
     "ReadLogsTool",
     "CloseTerminalTool",
     "GetTerminalInfoTool",
+    "StopCommandTool",
     "SearchTool",
     "GitTool",
     "SessionManager",

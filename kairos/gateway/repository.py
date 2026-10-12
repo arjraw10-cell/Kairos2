@@ -15,7 +15,7 @@ from .models import Conversation, Run, StoredMessage, new_id, utc_now
 class GatewayRepository:
     """Thread-safe repository using one short-lived SQLite connection per call."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, data_dir: str | os.PathLike[str] | None = None):
         if data_dir is None:
@@ -117,10 +117,15 @@ class GatewayRepository:
             if "model_settings" not in columns:
                 # JSON {setup, model, provider, effort}; NULL = default setup.
                 conn.execute("ALTER TABLE conversations ADD COLUMN model_settings TEXT")
+            if "pending_notifications" not in columns:
+                # JSON list of background events saved at unload/shutdown and
+                # handed to the next run when the runtime loads again.
+                conn.execute("ALTER TABLE conversations ADD COLUMN pending_notifications TEXT")
             run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
             for name, definition in (
                 ("request_content", "TEXT"),
                 ("request_image_url", "TEXT"),
+                ("origin", "TEXT NOT NULL DEFAULT 'user'"),
             ):
                 if name not in run_columns:
                     conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
@@ -150,6 +155,7 @@ class GatewayRepository:
             source=row["source"], client_id=row["client_id"], input_message_id=row["input_message_id"],
             started_at=row["started_at"], completed_at=row["completed_at"], error=row["error"],
             request_content=row["request_content"], request_image_url=row["request_image_url"],
+            origin=row["origin"],
         )
 
     def upsert_workspace(self, path: str, display_name: str = "") -> dict[str, Any]:
@@ -239,6 +245,34 @@ class GatewayRepository:
                 "UPDATE conversations SET model_settings = ? WHERE id = ?",
                 (json.dumps(settings), conversation_id),
             )
+
+    def add_pending_notifications(self, conversation_id: str, events: list[dict[str, Any]]) -> None:
+        """Append background events to deliver when the runtime loads again."""
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT pending_notifications FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+                existing = json.loads(row["pending_notifications"]) if row and row["pending_notifications"] else []
+                conn.execute(
+                    "UPDATE conversations SET pending_notifications = ? WHERE id = ?",
+                    (json.dumps(existing + events, ensure_ascii=False), conversation_id),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def take_pending_notifications(self, conversation_id: str) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT pending_notifications FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+                conn.execute("UPDATE conversations SET pending_notifications = NULL WHERE id = ?", (conversation_id,))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return json.loads(row["pending_notifications"]) if row and row["pending_notifications"] else []
 
     def delete_conversation(self, conversation_id: str) -> bool:
         # Explicit child cleanup keeps deletion compatible with databases
@@ -345,10 +379,10 @@ class GatewayRepository:
             result.append(StoredMessage(id=row["id"], conversation_id=row["conversation_id"], sequence=row["sequence"], role=message.get("role", row["role"]), content=message.get("content", ""), run_id=row["run_id"], tool_call_id=message.get("tool_call_id", row["tool_call_id"]), name=message.get("name", row["name"]), internal=bool(row["internal"]), created_at=row["created_at"]))
         return result
 
-    def create_run(self, conversation_id: str, content: str, image_url: str | None = None, source: str = "api", client_id: str | None = None) -> Run:
-        run = Run(id=new_id("run"), conversation_id=conversation_id, source=source, client_id=client_id, request_content=content, request_image_url=image_url)
+    def create_run(self, conversation_id: str, content: str, image_url: str | None = None, source: str = "api", client_id: str | None = None, origin: str = "user") -> Run:
+        run = Run(id=new_id("run"), conversation_id=conversation_id, source=source, client_id=client_id, request_content=content, request_image_url=image_url, origin=origin)
         with closing(self._connect()) as conn:
-            conn.execute("INSERT INTO runs(id, conversation_id, status, source, client_id, request_content, request_image_url) VALUES (?, ?, 'queued', ?, ?, ?, ?)", (run.id, run.conversation_id, run.source, run.client_id, content, image_url))
+            conn.execute("INSERT INTO runs(id, conversation_id, status, source, client_id, request_content, request_image_url, origin) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)", (run.id, run.conversation_id, run.source, run.client_id, content, image_url, origin))
         return run
 
     def get_run(self, run_id: str) -> Run | None:
