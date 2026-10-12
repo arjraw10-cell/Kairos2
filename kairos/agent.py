@@ -297,7 +297,7 @@ class Agent:
             "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, "
             + ("and inspect version control.\n\n" if sub else "inspect version control, and browse the web.\n\n") +
             "You think step-by-step. Before making changes, you read the relevant files to understand the current state. After making changes, you verify they work. When something fails, you read the error carefully and adjust.\n\n"
-            "You have absolute access to the filesystem. All file paths must be absolute (e.g., C:/Users/me/project/main.py or /home/me/project/main.py). You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
+            "You have full access to the filesystem. Relative file paths resolve against your workspace (below), and terminals start there; use absolute paths (e.g., C:/Users/me/project/main.py or /home/me/project/main.py) to reach anywhere else. You are not sandboxed \u2014 you can read any file you have permission to, and write to any location you have permission to.\n\n"
             "Each tool either succeeds and returns output, or fails and returns an error message. When a tool fails, the error tells you exactly what went wrong \u2014 use that information to fix your approach. Never retry the exact same call that just failed without changing something.\n\n"
             "Whenever the user asks you to look at a project, it usually has an AGENTS.md file and a README.md file. You should use these files to understand the project and the codebase, and ALWAYS follow the instructions mentioned in the AGENTS.md files. Make sure to look for this file in any projects the user points you towards. The AGENTS.md will automatically be injected into your system prompt in the directory the user starts in, but if they point you towards a different directory, it will not automatically be injected, so you will have to look for the AGENTS.md file in that directory. Note that the AGENTS.md does not always exist.\n\n"
             + ("When you finish your task, your final message (that has no tool calls) is returned as your result to the agent that started you.\n\n" if sub else
@@ -361,14 +361,14 @@ class Agent:
                 "function": {
                     "name": "read",
                     "description": (
-                        "Read a file at the given absolute path. Supports UTF-8 text files and "
-                        "images (.png, .jpg, .jpeg, .gif, .webp, .bmp, .tiff, .tif, .svg). "
-                        "Images are returned as vision data for visual analysis."
+                        "Read a file (absolute, or relative to the workspace). Supports UTF-8 text files "
+                        "(SVG is read as text) and PNG, JPEG, GIF and WebP images up to about 3.9 MB, "
+                        "which are returned as vision data for visual analysis."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Absolute file path"}
+                            "path": {"type": "string", "description": "File path (absolute, or relative to the workspace)"}
                         },
                         "required": ["path"],
                     },
@@ -382,7 +382,7 @@ class Agent:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Absolute file path"},
+                            "path": {"type": "string", "description": "File path (absolute, or relative to the workspace)"},
                             "content": {"type": "string", "description": "File content"},
                         },
                         "required": ["path", "content"],
@@ -397,7 +397,7 @@ class Agent:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Absolute file path"},
+                            "path": {"type": "string", "description": "File path (absolute, or relative to the workspace)"},
                             "oldText": {"type": "string", "description": "Exact text to find (must appear exactly once)"},
                             "newText": {"type": "string", "description": "Replacement text"},
                         },
@@ -414,7 +414,7 @@ class Agent:
                         "type": "object",
                         "properties": {
                             "pattern": {"type": "string", "description": "Regex pattern to match against file contents"},
-                            "path": {"type": "string", "description": "Directory to search in (defaults to cwd)"},
+                            "path": {"type": "string", "description": "Directory to search in (defaults to the workspace)"},
                             "include": {"type": "string", "description": "Filename glob filter"},
                             "max_results": {"type": "integer", "description": "Max matches to return (default 50)"},
                             "timeout": {"type": "number", "description": "Maximum search time in seconds (default 10; non-negative)"},

@@ -286,7 +286,7 @@ Host API: `add_background_events(events)` (hand events to the next run), `drain_
 
 #### System Prompt (`_setup_system_prompt`)
 
-Sections: base instructions (role, filesystem access — the text still says all paths must be absolute, although relative paths now resolve against the workspace — tool failures, AGENTS.md handling), Terminal Tools, Background Work (notifications arrive as `[Background notification]`; never poll, sleep or wait), Tool Result Limits, Web Search, Browser Tools, Native Desktop Tools, and the workspace path. Then the workspace's `AGENTS.md` (if present) under `## AGENTS.md (Architecture Documentation)`, and the skill names from `skills/` (or a note that none exist).
+Sections: base instructions (role, filesystem access — relative paths resolve against the workspace, absolute paths reach anywhere — tool failures, AGENTS.md handling), Terminal Tools, Background Work (notifications arrive as `[Background notification]`; never poll, sleep or wait), Tool Result Limits, Web Search, Browser Tools, Native Desktop Tools, and the workspace path. Then the workspace's `AGENTS.md` (if present) under `## AGENTS.md (Architecture Documentation)`, and the skill names from `skills/` (or a note that none exist).
 
 Sub-agents get their own variant (`_is_subagent`; `SubAgentTool._create_sub_agent` rebuilds the prompt after marking the Agent): no browser section or browser mention, no sub-agent notifications, its final message is its result for the parent agent, and background notifications reach it only while it is still working.
 
@@ -443,7 +443,7 @@ class ReadTool:
     def __call__(self, path: str) -> ToolResult:
 ```
 
-The `read` schema tells the model that it supports UTF-8 text files and images, returned as vision data (its text still lists `.bmp`, `.tiff`, `.tif` and `.svg` among the image types).
+The `read` schema tells the model it accepts absolute or workspace-relative paths, UTF-8 text (SVG is read as text) and PNG, JPEG, GIF and WebP images up to about 3.9 MB, returned as vision data.
 
 - **Images**: PNG, JPEG, GIF and WebP only (the formats OpenAI and Anthropic both accept), detected from the file's content, not its extension; returned as a base64 data URL in `image_url`. Max 3,932,160 bytes (`MAX_IMAGE_BYTES`), so the base64 data stays under Anthropic's 5 MB limit.
 - A file with an image extension (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.tiff`, `.tif`) whose content is not a supported format is refused with a conversion hint
@@ -492,7 +492,7 @@ class SearchTool:
 ```
 
 - Searches `path` (relative paths resolve against the workspace), or the workspace when `path` is omitted
-- Compiles `pattern` with the `regex` module (`IGNORECASE`; installed with `tiktoken`); `os.walk` with `SKIP_DIRS` pruning; `include` glob via `fnmatch.translate()`
+- Compiles `pattern` with the `regex` module (`IGNORECASE`; listed in `requirements.txt`); `os.walk` with `SKIP_DIRS` pruning; `include` glob via `fnmatch.translate()`
 - Skips binary files (a `\x00` in the first 512 bytes)
 - Enforces a finite, non-negative timeout (default 10 s) with a monotonic deadline; each line match gets the remaining time as its own `regex` timeout, so a catastrophic pattern cannot run past the deadline; a timed-out search fails with the partial matches found so far
 - Validates `max_results` as a positive integer; returns `"file:line: text"` lines
@@ -630,7 +630,7 @@ Run the unittest suites with `python -m unittest discover -s tests -v`; the pyte
 5. **Never Poll** — Background work reports back through notifications and wakes
 6. **Token Aware** — Session, context, and turn token counts displayed
 7. **Config in Two Places** — Models and keys in `provider.json`; everything else in environment variables, read on first access
-8. **Minimal Dependencies** — `openai`, `rich`, `prompt_toolkit`, `tiktoken`, `fastapi`, `uvicorn`, `websockets`, `playwright`, `cloakbrowser` (`httpx` comes with `openai`; `regex`, used by `search`, comes with `tiktoken`)
+8. **Minimal Dependencies** — `openai`, `rich`, `prompt_toolkit`, `tiktoken`, `regex`, `fastapi`, `uvicorn`, `websockets`, `playwright`, `cloakbrowser` (`httpx` comes with `openai`)
 
 ## Adding New Tools
 

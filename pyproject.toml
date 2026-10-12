@@ -16,6 +16,7 @@ dependencies = [
     "uvicorn[standard]>=0.34",
     "websockets>=14.0",
     "tiktoken>=0.7.0",
+    "regex",
 ]
 
 [project.optional-dependencies]

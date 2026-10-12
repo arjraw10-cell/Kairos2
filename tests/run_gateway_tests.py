@@ -833,12 +833,15 @@ class StopAwareAgent(FakeAgent):
 
         super().__init__(workspace)
         self._interrupt_event = threading.Event()
-        self._stop_requested = False
         self.after_run = None  # called once at the very end of run()
 
     def interrupt(self):
         self._interrupt_event.set()
-        self._stop_requested = True
+
+    def clear_stop(self):
+        # Same public contract as Agent.clear_stop(), which the gateway calls
+        # to drop a stop that arrived after its run had ended.
+        self._interrupt_event.clear()
 
     def run(self, content, image_url=None):
         if self._interrupt_event.is_set():
@@ -846,7 +849,6 @@ class StopAwareAgent(FakeAgent):
             return "[Stopped — waiting for your input]"
         result = super().run(content, image_url)
         self._interrupt_event.clear()
-        self._stop_requested = False
         hook, self.after_run = self.after_run, None
         if hook:
             hook()

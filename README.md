@@ -12,7 +12,7 @@ A minimal personal coding agent in Python.
 - **Workspaces**: `kairos <path>` or `kairos .` works in a folder; `kairos` alone starts in a fresh folder under `Documents/kairos_workspace`
 - **Workspace-relative Paths**: Relative paths in file tools resolve against the conversation's workspace, and terminals start there; absolute paths reach anywhere — no workspace restrictions
 - **Streaming First**: Tokens print as they arrive; no waiting for full responses
-- **Token Aware**: Session, context window, and per-turn token counts displayed after every turn, using provider-reported usage when available and tiktoken estimates otherwise
+- **Token Aware**: after every model call: context used (% and tokens / window), that call's output tokens, session input/output tokens and session cost, using provider-reported usage when available and tiktoken estimates otherwise
 - **Auto-Compaction**: History is summarized when the context passes 80% of the budget; estimates include tool schemas and tool-call metadata, and the compaction request itself is bounded
 - **Browser Automation**: CloakBrowser stealth Chromium, always headed (visible) and always humanized, launched lazily on first use. Accessibility snapshots with element refs, diff snapshots after actions, dialog handling, iframes, tabs, persistent profiles with pinned fingerprints, and console/network inspection.
 - **Native Desktop Automation**: Optional Cua Driver integration exposes native window discovery, accessibility-tree snapshots, screenshots, app launching, clicking, typing, keyboard, scrolling, dragging, and window actions. Accessibility element indices are the primary addressing mode; pixel coordinates are available as a fallback. Desktop tools are available to sub-agents and are loaded lazily when Cua Driver is installed.
@@ -321,7 +321,7 @@ Kairos auto-loads an `AGENTS.md` file from the workspace root into the system pr
 4. **Interruptible** — Esc and Ctrl+C stop the main agent and hand control back at once; `/stop` stops sub-agents
 5. **Never Poll** — Background work reports back through notifications and wakes
 6. **Token Aware** — Session, context, and turn token counts displayed
-7. **Minimal Dependencies** — `openai`, `rich`, `prompt_toolkit`, `tiktoken`, `fastapi`, `uvicorn`, `websockets`, `playwright`, `cloakbrowser`
+7. **Minimal Dependencies** — `openai`, `rich`, `prompt_toolkit`, `tiktoken`, `regex`, `fastapi`, `uvicorn`, `websockets`, `playwright`, `cloakbrowser`
 8. **Loud by Default** — Tools always report what they did. Success includes specifics (e.g. "Wrote 42 lines to `main.py`"). Failure clearly states what went wrong. Nothing happens silently — overwrites, creations, and deletions are always announced.
 
 ## Tests

@@ -19,7 +19,7 @@ if not errorlevel 1 goto launch_cli
 echo [kairos] Starting the gateway...
 rem cmd /k keeps the window (and the error) when the gateway exits.
 start "Kairos Gateway" /min /D "%KAIROS_ROOT%" cmd /k py -m kairos.gateway_main
-curl.exe -sf -o NUL --connect-timeout 1 --retry 30 --retry-delay 1 --retry-connrefused --retry-max-time 40 "%KAIROS_HEALTH_URL%" >NUL 2>&1
+curl.exe -sf -o NUL --connect-timeout 1 --retry 30 --retry-delay 1 --retry-connrefused --retry-max-time 30 "%KAIROS_HEALTH_URL%" >NUL 2>&1
 if errorlevel 1 echo [kairos] The gateway did not start; see the "Kairos Gateway" window.
 
 :launch_cli
