@@ -15,6 +15,7 @@ from .session import SessionManager
 from .subagent import SubAgentTool
 from .browser import BrowserTool, BrowserScreenshotTool
 from .skills import SkillManager
+from .web_search import WebSearchTool
 from .desktop import (
     DesktopDoctorTool, DesktopListWindowsTool, DesktopWindowStateTool,
     DesktopScreenshotTool, DesktopLaunchAppTool, DesktopClickTool,
@@ -39,6 +40,7 @@ __all__ = [
     "BrowserTool",
     "BrowserScreenshotTool",
     "SkillManager",
+    "WebSearchTool",
     "DesktopDoctorTool", "DesktopListWindowsTool", "DesktopWindowStateTool",
     "DesktopScreenshotTool", "DesktopLaunchAppTool", "DesktopClickTool",
     "DesktopTypeTool", "DesktopPressKeyTool", "DesktopHotkeyTool", "DesktopScrollTool",
