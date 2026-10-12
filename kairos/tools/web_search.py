@@ -6,7 +6,8 @@ import httpx
 from .base import ToolResult
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
-USE_BROWSER = "Use the browser to search instead."
+USE_BROWSER = ("Use the browser to search instead "
+               "(sub-agents have no browser: say in your result that web search was unavailable).")
 SNIPPET_CHARS = 300
 
 
