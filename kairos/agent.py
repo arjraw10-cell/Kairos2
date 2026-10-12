@@ -15,16 +15,7 @@ from .tools import (
     ReadTool, WriteTool, EditTool,
     NewTerminalTool, ExecuteCommandTool, ReadLogsTool, CloseTerminalTool, GetTerminalInfoTool,
     SearchTool, GitTool, SubAgentTool,
-    BrowserLaunchTool, BrowserNavigateTool, BrowserClickTool, BrowserClickIndexTool,
-    BrowserTypeTool, BrowserTypeIndexTool, BrowserSelectTool, BrowserSelectIndexTool,
-    BrowserSnapshotTool, BrowserScreenshotTool, BrowserScrollTool, BrowserWaitTool,
-    BrowserSendKeysTool, BrowserSearchPageTool, BrowserFindElementsTool,
-    BrowserTabListTool, BrowserTabSwitchTool, BrowserTabOpenTool, BrowserEvaluateTool,
-    BrowserGoBackTool, BrowserGoForwardTool, BrowserReloadTool, BrowserCloseTool,
-    BrowserClickXYTool, BrowserSwitchFrameTool,
-    BrowserHoverTool, BrowserHoverIndexTool, BrowserDragTool, BrowserDragXYTool, BrowserWaitForTool,
-    BrowserListConsoleMessagesTool, BrowserGetConsoleMessageTool,
-    BrowserListNetworkRequestsTool, BrowserGetNetworkRequestTool,
+    BrowserTool, BrowserScreenshotTool,
     DesktopDoctorTool, DesktopListWindowsTool, DesktopWindowStateTool, DesktopScreenshotTool,
     DesktopLaunchAppTool, DesktopClickTool, DesktopTypeTool, DesktopPressKeyTool,
     DesktopHotkeyTool, DesktopScrollTool, DesktopMoveTool, DesktopDragTool, DesktopWindowActionTool,
@@ -92,45 +83,31 @@ class Agent:
             model=self.model,
         )
 
-        # Browser tools
+        # Browser tools: each forwards to one BrowserManager method
         self.browser_manager = BrowserManager()
-        self.browser_launch_tool = BrowserLaunchTool(self.browser_manager)
-        self.browser_navigate_tool = BrowserNavigateTool(self.browser_manager)
-        self.browser_click_tool = BrowserClickTool(self.browser_manager)
-        self.browser_click_index_tool = BrowserClickIndexTool(self.browser_manager)
-        self.browser_type_tool = BrowserTypeTool(self.browser_manager)
-        self.browser_type_index_tool = BrowserTypeIndexTool(self.browser_manager)
-        self.browser_select_tool = BrowserSelectTool(self.browser_manager)
-        self.browser_select_index_tool = BrowserSelectIndexTool(self.browser_manager)
-        self.browser_snapshot_tool = BrowserSnapshotTool(self.browser_manager)
-        self.browser_screenshot_tool = BrowserScreenshotTool(self.browser_manager)
-        self.browser_scroll_tool = BrowserScrollTool(self.browser_manager)
-        self.browser_wait_tool = BrowserWaitTool(self.browser_manager)
-        self.browser_send_keys_tool = BrowserSendKeysTool(self.browser_manager)
-        self.browser_search_page_tool = BrowserSearchPageTool(self.browser_manager)
-        self.browser_find_elements_tool = BrowserFindElementsTool(self.browser_manager)
-
-        self.browser_tab_list_tool = BrowserTabListTool(self.browser_manager)
-        self.browser_tab_switch_tool = BrowserTabSwitchTool(self.browser_manager)
-        self.browser_tab_open_tool = BrowserTabOpenTool(self.browser_manager)
-        self.browser_evaluate_tool = BrowserEvaluateTool(self.browser_manager)
-        self.browser_go_back_tool = BrowserGoBackTool(self.browser_manager)
-        self.browser_go_forward_tool = BrowserGoForwardTool(self.browser_manager)
-        self.browser_reload_tool = BrowserReloadTool(self.browser_manager)
-        self.browser_close_tool = BrowserCloseTool(self.browser_manager)
-        self.browser_click_xy_tool = BrowserClickXYTool(self.browser_manager)
-        self.browser_switch_frame_tool = BrowserSwitchFrameTool(self.browser_manager)
-        self.browser_hover_tool = BrowserHoverTool(self.browser_manager)
-        self.browser_hover_index_tool = BrowserHoverIndexTool(self.browser_manager)
-        self.browser_drag_tool = BrowserDragTool(self.browser_manager)
-        self.browser_drag_xy_tool = BrowserDragXYTool(self.browser_manager)
-        self.browser_wait_for_tool = BrowserWaitForTool(self.browser_manager)
-
-        # Console & network monitoring tools
-        self.browser_list_console_messages_tool = BrowserListConsoleMessagesTool(self.browser_manager)
-        self.browser_get_console_message_tool = BrowserGetConsoleMessageTool(self.browser_manager)
-        self.browser_list_network_requests_tool = BrowserListNetworkRequestsTool(self.browser_manager)
-        self.browser_get_network_request_tool = BrowserGetNetworkRequestTool(self.browser_manager)
+        bm = self.browser_manager
+        self.browser_tools = {
+            "browser_navigate": BrowserTool(bm.navigate, "Navigation"),
+            "browser_snapshot": BrowserTool(bm.snapshot, "Snapshot"),
+            "browser_click": BrowserTool(bm.click, "Click"),
+            "browser_type": BrowserTool(bm.type, "Type"),
+            "browser_fill_form": BrowserTool(bm.fill_form, "Fill form"),
+            "browser_select": BrowserTool(bm.select, "Select"),
+            "browser_hover": BrowserTool(bm.hover, "Hover"),
+            "browser_drag": BrowserTool(bm.drag, "Drag"),
+            "browser_press_key": BrowserTool(bm.press_key, "Key press"),
+            "browser_scroll": BrowserTool(bm.scroll, "Scroll"),
+            "browser_wait_for": BrowserTool(bm.wait_for, "Wait"),
+            "browser_evaluate": BrowserTool(bm.evaluate, "JavaScript"),
+            "browser_search_page": BrowserTool(bm.search_page, "Search page"),
+            "browser_tabs": BrowserTool(bm.tabs, "Tabs"),
+            "browser_handle_dialog": BrowserTool(bm.handle_dialog, "Dialog"),
+            "browser_console": BrowserTool(bm.console, "Console"),
+            "browser_network": BrowserTool(bm.network, "Network"),
+            "browser_profile": BrowserTool(bm.profile, "Profile"),
+            "browser_close": BrowserTool(bm.close, "Close"),
+        }
+        self.browser_screenshot_tool = BrowserScreenshotTool(bm)
 
         # Native desktop tools backed by Cua Driver. Desktop access is also
         # intentionally available to sub-agents; each Agent owns its own Cua
@@ -225,29 +202,14 @@ class Agent:
             "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call requires a finite positive timeout; values above 20 seconds are capped at 20 seconds. Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately, the persistent shell stays alive, and a completion notification containing capped output is delivered while the agent is active or queued for the next user message when the agent is idle. The full output remains available through read_logs.\n\n"
             f"## Tool Result Limits\nText returned by tools is capped before it is added to conversation history: up to {self.max_tool_result_chars:,} characters per tool result. Oversized results contain a truncation marker and preserve both the beginning and end. Use narrower commands or queries; for complete background-terminal output, use read_logs.\n\n"
             "## Browser Tools\n"
-            "You can browse the web using browser tools. The workflow is:\n"
-            "1. `browser_launch` \u2014 start the browser (optionally with a named profile for persistent sessions)\n"
-            "2. `browser_navigate` \u2014 go to a URL\n"
-            "3. `browser_snapshot` \u2014 observe the page (shows elements with indices [0],[1]... and CSS selectors)\n"
-            "4. `browser_click_index` / `browser_type_index` \u2014 interact by element index (PREFERRED)\n"
-            "   Also: `browser_click` / `browser_type` with CSS selectors (fallback)\n"
-            "5. `browser_scroll` \u2014 scroll up/down by viewport heights\n"
-            "6. `browser_search_page` \u2014 grep the live page for text (zero LLM cost)\n"
-            "7. `browser_find_elements` \u2014 query DOM by CSS selector (zero LLM cost)\n"
-            "8. `browser_send_keys` \u2014 keyboard shortcuts (Enter, Tab, Control+a, etc.)\n"
-            "9. `browser_screenshot` \u2014 capture visual screenshot (saves to ~/.kairos/screenshots/)\n"
-            "10. `browser_tab_open` / `browser_tab_switch` / `browser_tab_list` \u2014 manage multiple tabs\n"
-            "11. `browser_go_back` / `browser_go_forward` / `browser_reload` \u2014 navigation history\n"
-            "12. `browser_wait` \u2014 wait for animations/AJAX to complete\n"
-            "13. `browser_wait_for` \u2014 wait for a specific element or text to appear (more efficient than blind waiting)\n"
-            "14. `browser_switch_frame` \u2014 enter/exit iframes (including cross-origin via CDP)\n"
-            "15. `browser_hover` / `browser_hover_index` \u2014 hover over elements (for dropdowns, tooltips)\n"
-            "16. `browser_drag` / `browser_drag_xy` \u2014 drag and drop (for file uploads, sortable lists)\n"
-            "17. `browser_close` \u2014 shut down when done\n\n"
-            "PREFER index-based tools (browser_click_index, browser_type_index, browser_select_index, browser_hover_index) over selector-based ones.\n"
-            "All interaction tools automatically detect significant page changes (popups, navigation, big DOM shifts) and snapshot+screen when needed.\n"
-            "You can still use browser_snapshot and browser_screenshot explicitly when you want to observe the page.\n"
-            "Use named profiles (e.g. profile=\"Kairos\") to keep logins and cookies across sessions.\n\n"
+            "The browser is a headed, humanized CloakBrowser. It launches automatically on the first browser tool call.\n"
+            "1. `browser_navigate` opens a URL (or back / forward / reload) and returns an accessibility snapshot.\n"
+            "2. Elements in the snapshot carry refs like [ref=e12]; refs inside iframes or after the page navigates look like f1e12. Pass them as `ref` to click/type/select/hover/drag. Always use refs from the latest snapshot.\n"
+            "3. Every action returns the resulting page state: on the same page only the changed snapshot lines, after navigation the full snapshot. Call `browser_snapshot` only to see the whole page again.\n"
+            "4. If an action opens an alert/confirm/prompt, the result says so; answer it with `browser_handle_dialog` before anything else.\n"
+            "5. `browser_search_page` finds text when a snapshot is truncated; `browser_evaluate` reads anything else.\n"
+            "6. `browser_screenshot` is for visual checks only; prefer snapshots for reading and acting.\n"
+            "7. Use `browser_profile use <name>` only when a task needs a login (profiles keep cookies and a fixed fingerprint); return with `browser_profile ephemeral`.\n\n"
             "## Native Desktop Tools\n"
             "Native desktop tools use Cua Driver. Start with `desktop_doctor`, then `desktop_list_windows`, and use `desktop_window_state(pid, window_id)` before every interaction. Prefer `element_index` values from the latest accessibility snapshot for click/type/key/scroll actions. Use x/y coordinates only as a fallback when the accessibility tree is missing, degraded, stale, or the action did not land; never infer coordinates from the tree without checking the matching screenshot. Re-snapshot after every state-changing action to verify the result. Desktop state is session-scoped and available to sub-agents.\n\n"
             f"## Workspace\nYour current workspace is: {self.cwd}"
@@ -490,471 +452,159 @@ class Agent:
                 },
             },
             # ---- Browser Tools ----
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_launch",
-                    "description": "Launch an always-headed, always-humanized stealth browser. Legacy headless and humanize arguments are ignored; CDP attachment is not supported because Kairos must enforce this policy.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "profile": {"type": "string", "description": "Named persistent profile (e.g. 'Arjun', 'work')."},
-                            "proxy": {"type": "string", "description": "Proxy server URL"},
-                            "humanize": {"type": "boolean", "description": "Legacy compatibility flag; always enabled"},
-                            "headless": {"type": "boolean", "description": "Legacy compatibility flag; always disabled (browser is always headed)"},
-                            "chrome_profile": {"type": "string", "description": "Path to Chrome user data directory to copy"},
-                            "connect_cdp": {"type": "string", "description": "Connect to running Chrome via CDP"},
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_navigate",
-                    "description": "Navigate the current tab to a URL.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "url": {"type": "string", "description": "URL to navigate to (include https://)"},
-                        },
-                        "required": ["url"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_go_back",
-                    "description": "Navigate back in browser history.",
-                    "parameters": {"type": "object", "properties": {}, "required": []},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_go_forward",
-                    "description": "Navigate forward in browser history.",
-                    "parameters": {"type": "object", "properties": {}, "required": []},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_reload",
-                    "description": "Reload the current page.",
-                    "parameters": {"type": "object", "properties": {}, "required": []},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_click",
-                    "description": "Click an element on the page. TIP: Use browser_click_index instead for more reliable clicks.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "selector": {"type": "string", "description": "CSS selector, text selector, or visible text to click"},
-                        },
-                        "required": ["selector"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_click_index",
-                    "description": "Click an element by its snapshot index number. PREFERRED over browser_click for reliability.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer", "description": "Element index from browser_snapshot"},
-                        },
-                        "required": ["index"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_type",
-                    "description": "Type text into an input field. TIP: Use browser_type_index instead for more reliable input.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "selector": {"type": "string", "description": "CSS selector or placeholder text of the input field"},
-                            "text": {"type": "string", "description": "Text to type"},
-                            "press_enter": {"type": "boolean", "description": "Press Enter after typing"},
-                        },
-                        "required": ["selector", "text"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_type_index",
-                    "description": "Type text into an input element by its snapshot index number. PREFERRED over browser_type.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer", "description": "Element index from browser_snapshot"},
-                            "text": {"type": "string", "description": "Text to type"},
-                            "press_enter": {"type": "boolean", "description": "Press Enter after typing"},
-                        },
-                        "required": ["index", "text"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_select",
-                    "description": "Select an option from a <select> dropdown by its value attribute.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "selector": {"type": "string", "description": "CSS selector of the <select> element"},
-                            "value": {"type": "string", "description": "Value attribute of the option to select"},
-                        },
-                        "required": ["selector", "value"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_select_index",
-                    "description": "Select an option from a <select> dropdown by snapshot index. PREFERRED over browser_select.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer", "description": "Element index from browser_snapshot (must be a <select>)"},
-                            "value": {"type": "string", "description": "Value, label text, or numeric index of the option to select"},
-                        },
-                        "required": ["index", "value"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_snapshot",
-                    "description": "Get a compact text representation of the current page. PRIMARY way to observe a page.",
-                    "parameters": {"type": "object", "properties": {}, "required": []},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_screenshot",
-                    "description": "Capture a visual screenshot of the current page.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "full_page": {"type": "boolean", "description": "Capture the entire scrollable page (default false)"},
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_tab_list",
-                    "description": "List all open browser tabs with their index, title, and URL.",
-                    "parameters": {"type": "object", "properties": {}, "required": []},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_tab_switch",
-                    "description": "Switch to a different tab by index number or URL pattern match.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer", "description": "Tab index (0-based, from browser_tab_list)"},
-                            "url_pattern": {"type": "string", "description": "Switch to the first tab whose URL contains this text"},
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_tab_open",
-                    "description": "Open a new browser tab. Optionally navigate it to a URL immediately.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "url": {"type": "string", "description": "URL to open in the new tab (optional)"},
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_evaluate",
-                    "description": "Execute JavaScript in the current page and return the result.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "expression": {"type": "string", "description": "JavaScript expression or function body to evaluate"},
-                        },
-                        "required": ["expression"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_close",
-                    "description": "Close the browser and clean up all resources. Always close when done browsing.",
-                    "parameters": {"type": "object", "properties": {}, "required": []},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_click_xy",
-                    "description": "Click at absolute viewport coordinates (x, y). Useful for vision-based interaction.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "x": {"type": "number", "description": "Horizontal pixel coordinate (left=0)"},
-                            "y": {"type": "number", "description": "Vertical pixel coordinate (top=0)"},
-                        },
-                        "required": ["x", "y"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_scroll",
-                    "description": "Scroll the page up or down.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "direction": {"type": "string", "enum": ["down", "up"], "description": "Scroll direction"},
-                            "pages": {"type": "number", "description": "Number of viewport heights to scroll (default 1.0)"},
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_wait",
-                    "description": "Wait for a specified number of seconds (max 30). Useful for letting animations/AJAX complete.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "seconds": {"type": "integer", "description": "Seconds to wait (default 3, max 30)"},
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_wait_for",
-                    "description": "Wait for a specific element to become visible or text to appear on the page. More efficient than browser_wait for AJAX/dynamic content.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "selector": {"type": "string", "description": "CSS selector of element to wait for (provide selector OR text, not both)"},
-                            "text": {"type": "string", "description": "Text to wait for appearing on page (provide selector OR text, not both)"},
-                            "timeout": {"type": "integer", "description": "Max seconds to wait (default 10, max 30)"},
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_send_keys",
-                    "description": "Send a keyboard key or shortcut. Examples: 'Enter', 'Tab', 'Escape', 'Control+a'.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "keys": {"type": "string", "description": "Key name or shortcut (e.g. 'Enter', 'Control+a', 'Tab')"},
-                        },
-                        "required": ["keys"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_search_page",
-                    "description": "Search for text on the current page (like grep on the live DOM). Zero LLM cost.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "pattern": {"type": "string", "description": "Text or regex pattern to search for"},
-                            "regex": {"type": "boolean", "description": "Treat pattern as regex (default false)"},
-                            "case_sensitive": {"type": "boolean", "description": "Case-sensitive search (default false)"},
-                            "max_results": {"type": "integer", "description": "Max matches to return (default 20)"},
-                        },
-                        "required": ["pattern"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_find_elements",
-                    "description": "Query DOM elements by CSS selector. Returns matching elements with index, tag, and text. Zero LLM cost.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "selector": {"type": "string", "description": "CSS selector query"},
-                            "max_results": {"type": "integer", "description": "Max elements to return (default 50)"},
-                        },
-                        "required": ["selector"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_switch_frame",
-                    "description": "Switch the active context into an iframe, or back to the top-level page.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "frame_selector": {"type": "string", "description": "CSS selector, frame name, or URL fragment to match the iframe. Empty/null to return to top-level."},
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_hover",
-                    "description": "Hover over an element to trigger hover states (dropdown menus, tooltips, hover cards).",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "selector": {"type": "string", "description": "CSS selector or text to hover over"},
-                        },
-                        "required": ["selector"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_hover_index",
-                    "description": "Hover over an element by its snapshot index number. PREFERRED over browser_hover.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer", "description": "Element index from browser_snapshot"},
-                        },
-                        "required": ["index"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_drag",
-                    "description": "Drag an element to another element. Use for file uploads, sortable lists, Kanban boards.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "selector_from": {"type": "string", "description": "CSS selector of the element to drag"},
-                            "selector_to": {"type": "string", "description": "CSS selector of the destination element"},
-                        },
-                        "required": ["selector_from", "selector_to"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_drag_xy",
-                    "description": "Drag from one viewport coordinate to another.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "x1": {"type": "number", "description": "Start X coordinate"},
-                            "y1": {"type": "number", "description": "Start Y coordinate"},
-                            "x2": {"type": "number", "description": "End X coordinate"},
-                            "y2": {"type": "number", "description": "End Y coordinate"},
-                        },
-                        "required": ["x1", "y1", "x2", "y2"],
-                    },
-                },
-            },
-            # ---- Console & Network Monitoring ----
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_list_console_messages",
-                    "description": "List captured console messages from the current page. Enables CDP Runtime console capture on first call. Returns index, level, text preview, and source location.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "max_results": {"type": "integer", "description": "Max messages to return (default 50)"}
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_get_console_message",
-                    "description": "Inspect a single console message by its index from browser_list_console_messages. Returns full details: level, text, source, URL, line, column, timestamp.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer", "description": "Message index from browser_list_console_messages"}
-                        },
-                        "required": ["index"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_list_network_requests",
-                    "description": "List captured network requests from the current page. Enables CDP Network capture on first call. Returns index, HTTP method, status, URL, and duration.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "max_results": {"type": "integer", "description": "Max requests to return (default 50)"}
-                        },
-                        "required": [],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "browser_get_network_request",
-                    "description": "Inspect a single network request by its index from browser_list_network_requests. Returns full details: method, URL, status, headers, duration.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer", "description": "Request index from browser_list_network_requests"}
-                        },
-                        "required": ["index"],
-                    },
-                },
-            },
+            {"type": "function", "function": {
+                "name": "browser_navigate",
+                "description": "Open a URL in the current tab (launches the browser if needed), or pass back / forward / reload. Returns the page snapshot with [ref=eN] handles.",
+                "parameters": {"type": "object", "properties": {
+                    "url": {"type": "string", "description": "Absolute URL, or back | forward | reload"},
+                }, "required": ["url"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_snapshot",
+                "description": "Full accessibility snapshot of the current page with [ref=eN] handles. Actions already return page state; use this to see the whole page again.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_click",
+                "description": "Click an element by ref. Pass x/y instead of ref to click viewport coordinates (canvas, captchas, elements missing from the snapshot).",
+                "parameters": {"type": "object", "properties": {
+                    "ref": {"type": "string", "description": "Ref from the latest snapshot, e.g. e12 or f1e12"},
+                    "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                    "double": {"type": "boolean"},
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                }, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_type",
+                "description": "Replace the content of a text field by typing like a human. submit presses Enter afterwards.",
+                "parameters": {"type": "object", "properties": {
+                    "ref": {"type": "string"},
+                    "text": {"type": "string"},
+                    "submit": {"type": "boolean"},
+                }, "required": ["ref", "text"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_fill_form",
+                "description": "Fill several fields in one call. checkbox/radio take \"true\" or \"false\"; combobox takes an option label or value.",
+                "parameters": {"type": "object", "properties": {
+                    "fields": {"type": "array", "items": {"type": "object", "properties": {
+                        "ref": {"type": "string"},
+                        "type": {"type": "string", "enum": ["textbox", "checkbox", "radio", "combobox"]},
+                        "value": {"type": "string"},
+                    }, "required": ["ref", "type", "value"]}},
+                }, "required": ["fields"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_select",
+                "description": "Select option(s) in a <select> by label or value.",
+                "parameters": {"type": "object", "properties": {
+                    "ref": {"type": "string"},
+                    "values": {"type": "array", "items": {"type": "string"}},
+                }, "required": ["ref", "values"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_hover",
+                "description": "Move the mouse over an element (menus, tooltips).",
+                "parameters": {"type": "object", "properties": {"ref": {"type": "string"}}, "required": ["ref"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_drag",
+                "description": "Drag one element onto another (from_ref, to_ref), or between viewport coordinates (x1, y1, x2, y2).",
+                "parameters": {"type": "object", "properties": {
+                    "from_ref": {"type": "string"}, "to_ref": {"type": "string"},
+                    "x1": {"type": "number"}, "y1": {"type": "number"}, "x2": {"type": "number"}, "y2": {"type": "number"},
+                }, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_press_key",
+                "description": "Press a key or combination on the focused element, e.g. Enter, Escape, Tab, Control+A.",
+                "parameters": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_scroll",
+                "description": "Scroll by viewport heights. With ref, scroll the area under that element (inner scroll panes).",
+                "parameters": {"type": "object", "properties": {
+                    "direction": {"type": "string", "enum": ["down", "up"]},
+                    "pages": {"type": "number", "description": "Viewport heights, default 1"},
+                    "ref": {"type": "string"},
+                }, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_wait_for",
+                "description": "Wait for text to appear, text to disappear, or a number of seconds (max 60).",
+                "parameters": {"type": "object", "properties": {
+                    "text": {"type": "string"}, "text_gone": {"type": "string"}, "seconds": {"type": "number"},
+                    "timeout": {"type": "number", "description": "Seconds to wait for text, default 30"},
+                }, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_screenshot",
+                "description": "Screenshot of the viewport, the full page, or one element (ref), returned as an image. For visual checks; prefer snapshots for reading and acting.",
+                "parameters": {"type": "object", "properties": {
+                    "full_page": {"type": "boolean"}, "ref": {"type": "string"},
+                }, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_evaluate",
+                "description": "Run JavaScript in the page and return the JSON result: an expression (document.title) or a function (() => ...). With ref, pass a function that receives the element (el => el.value).",
+                "parameters": {"type": "object", "properties": {
+                    "expression": {"type": "string"}, "ref": {"type": "string"},
+                }, "required": ["expression"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_search_page",
+                "description": "Find text in the page's visible text and return matches with context. Useful when a snapshot is truncated.",
+                "parameters": {"type": "object", "properties": {
+                    "pattern": {"type": "string"},
+                    "regex": {"type": "boolean"},
+                    "case_sensitive": {"type": "boolean"},
+                    "max_results": {"type": "integer"},
+                }, "required": ["pattern"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_tabs",
+                "description": "List, open, select or close tabs. index is 0-based; close without index closes the current tab.",
+                "parameters": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["list", "new", "select", "close"]},
+                    "index": {"type": "integer"},
+                    "url": {"type": "string", "description": "URL to open with action=new"},
+                }, "required": ["action"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_handle_dialog",
+                "description": "Accept or dismiss the open alert/confirm/prompt dialog.",
+                "parameters": {"type": "object", "properties": {
+                    "accept": {"type": "boolean"}, "prompt_text": {"type": "string"},
+                }, "required": ["accept"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_console",
+                "description": "Console messages and uncaught errors of the current page (since it loaded). Without index: a list. With index: one message in full.",
+                "parameters": {"type": "object", "properties": {
+                    "index": {"type": "integer"}, "errors_only": {"type": "boolean"}, "max_results": {"type": "integer"},
+                }, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_network",
+                "description": "Network requests for the current tab. Without index: a list (filter = URL substring). With index: one request with headers.",
+                "parameters": {"type": "object", "properties": {
+                    "index": {"type": "integer"}, "filter": {"type": "string"}, "max_results": {"type": "integer"},
+                }, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_profile",
+                "description": "Persistent profiles keep logins, cookies and a fixed fingerprint. list shows them; use relaunches the browser in a profile (created if new); ephemeral relaunches with a throwaway session. proxy applies to the relaunch.",
+                "parameters": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["list", "use", "ephemeral"]},
+                    "name": {"type": "string"}, "proxy": {"type": "string"},
+                }, "required": ["action"]},
+            }},
+            {"type": "function", "function": {
+                "name": "browser_close",
+                "description": "Close the browser. The next browser tool relaunches it.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
             # ---- Skill Tools ----
             # Native desktop tools (Cua Driver). Accessibility element indices
             # are the primary addressing mode; x/y coordinates are an explicit
@@ -1108,20 +758,8 @@ class Agent:
         ]
 
         if self._is_subagent:
-            tools = [t for t in tools if t["function"]["name"] not in (
-                "spawn_subagent", "get_subagent_result",
-                "browser_launch", "browser_navigate", "browser_click", "browser_click_index",
-                "browser_type", "browser_type_index", "browser_select", "browser_select_index",
-                "browser_snapshot", "browser_screenshot", "browser_scroll", "browser_wait", "browser_wait_for",
-                "browser_send_keys", "browser_search_page", "browser_find_elements",
-                "browser_tab_list", "browser_tab_switch", "browser_tab_open",
-                "browser_evaluate", "browser_close", "browser_click_xy",
-                "browser_switch_frame", "browser_go_back", "browser_go_forward", "browser_reload",
-                "browser_hover", "browser_hover_index",
-                "browser_drag", "browser_drag_xy",
-                "browser_list_console_messages", "browser_get_console_message",
-                "browser_list_network_requests", "browser_get_network_request",
-            )]
+            tools = [t for t in tools if t["function"]["name"] not in ("spawn_subagent", "get_subagent_result")
+                     and not t["function"]["name"].startswith("browser_")]
         return tools
 
     TOOL_ERROR_RESERVE_CHARS = 4_000
@@ -1200,47 +838,9 @@ class Agent:
             "get_terminal_info": lambda a: self.get_terminal_info_tool(a["terminal_id"]).to_dict(),
             "spawn_subagent": lambda a: self.subagent_tool.spawn(a["prompt"], a.get("mode", "blocking")).to_dict(),
             "get_subagent_result": lambda a: self.subagent_tool.get_result(a["subagent_id"]).to_dict(),
-            # Browser tools
-            "browser_launch": lambda a: self.browser_launch_tool(
-                profile=a.get("profile"), headless=False, proxy=a.get("proxy"),
-                humanize=True, chrome_profile=a.get("chrome_profile"), connect_cdp=None,
-            ).to_dict(),
-            "browser_navigate": lambda a: self.browser_navigate_tool(a["url"]).to_dict(),
-            "browser_go_back": lambda a: self.browser_go_back_tool().to_dict(),
-            "browser_go_forward": lambda a: self.browser_go_forward_tool().to_dict(),
-            "browser_reload": lambda a: self.browser_reload_tool().to_dict(),
-            "browser_click": lambda a: self.browser_click_tool(a["selector"]).to_dict(),
-            "browser_click_index": lambda a: self.browser_click_index_tool(a["index"]).to_dict(),
-            "browser_type": lambda a: self.browser_type_tool(a["selector"], a["text"], press_enter=a.get("press_enter", False)).to_dict(),
-            "browser_type_index": lambda a: self.browser_type_index_tool(a["index"], a["text"], press_enter=a.get("press_enter", False)).to_dict(),
-            "browser_select": lambda a: self.browser_select_tool(a["selector"], a["value"]).to_dict(),
-            "browser_select_index": lambda a: self.browser_select_index_tool(a["index"], a["value"]).to_dict(),
-            "browser_snapshot": lambda a: self.browser_snapshot_tool().to_dict(),
-            "browser_screenshot": lambda a: self.browser_screenshot_tool(full_page=a.get("full_page", False)).to_dict(),
-            "browser_scroll": lambda a: self.browser_scroll_tool(direction=a.get("direction", "down"), pages=a.get("pages", 1.0)).to_dict(),
-            "browser_wait": lambda a: self.browser_wait_tool(seconds=a.get("seconds", 3)).to_dict(),
-            "browser_wait_for": lambda a: self.browser_wait_for_tool(selector=a.get("selector"), text=a.get("text"), timeout=a.get("timeout", 10)).to_dict(),
-            "browser_send_keys": lambda a: self.browser_send_keys_tool(keys=a["keys"]).to_dict(),
-            "browser_search_page": lambda a: self.browser_search_page_tool(
-                a["pattern"], regex=a.get("regex", False), case_sensitive=a.get("case_sensitive", False), max_results=a.get("max_results", 20),
-            ).to_dict(),
-            "browser_find_elements": lambda a: self.browser_find_elements_tool(a["selector"], max_results=a.get("max_results", 50)).to_dict(),
-            "browser_tab_list": lambda a: self.browser_tab_list_tool().to_dict(),
-            "browser_tab_switch": lambda a: self.browser_tab_switch_tool(index=a.get("index"), url_pattern=a.get("url_pattern")).to_dict(),
-            "browser_tab_open": lambda a: self.browser_tab_open_tool(url=a.get("url")).to_dict(),
-            "browser_evaluate": lambda a: self.browser_evaluate_tool(a["expression"]).to_dict(),
-            "browser_close": lambda a: self.browser_close_tool().to_dict(),
-            "browser_click_xy": lambda a: self.browser_click_xy_tool(a["x"], a["y"]).to_dict(),
-            "browser_switch_frame": lambda a: self.browser_switch_frame_tool(a.get("frame_selector")).to_dict(),
-            "browser_hover": lambda a: self.browser_hover_tool(a["selector"]).to_dict(),
-            "browser_hover_index": lambda a: self.browser_hover_index_tool(a["index"]).to_dict(),
-            "browser_drag": lambda a: self.browser_drag_tool(a["selector_from"], a["selector_to"]).to_dict(),
-            "browser_drag_xy": lambda a: self.browser_drag_xy_tool(a["x1"], a["y1"], a["x2"], a["y2"]).to_dict(),
-            # Console & network monitoring
-            "browser_list_console_messages": lambda a: self.browser_list_console_messages_tool(max_results=a.get("max_results", 50)).to_dict(),
-            "browser_get_console_message": lambda a: self.browser_get_console_message_tool(a["index"]).to_dict(),
-            "browser_list_network_requests": lambda a: self.browser_list_network_requests_tool(max_results=a.get("max_results", 50)).to_dict(),
-            "browser_get_network_request": lambda a: self.browser_get_network_request_tool(a["index"]).to_dict(),
+            # Browser tools: schema parameter names match BrowserManager keyword arguments
+            **{name: (lambda a, tool=tool: tool(**a).to_dict()) for name, tool in self.browser_tools.items()},
+            "browser_screenshot": lambda a: self.browser_screenshot_tool(**a).to_dict(),
             # Native desktop tools
             "desktop_doctor": lambda a: self.desktop_doctor_tool().to_dict(),
             "desktop_list_windows": lambda a: self.desktop_list_windows_tool(a.get("pid")).to_dict(),
@@ -1322,67 +922,35 @@ class Agent:
         if name == "desktop_move": return "move native desktop cursor"
         if name == "desktop_drag": return "drag native desktop"
         if name == "desktop_window_action": return f"{args.get('action', 'act')} native window"
-        if name == "browser_launch":
-            profile = args.get("profile")
-            chrome = args.get("chrome_profile")
-            cdp = args.get("connect_cdp")
-            if cdp: return f"connect to Chrome via CDP: {cdp}"
-            if chrome: return f"launch with Chrome profile: {chrome}"
-            return f"launch browser" + (f" (profile: {profile})" if profile else "")
-        if name == "browser_navigate": return f"navigate to: {args.get('url', '?')}"
-        if name == "browser_go_back": return "go back"
-        if name == "browser_go_forward": return "go forward"
-        if name == "browser_reload": return "reload page"
-        if name == "browser_click": return f"click: {args.get('selector', '?')}"
-        if name == "browser_click_index": return f"click element [{args.get('index', '?')}]"
-        if name == "browser_type":
-            text_preview = (args.get("text", "") or "")[:30]
-            return f"type into {args.get('selector', '?')}: \"{text_preview}\""
-        if name == "browser_type_index":
-            text_preview = (args.get("text", "") or "")[:30]
-            return f"type into [{args.get('index', '?')}]: \"{text_preview}\""
-        if name == "browser_select": return f"select '{args.get('value', '?')}' in {args.get('selector', '?')}"
-        if name == "browser_select_index": return f"select '{args.get('value', '?')}' in [{args.get('index', '?')}]"
+        if name == "browser_navigate": return f"navigate: {args.get('url', '?')}"
         if name == "browser_snapshot": return "snapshot current page"
-        if name == "browser_screenshot":
-            kind = "full page" if args.get("full_page") else "viewport"
-            return f"screenshot ({kind})"
-        if name == "browser_scroll":
-            d = args.get("direction", "down")
-            p = args.get("pages", 1.0)
-            return f"scroll {d} {p} pages"
-        if name == "browser_wait": return f"wait {args.get('seconds', 3)}s"
+        if name == "browser_click":
+            if args.get("ref"): return f"click {args['ref']}" + (" (double)" if args.get("double") else "")
+            return f"click at ({args.get('x', '?')}, {args.get('y', '?')})"
+        if name == "browser_type":
+            text = args.get("text", "")
+            return f"type into {args.get('ref', '?')}: \"{text[:30]}{'...' if len(text) > 30 else ''}\""
+        if name == "browser_fill_form": return f"fill {len(args.get('fields', []))} form field(s)"
+        if name == "browser_select": return f"select {args.get('values', '?')} in {args.get('ref', '?')}"
+        if name == "browser_hover": return f"hover {args.get('ref', '?')}"
+        if name == "browser_drag": return f"drag {args.get('from_ref', 'xy')} -> {args.get('to_ref', 'xy')}"
+        if name == "browser_press_key": return f"press key: {args.get('key', '?')}"
+        if name == "browser_scroll": return f"scroll {args.get('direction', 'down')} {args.get('pages', 1)} page(s)"
         if name == "browser_wait_for":
-            target = args.get("selector") or args.get("text", "?")
-            return f"wait for: {target}"
-        if name == "browser_send_keys": return f"send keys: {args.get('keys', '?')}"
-        if name == "browser_search_page": return f"search page for: '{args.get('pattern', '?')}'"
-        if name == "browser_find_elements": return f"find elements: {args.get('selector', '?')}"
-        if name == "browser_tab_list": return "list tabs"
-        if name == "browser_tab_switch":
-            idx = args.get("index")
-            pattern = args.get("url_pattern")
-            if idx is not None: return f"switch to tab {idx}"
-            return f"switch to tab matching: {pattern or '?'}"
-        if name == "browser_tab_open":
-            url = args.get("url")
-            return f"open new tab" + (f" -> {url}" if url else "")
+            if args.get("text"): return f"wait for text: '{args['text']}'"
+            if args.get("text_gone"): return f"wait for text to disappear: '{args['text_gone']}'"
+            return f"wait {args.get('seconds', '?')}s"
+        if name == "browser_screenshot": return "screenshot (" + ("full page" if args.get("full_page") else args.get("ref") or "viewport") + ")"
         if name == "browser_evaluate":
-            expr_preview = (args.get("expression", "") or "")[:40]
-            return f"evaluate JS: {expr_preview}"
+            expr = args.get("expression", "")
+            return f"run JS: {expr[:40]}{'...' if len(expr) > 40 else ''}"
+        if name == "browser_search_page": return f"search page for: '{args.get('pattern', '?')}'"
+        if name == "browser_tabs": return f"tabs: {args.get('action', 'list')}" + (f" [{args['index']}]" if args.get("index") is not None else "")
+        if name == "browser_handle_dialog": return ("accept" if args.get("accept") else "dismiss") + " dialog"
+        if name == "browser_console": return "console messages" + (f" [{args['index']}]" if args.get("index") is not None else "")
+        if name == "browser_network": return "network requests" + (f" [{args['index']}]" if args.get("index") is not None else "")
+        if name == "browser_profile": return f"browser profile: {args.get('action', '?')} {args.get('name') or ''}".rstrip()
         if name == "browser_close": return "close browser"
-        if name == "browser_click_xy": return f"click at ({args.get('x', '?')}, {args.get('y', '?')})"
-        if name == "browser_switch_frame":
-            sel = args.get("frame_selector", "")
-            return f"switch to frame: {sel}" if sel else "switch to top-level page"
-        if name == "browser_hover": return f"hover: {args.get('selector', '?')}"
-        if name == "browser_hover_index": return f"hover element [{args.get('index', '?')}]"
-        if name == "browser_drag": return f"drag '{args.get('selector_from', '?')}' -> '{args.get('selector_to', '?')}'"
-        if name == "browser_drag_xy": return f"drag ({args.get('x1', '?')}, {args.get('y1', '?')}) -> ({args.get('x2', '?')}, {args.get('y2', '?')})"
-        if name == "browser_list_console_messages": return f"list console messages (max {args.get('max_results', 50)})"
-        if name == "browser_get_console_message": return f"inspect console message [{args.get('index', '?')}]"
-        if name == "browser_list_network_requests": return f"list network requests (max {args.get('max_results', 50)})"
-        if name == "browser_get_network_request": return f"inspect network request [{args.get('index', '?')}]"
         # Skill tool summaries
         if name == "list_skills": return "list skills"
         if name == "load_skill": return f"load skill: {args.get('skill_name', '?')}"

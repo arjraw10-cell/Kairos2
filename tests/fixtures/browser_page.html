@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><title>Browser test</title></head>
+<body>
+  <div class="app"><div class="wrapper"><div class="inner">
+    <header><nav><a href="#a">Home</a> <a href="#b">Pricing</a></nav></header>
+    <main>
+      <section>
+        <h1>Test page</h1>
+        <p>Some intro paragraph text that repeats the wrapper content problem.</p>
+        <ul>
+          <li onclick="document.title='li-clicked'">First item</li>
+          <li>Second item</li>
+        </ul>
+        <label for="q">Search</label><input id="q" placeholder="Type here">
+        <select id="c" aria-label="Color"><option>Red</option><option>Blue</option></select>
+        <label><input type="checkbox" id="agree"> Agree</label>
+        <div style="height:2000px"></div>
+        <button onclick="alert('hello')">Alert me</button>
+        <button onclick="document.title = confirm('Proceed?') ? 'confirmed' : 'cancelled'">Confirm me</button>
+        <button onclick="document.title='btn-clicked'">
+          Sign
+          in
+        </button>
+      </section>
+    </main>
+  </div></div></div>
+<script>console.log('fixture-loaded'); console.error('fixture-error');</script>
+</body></html>

@@ -1,0 +1,5 @@
+<!doctype html><html><head><title>Iframe login test</title></head><body>
+<h1>Host page</h1>
+<iframe id="login" style="width:400px;height:200px" srcdoc="<label for=u>Username</label><input id=u><button onclick=&quot;parent.document.title='iframe-clicked:'+document.getElementById('u').value&quot;>Sign in</button>"></iframe>
+<a href="browser_page.html">Go to page 2</a>
+</body></html>

@@ -4,13 +4,13 @@ A minimal personal coding agent in Python.
 
 ## Features
 
-- **62 Tools**: File operations, terminal management, search, git, sub-agents, skills, a comprehensive browser automation suite (including console/network monitoring), and optional native desktop automation through Cua Driver
+- **48 Tools**: File operations, terminal management, search, git, sub-agents, skills, a comprehensive browser automation suite (including console/network monitoring), and optional native desktop automation through Cua Driver
 - **Absolute Paths**: All file operations use absolute paths — no workspace restrictions
 - **Streaming First**: Tokens print as they arrive; no waiting for full responses
 - **Token Aware**: Session, context window, and per-turn token counts displayed after every exchange. Estimates include message metadata, tool-call arguments, and function-tool schemas; uses ground-truth counts from the API when available (`stream_options={"include_usage": True}`), with tiktoken estimates as fallback
 - **Auto-Compaction**: Conversation history is automatically summarized when the configured context budget exceeds 80%; estimates include tool schemas and tool-call metadata, and compaction input is bounded so large results cannot cause a second breach
 - **Sub-Agents**: Spawn autonomous child agents to work on tasks in parallel
-- **Browser Automation**: CloakBrowser-backed stealth mode with persistent profiles, multi-tab, and DOM/CDP inspection support. Browser launches are always headed (visible) and always humanized; legacy `headless`/`humanize` arguments are accepted but cannot disable this policy. CDP attachment is rejected because Kairos cannot enforce the policy on an externally managed browser.
+- **Browser Automation**: CloakBrowser stealth Chromium, always headed (visible) and always humanized, launched lazily on first use. Accessibility snapshots with element refs, diff snapshots after actions, dialog handling, iframes, tabs, persistent profiles with pinned fingerprints, and console/network inspection.
 - **Native Desktop Automation**: Optional Cua Driver integration exposes native window discovery, accessibility-tree snapshots, screenshots, app launching, clicking, typing, keyboard, scrolling, dragging, and window actions. Accessibility element indices are the primary addressing mode; pixel coordinates are available as a fallback. Desktop tools are available to sub-agents and are loaded lazily when Cua Driver is installed.
 - **Skills**: Self-extensible skill system — agent can create/load skills stored as `SKILL.md` files in `skills/` directory
 - **Paste System**: Text pastes use explicit prompt-toolkit paste events: bracketed-paste events carry their own payload, and Ctrl+V reads the clipboard only when that key is pressed. Alt+V pastes images from the clipboard. Creates visible tokens like `(Pasted Text #1)` or `(Pasted Image #1)`. Backspace removes the entire token and its content. Clipboard changes from copying are never mistaken for paste actions.
@@ -19,7 +19,7 @@ A minimal personal coding agent in Python.
 - **Animated Thinking**: "Thinking..." indicator with cycling dots
 - **Streaming Display**: Real-time tokens in a live-updating panel (grey for thinking, green for final response)
 - **Tool Summaries**: One-line display when tools are called (e.g., `read file: /path`)
-- **Immediate Stop**: Ctrl+C and Escape share one hard-stop path. They close the active stream, cancel running blocking terminal commands and cancellable browser waits, stop before the next tool/API step, and return control to the prompt as soon as cleanup is complete. Interrupted assistant/tool turns remain repairable so the next request can continue them rather than silently losing context. Input typed while a response is handing back to the prompt is buffered, so commands such as `/exit` are not silently lost.
+- **Immediate Stop**: Ctrl+C and Escape share one hard-stop path. They close the active stream, cancel running blocking terminal commands and the in-flight browser call, stop before the next tool/API step, and return control to the prompt as soon as cleanup is complete. Interrupted assistant/tool turns remain repairable so the next request can continue them rather than silently losing context. Input typed while a response is handing back to the prompt is buffered, so commands such as `/exit` are not silently lost.
 - **Responsive Terminals**: Blocking commands require a finite positive timeout capped at 20 seconds; background commands return immediately, preserve shell state, stay alive after completion, and notify the CLI/agent asynchronously with capped output
 - **Cua Driver Configuration**: Set `KAIROS_CUA_DRIVER_PATH` to an explicit `cua-driver` executable or installation directory, or leave it empty for PATH discovery. On Windows, Kairos also checks the official per-user install location under `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin` when a long-lived gateway has an older inherited PATH. Kairos starts the Cua daemon lazily when a desktop tool is first used.
 - **Bounded Tool Results**: Text returned by tools is capped before it enters history or the API (20,000 characters per result by default), preserving both the beginning and end with a truncation marker; image data is kept out of textual tool messages and re-injected as vision context with bounded token estimates; the limit can be configured with `KAIROS_MAX_TOOL_RESULT_CHARS`
@@ -37,14 +37,13 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-For browser automation, install Playwright and CloakBrowser's headed/humanized Chromium integration:
+Browser automation needs Playwright 1.63+ (for AI accessibility snapshots) and CloakBrowser 0.6+, both in `requirements.txt`. CloakBrowser downloads its Chromium binary (~200 MB) on first use; to fetch it ahead of time:
 
 ```bash
-pip install cloakbrowser
-playwright install chromium
+python -m cloakbrowser install
 ```
 
-Kairos enforces headed, humanized browser launches, requires `cloakbrowser`, and rejects CDP attachment; launch fails with an installation message if CloakBrowser or its humanization layer is unavailable.
+Kairos always launches the browser headed and humanized; a browser tool fails with an installation message if CloakBrowser or its humanization layer is unavailable.
 
 ## Configuration
 
@@ -152,42 +151,30 @@ Skills are stored in `skills/<skill-name>/SKILL.md`. Only skill names are inject
 
 ### Browser Tools
 
+The browser is a headed, humanized CloakBrowser that launches automatically on the first browser tool call. Snapshots are Playwright's AI accessibility snapshots: elements carry refs like `[ref=e12]` (`f1e12` inside iframes and after the page navigates), and tools take those refs. Every action returns the resulting page state: only the changed snapshot lines while the URL stays the same, the full snapshot after navigation, and a fresh full snapshot with any error.
+
 | Tool | Description |
 |------|-------------|
-| `browser_launch(profile?, proxy?, chrome_profile?)` | Launch an always-headed, always-humanized CloakBrowser session; legacy `headless`/`humanize` values are ignored and CDP attachment is rejected |
-| `browser_navigate(url)` | Navigate to a URL. Always auto-screenshots + auto-snapshots (navigation = significant change). |
-| `browser_go_back()` | Navigate back in browser history. Auto-snapshots if page changed significantly. |
-| `browser_go_forward()` | Navigate forward in browser history. Auto-snapshots if page changed significantly. |
-| `browser_reload()` | Reload the current page. Auto-snapshots on reload. |
-| `browser_click(selector)` | Click an element (CSS selector, text, or label — auto-fallback chain). Verifies post-click. Auto-detects new tabs. Smart auto-snapshot on significant DOM changes. |
-| `browser_click_index(index)` | **Click by snapshot index [0],[1]...** — PREFERRED, most reliable method. Smart auto-snapshot. |
-| `browser_type(selector, text, press_enter?)` | Type into an input field. Verifies by reading back value. Smart auto-snapshot. |
-| `browser_type_index(index, text, press_enter?)` | **Type by snapshot index** — PREFERRED over selector-based. Smart auto-snapshot. |
-| `browser_select(selector, value)` | Select a dropdown option (by value, label, index, or JS fallback). Verifies. Smart auto-snapshot. |
-| `browser_select_index(index, value)` | **Select by snapshot index** — PREFERRED over selector-based. Validates target is `<select>`. Smart auto-snapshot. |
-| `browser_scroll(direction?, pages?)` | Scroll up/down by viewport heights (default 1.0 = full viewport). Smart auto-snapshot. |
-| `browser_wait(seconds?)` | Wait for animations/AJAX to complete (max 30s). Smart auto-snapshot. |
-| `browser_wait_for(selector?, text?, timeout?)` | Wait for a specific element to become visible or text to appear — more efficient than blind waiting. Smart auto-snapshot. |
-| `browser_send_keys(keys)` | Send keyboard shortcuts (Enter, Tab, Control+a, ArrowDown, etc.). Smart auto-snapshot. |
-| `browser_search_page(pattern, regex?, case_sensitive?, max_results?)` | **Grep the live page** for text patterns — zero LLM cost, instant results |
-| `browser_find_elements(selector, max_results?)` | **Query DOM by CSS selector** — zero LLM cost, instant element listing |
-| `browser_snapshot()` | Get a compact text representation of the page with element indices, CSS selectors, headings, text, form state, and cross-origin iframe content |
-| `browser_screenshot(full_page?)` | Capture a screenshot (saved to `~/.kairos/screenshots/` and returned as vision data) |
-| `browser_tab_list()` | List all open tabs |
-| `browser_tab_switch(index?, url_pattern?)` | Switch tabs by index or URL pattern |
-| `browser_tab_open(url?)` | Open a new tab |
-| `browser_evaluate(expression)` | Execute JavaScript in the page |
-| `browser_close()` | Close the browser and clean up |
-| `browser_click_xy(x, y)` | Click at absolute viewport coordinates (vision-based fallback). Smart auto-snapshot. |
-| `browser_hover(selector)` | Hover over an element to trigger hover states (dropdowns, tooltips, hover cards). Smart auto-snapshot. |
-| `browser_hover_index(index)` | **Hover by snapshot index** — PREFERRED. Smart auto-snapshot. |
-| `browser_drag(selector_from, selector_to)` | Drag an element to another element (for file uploads, sortable lists, Kanban boards). Smart auto-snapshot. |
-| `browser_drag_xy(x1, y1, x2, y2)` | Drag from one coordinate to another. Smart auto-snapshot. |
-| `browser_switch_frame(frame_selector?)` | Switch into an iframe (including cross-origin via CDP), or back to top-level |
-| `browser_list_console_messages(max_results?)` | List CDP-captured console messages (enables capture on first call). Zero LLM cost. |
-| `browser_get_console_message(index)` | Inspect a single console message by index — full details: level, text, source, URL, line, column |
-| `browser_list_network_requests(max_results?)` | List CDP-captured network requests (enables capture on first call). Zero LLM cost. |
-| `browser_get_network_request(index)` | Inspect a single network request by index — full details: method, URL, status, headers, duration |
+| `browser_navigate(url)` | Open a URL, or `back` / `forward` / `reload`. Returns the full snapshot. |
+| `browser_snapshot()` | Full accessibility snapshot of the current page |
+| `browser_click(ref?, button?, double?, x?, y?)` | Click an element by ref, or viewport coordinates (canvas, captchas) |
+| `browser_type(ref, text, submit?)` | Replace a field's content by typing like a human; `submit` presses Enter |
+| `browser_fill_form(fields)` | Fill textboxes, checkboxes, radios and selects in one call |
+| `browser_select(ref, values)` | Select `<select>` options by label or value |
+| `browser_hover(ref)` | Hover (menus, tooltips) |
+| `browser_drag(from_ref?, to_ref?, x1?, y1?, x2?, y2?)` | Drag between elements or coordinates |
+| `browser_press_key(key)` | Press a key or combination (Enter, Escape, Control+A) |
+| `browser_scroll(direction?, pages?, ref?)` | Scroll by viewport heights, optionally inside the pane under `ref` |
+| `browser_wait_for(text?, text_gone?, seconds?, timeout?)` | Wait for text to appear or disappear, or for a number of seconds |
+| `browser_screenshot(full_page?, ref?)` | Screenshot returned as vision data and saved to `~/.kairos/screenshots/` |
+| `browser_evaluate(expression, ref?)` | Run JavaScript; an expression or a function (with `ref`, the function receives the element) |
+| `browser_search_page(pattern, regex?, case_sensitive?, max_results?)` | Find text in the page's visible text with context |
+| `browser_tabs(action, index?, url?)` | `list` / `new` / `select` / `close` tabs |
+| `browser_handle_dialog(accept, prompt_text?)` | Answer an open alert/confirm/prompt |
+| `browser_console(index?, errors_only?, max_results?)` | Console messages and uncaught errors of the current page |
+| `browser_network(index?, filter?, max_results?)` | Network requests of the current tab; `index` shows headers and timing |
+| `browser_profile(action, name?, proxy?)` | `list` / `use <name>` / `ephemeral`; switching relaunches the browser |
+| `browser_close()` | Close the browser; the next browser tool relaunches it |
 
 ### Native desktop tools
 
@@ -209,23 +196,15 @@ When `cua-driver` is installed, Kairos also exposes native desktop automation th
 | `desktop_window_action(action, pid, ...)` | Activate, minimize, maximize, or close a window |
 
 Browser features:
-- **Persistent profiles**: Cookies, localStorage, and cache survive across sessions (`~/.kairos/profiles/`)
-- **CloakBrowser**: Stealth Chromium with fingerprint patches when installed (`pip install cloakbrowser`)
-- **CDP mode**: Connect to an already-running Chrome instance (`chrome --remote-debugging-port=9222`)
-- **Chrome profile copy**: Import your real Chrome profile (cookies, logins, history)
-- **Human-like mode**: Realistic mouse/keyboard/scroll behavior for bot detection
-- **Index-based interaction**: Snapshot shows element indices [0],[1],[2]... use `browser_click_index`/`browser_type_index` for reliable, selector-free interaction
-- **Auto new-tab detection**: When a click opens a new tab (target="_blank"), automatically switches to it
-- **Smart auto-snapshot**: All interaction tools automatically detect significant page changes via DOM fingerprinting (URL/title change, modals, new iframes, big DOM shifts) and append a snapshot + screenshot only when warranted — eliminating both the token waste of always-snapshotting and the blind spots of never-snapshotting
-- **Smart form interaction**: Hidden radio/checkbox inputs are captured with their label text; click auto-falls back to label/JS for hidden elements; select dropdowns show available options with both display text and value attributes
-- **Shadow DOM**: Snapshot pierces shadow roots to expose web component internals
-- **Ancestor visibility**: Snapshot checks ALL ancestors for display/visibility/opacity — prevents selecting hidden elements
-- **Off-viewport detection**: Elements flagged as offscreen vs truly hidden
-- **Cross-origin iframes**: CDP-based a11y tree access for cross-origin iframe content (e.g., embedded Google Docs, payment forms)
-- **In-page search**: `browser_search_page` greps the live DOM without LLM cost
-- **DOM queries**: `browser_find_elements` queries by CSS selector for instant element discovery
-- **Iframe support**: `browser_switch_frame` routes all interactions through a target iframe
-- **Vision click**: `browser_click_xy` enables coordinate-based clicking from screenshots
+- **Stealth and humanized input**: CloakBrowser's patched Chromium, with every click, keystroke and mouse path humanized. Refs are resolved to element handles before acting, because CloakBrowser's humanized Locator methods cannot resolve `aria-ref` selectors; inside iframes, where its engine cannot map a handle, the humanized page mouse and keyboard act at the element's box.
+- **Real accessibility snapshots**: `page.aria_snapshot(mode="ai")` gives real ARIA roles and names, iframe content inline, and refs for every element; snapshots over 15,000 characters are truncated with a pointer to `browser_search_page`.
+- **Diff snapshots**: actions on the same page return only the snapshot lines that changed (refs are stable across snapshots), so a click on a large page returns a few hundred characters instead of the whole page.
+- **Dialogs**: actions race against `dialog` events. An alert/confirm/prompt is reported to the agent and answered with `browser_handle_dialog`, instead of hanging the call or being silently dismissed.
+- **Stale refs**: a ref that no longer exists fails immediately with a fresh snapshot.
+- **Lazy launch and recovery**: the browser starts on the first call, a failed launch can be retried, and closing the window by hand makes the next call relaunch.
+- **Persistent profiles**: `browser_profile use <name>` keeps cookies and logins under `~/.kairos/profiles/<name>` and pins a fingerprint seed in `.kairos-browser.json`, so a logged-in identity always presents the same device. A profile can be open in only one browser at a time; a second conversation gets a clear error.
+- **New tabs**: when an action opens a tab, Kairos switches to it and says so.
+- **Console and network**: network requests are captured from tab creation with status, timing and headers. CloakBrowser suppresses the live console stream (enabling the CDP Runtime domain is a bot signal), so `browser_console` briefly enables it on demand, which makes Chrome replay the current page's console messages and uncaught exceptions.
 
 ## Architecture
 
@@ -241,8 +220,7 @@ kairos/
 ├── temp_cli.py             # Textual frontend with workspace-aware numbered resume picker
 ├── tokens.py               # Token counting with tiktoken (metadata/tools/session/context/turn)
 ├── terminal_manager.py     # Terminal lifecycle (background shells, blocking subprocesses)
-├── browser_manager.py      # Playwright/CloakBrowser lifecycle in a dedicated worker thread + CDP cross-origin iframe support + smart auto-snapshot
-├── cdp_manager.py          # CDPManager — low-level Chrome DevTools Protocol access (a11y tree, frame detection, console/network monitoring)
+├── browser_manager.py      # CloakBrowser via async Playwright on a worker thread: AI snapshots, refs, diff snapshots, dialogs, profiles
 ├── tests/
 │   └── test_compaction.py  # Context accounting and compaction regression tests
 └── tools/
@@ -254,7 +232,7 @@ kairos/
     ├── git.py              # Git subcommand dispatcher
     ├── terminal.py         # Terminal tool wrappers
     ├── subagent.py         # Sub-agent spawn and tracking
-    ├── browser.py          # Browser tool wrappers (34 tools, smart auto-snapshot, console/network monitoring)
+    ├── browser.py          # BrowserTool (forwards one BrowserManager method) and BrowserScreenshotTool
     ├── skills.py           # Skill manager (list, load, write skills)
     └── session.py          # Chat save/load manager
 ```
@@ -294,7 +272,7 @@ Chat history is saved:
 3. **One Tool Per File** — Easy to add new tools
 4. **Interruptible** — Ctrl+C and Escape hard-stop active streams/tools and safely hand control back to the prompt
 5. **Token Aware** — Session, context, and turn token counts displayed; estimates include message metadata, tool calls, schemas, and bounded vision estimates
-6. **Minimal Dependencies** — `openai`, `python-dotenv`, `rich`, `prompt_toolkit`, `tiktoken`, `playwright`
+6. **Minimal Dependencies** — `openai`, `python-dotenv`, `rich`, `prompt_toolkit`, `tiktoken`, `playwright`, `cloakbrowser`
 7. **Loud by Default** — Tools always report what they did. Success includes specifics (e.g. "Wrote 42 lines to `main.py`"). Failure clearly states what went wrong. Nothing happens silently — overwrites, creations, and deletions are always announced.
 
 ## Tests

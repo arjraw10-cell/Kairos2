@@ -4,7 +4,7 @@
 
 ## Overview
 
-Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 58 tools, including optional native desktop automation through Cua Driver. All file operations use absolute paths — no workspace containment.
+Kairos is a minimal coding agent written in Python. It uses the OpenAI chat completions API with streaming and function calling to autonomously execute tasks through 48 tools, including optional native desktop automation through Cua Driver. All file operations use absolute paths — no workspace containment.
 
 ## Project Structure
 
@@ -29,7 +29,9 @@ Agent2/
 │       └── SKILL.md
 ├── tests/                  # Local regression tests
 │   ├── test_compaction.py  # Context accounting, compaction, and legacy-result tests
-│   └── test_sessions.py    # Workspace-isolated home chat storage and legacy loading tests
+│   ├── test_sessions.py    # Workspace-isolated home chat storage and legacy loading tests
+│   ├── test_browser.py     # Real-browser BrowserManager tests against local fixtures
+│   └── fixtures/           # browser_page.html, browser_iframe.html
 └── kairos/
     ├── __init__.py         # Exports: Config, Agent, ToolResult, SessionManager, SkillManager, TerminalManager, BrowserManager, DesktopManager
     ├── main.py             # CLI REPL loop, signal handlers, auto-save, paste resolution
@@ -43,8 +45,7 @@ Agent2/
     ├── temp_cli.py         # Textual frontend, workspace-aware numbered resume picker
     ├── tokens.py           # TokenCounter using tiktoken
     ├── terminal_manager.py # Terminal lifecycle (background + blocking)
-    ├── browser_manager.py  # Playwright/CloakBrowser in dedicated worker thread + CDP cross-origin iframe support
-    ├── cdp_manager.py      # CDPManager — low-level Chrome DevTools Protocol access (a11y tree, frame detection)
+    ├── browser_manager.py  # CloakBrowser via async Playwright on a worker thread: AI snapshots, refs, diff snapshots, dialogs, profiles
     └── tools/
         ├── __init__.py     # Imports and re-exports all tools
         ├── base.py         # ToolResult(success, output, error?, image_url?)
@@ -55,7 +56,7 @@ Agent2/
         ├── git.py          # GitTool — status, diff, log, commit, branch
         ├── terminal.py     # 5 terminal tool wrappers
         ├── subagent.py     # SubAgentTool — spawn/track child agents
-        ├── browser.py      # 34 browser tool wrappers (scroll, wait, send_keys, search, find, think, index-based, console/network monitoring, etc.)
+        ├── browser.py      # BrowserTool (forwards one BrowserManager method) + BrowserScreenshotTool
         ├── skills.py       # SkillManager — list, load, write skills
         └── session.py      # SessionManager — isolated ~/.kairos chat stores with legacy fallback loading
 ```
@@ -232,7 +233,7 @@ This means the AGENTS.md content is injected directly into every API call's syst
 
 #### Tool Schema (`_get_tool_schema()`)
 
-Returns a list of 58 OpenAI function tool definitions. If `self._is_subagent` is True, removes browser tools and sub-agent tools while retaining native desktop tools, so sub-agents can operate desktop software with the same accessibility-first interaction model.
+Returns a list of 48 OpenAI function tool definitions. If `self._is_subagent` is True, removes browser tools and sub-agent tools while retaining native desktop tools, so sub-agents can operate desktop software with the same accessibility-first interaction model.
 
 #### Tool Execution (`_execute_tool(name, args)`)
 
@@ -425,7 +426,7 @@ A `MarkdownElement` subclass that yields a `rich.table.Table` with `box.ROUNDED`
 
 ### `kairos/terminal_manager.py` — TerminalManager
 
-Blocking commands are registered in `_active_blocking` while running. `cancel_active_commands()` kills their process trees so hard stop does not wait for a normal command timeout; background terminals remain persistent unless explicitly closed. Browser waits/polls also honor the agent's cancellation event through `cancel_active_operation()`.
+Blocking commands are registered in `_active_blocking` while running. `cancel_active_commands()` kills their process trees so hard stop does not wait for a normal command timeout; background terminals remain persistent unless explicitly closed. Hard stop also cancels the in-flight browser call through `BrowserManager.cancel_active_operation()`.
 
 **Class**: `TerminalManager`
 
@@ -453,118 +454,40 @@ Blocking commands are registered in `_active_blocking` while running. `cancel_ac
 
 All shared state is protected by `threading.Lock`.
 
-### `kairos/cdp_manager.py` — CDPManager (NEW)
-
-**Class**: `CDPManager`
-
-Low-level Chrome DevTools Protocol access via Playwright's CDP session API.
-
-**Key attributes**:
-- `self._sessions` — `Dict[int, Any]` mapping `id(page)` → CDP session
-
-**Methods**:
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `get_session(page)` | `CDPSession` | Get/create CDP session for a page |
-| `invalidate_session(page)` | `None` | Remove cached session |
-| `invalidate_all()` | `None` | Clear all cached sessions |
-| `get_frame_tree(page)` | `Dict` | Get frame hierarchy via `Page.getFrameTree` |
-| `get_all_frame_ids(page)` | `List[Dict]` | Collect all frame IDs, URLs, names |
-| `get_ax_tree(page, frame_id?)` | `List[Dict]` | Get accessibility tree (optionally per-frame) |
-| `get_all_ax_trees(page)` | `Dict[str, List]` | A11y trees for all frames |
-| `capture_dom_snapshot(page, computed_styles?)` | `Dict` | Full layout snapshot via `DOMSnapshot.captureSnapshot` |
-| `get_layout_metrics(page)` | `Dict` | Viewport size and DPR |
-| `get_viewport_size(page)` | `(float, float)` | CSS viewport width/height |
-| `get_device_pixel_ratio(page)` | `float` | DPR value |
-| `get_cross_origin_iframe_content(page, main_url?)` | `List[Dict]` | A11y content for cross-origin iframes |
-| `evaluate_js(page, expression, frame_id?)` | `Any` | JS evaluation via CDP `Runtime.evaluate` |
-| `enable_console(page)` | `None` | Enable live console capture via `Runtime.consoleAPICalled` |
-| `disable_console(page)` | `None` | Disable console capture and clear buffer |
-| `clear_console_buffer()` | `None` | Clear console messages without disabling capture |
-| `enable_network(page)` | `None` | Enable live network capture via `Network.requestWillBeSent` / `responseReceived` |
-| `disable_network(page)` | `None` | Disable network capture and clear buffer |
-| `clear_network_buffer()` | `None` | Clear network requests without disabling capture |
-| `disable_all(page)` | `None` | Disable all monitoring and clear all buffers |
-
-**CDP session management**: Sessions are cached per-page and reused across operations. A session is tied to the page target, not the URL — navigation does not invalidate it. Console and network event callbacks run on Playwright's internal thread and append directly to thread-safe buffers; `BrowserManager` reads them without worker dispatch.
-
 ### `kairos/browser_manager.py` — BrowserManager
 
-**Class**: `BrowserManager`
+**Class**: `BrowserManager` — one headed, humanized CloakBrowser session per Agent. External callers use `is_open`, `close()` and `cancel_active_operation()`; tools call the action methods below.
 
-Uses a dedicated `_WorkerThread` that keeps `sync_playwright()` alive for its entire lifetime (avoids greenlet errors). Browser launches are always headed and always humanized: `launch()` forces `headless=False` and `humanize=True` even when compatibility callers pass different values. Ephemeral, named-profile, and copied Chrome-profile launches require CloakBrowser and apply its human interaction patch to every context, including pages created later. Plain Playwright is rejected because it cannot guarantee this policy. CDP connections are rejected because Kairos cannot guarantee that an externally managed browser is headed and humanized. The tool-level `headless` and `humanize` inputs remain accepted only for backward compatibility and cannot disable this policy.
+**Threading**: `_Worker` runs a dedicated thread with its own asyncio loop and an async Playwright instance, so the browser never touches the main thread's loop (rich/prompt_toolkit). Public methods are synchronous: `_run(coro_fn, timeout)` submits a coroutine with `asyncio.run_coroutine_threadsafe` under a lock and waits. `cancel_active_operation()` cancels the in-flight future (agent hard stop). Async is required so actions can be raced against dialogs.
 
-**Worker Thread** (`_WorkerThread`):
-- `start()` — spawns thread, initializes Playwright, signals `_started` event when ready
-- `dispatch(fn, timeout)` — queues callable, blocks using `threading.Event` for zero-latency notification; raises `TimeoutError` if task never completes
-- `stop()` — sends sentinel, joins thread
+**Launch**: lazy. The first browser call runs `_ensure()`, which launches CloakBrowser's binary (`ensure_binary()`, `build_args(stealth_args=True, headless=False)`, `IGNORE_DEFAULT_ARGS`) headed with a 1280x720 viewport and applies `cloakbrowser.human.patch_context_async`. There is no headless or non-humanized path. Closing the window by hand fires the context `close` event, which resets state so the next call relaunches.
 
-**Launch modes**:
-1. **Ephemeral** (no profile): `pw.chromium.launch()` + `browser.new_context()`
-2. **Named profile**: `pw.chromium.launch_persistent_context(profile_dir)` — stores at `~/.kairos/profiles/<name>`
-3. **CDP**: rejected by policy; Kairos cannot guarantee that an externally managed browser is headed and humanized
-4. **Chrome profile copy**: Copies real Chrome user data dir to `~/.kairos/profiles/_chrome_copy_<name>`, launches persistent context with copy
+**Profiles** (`profile(action, name?, proxy?)`): `list`, `use <name>` (persistent context in `~/.kairos/profiles/<name>`), `ephemeral`. Switching closes and relaunches. Each profile pins a fingerprint seed in `<profile>/.kairos-browser.json` (created randomly on first use) passed as `--fingerprint=<seed>`. A module-level `_open_profiles` set refuses opening a profile that another BrowserManager in the same process (another gateway conversation) has open.
 
-**CloakBrowser integration**: Requires `cloakbrowser`, uses its stealth Chromium binary and `build_args()` for fingerprint patches, and applies its human interaction layer to every browser context. There is no plain Playwright fallback.
+**Snapshots**: `page.aria_snapshot(mode="ai")` (Playwright 1.63+). Refs look like `e12`, or `f1e12` inside iframes and after the page navigates. `_snapshot_text(page, mode)` keeps the trimmed lines of the previous snapshot; in `diff` mode on the same page and URL it returns only new/changed lines plus a count of removed lines, falling back to the full snapshot when the diff is large. Full snapshots over `SNAPSHOT_MAX_CHARS` (15,000) are truncated with a pointer to `browser_search_page`. `_state(mode)` prepends URL, title, tab count, a notice when the page opened a new tab (and switches to it), and an open dialog (in which case no snapshot is taken).
 
-**Key operations** (all dispatched to worker thread):
-- `navigate(url)` — `page.goto(url, wait_until="domcontentloaded")`, clears active frame; reports specific error types (DNS, connection, timeout) on failure. Auto-screenshots after navigate.
-- `go_back()` / `go_forward()` / `reload()` — navigation history, clear active frame
-- `scroll(direction?, pages?)` — scroll page using `page.mouse.wheel()` by viewport heights. `direction="down"|"up"`, `pages=1.0` (full viewport)
-- `wait(seconds?)` — sleep for up to 30 seconds to let animations/AJAX complete
-- `wait_for(selector?, text?, timeout?)` — wait for a specific element to become visible or text to appear (uses Playwright's built-in wait mechanisms for selectors; for text, polls every 0.5s until timeout). Much more efficient than blind waiting.
-- `send_keys(keys)` — send keyboard shortcut via `page.keyboard.press()` (e.g. "Enter", "Tab", "Control+a")
-- `hover(selector)` — hover over an element to trigger hover states (dropdown menus, tooltips, hover cards). Uses Playwright's `locator.hover()` with text fallback.
-- `hover_by_index(index)` — hover by snapshot index (PREFERRED)
-- `click(selector)` — tries CSS selector, visible text, label/aria-labelledby click for hidden elements, then JS `getElementById` force-click. Auto-screenshots. Detects new tabs and auto-switches.
-- `click_by_index(index)` — click element by its snapshot index `[0]`, `[1]`, etc. PREFERRED over `click(selector)` for reliability.
-- `click_xy(x, y)` — `page.mouse.click(x, y)` for coordinate-based clicking (vision fallback)
-- `drag(selector_from, selector_to)` — drag-and-drop between elements via bounding box calculation with smooth 10-step mouse movement (uses `current_page` for mouse operations)
-- `drag_xy(x1, y1, x2, y2)` — coordinate-based drag
-- `type_text(selector, text, press_enter?)` — tries `fill()` first (fast, fires events), falls back to `click + type()` (keystroke simulation), then placeholder fallback. Verifies value after each attempt.
-- `type_by_index(index, text, press_enter?)` — type into element by snapshot index. PREFERRED over `type_text`.
-- `select_option(selector, value)` — tries by HTML `value` attribute, then visible `label` text, then numeric index, then JS fallback
-- `select_option_by_index(index, value)` — select by snapshot index (PREFERRED). Validates that target is a `<select>`.
-- `snapshot()` — executes `_SNAPSHOT_JS` (inline JS that extracts accessibility tree), formats into compact text. Caches elements in `_last_snapshot_elements` for index-based interactions. Appends cross-origin iframe a11y data via CDP. Question context lines (`↳ Q:`) shown below radio/checkbox/select elements.
-- `screenshot(full_page?)` — saves PNG to `~/.kairos/screenshots/screenshot_<timestamp>.png`, returns file path + base64 data URL for vision injection
-- `search_page(pattern, regex?, case_sensitive?, max_results?)` — in-page text search via `document.createTreeWalker` + regex. Returns matches with context. Zero LLM cost.
-- `find_elements(selector, max_results?)` — CSS selector query returning matching elements with index, tag, text, attributes. Zero LLM cost.
-- Tab management: `open_new_tab()`, `switch_tab()`, `list_tabs()`, `close_tab()` (invalidates CDP session on close)
-- `evaluate(expression)` — tries expression directly first, wraps in arrow function on `SyntaxError` fallback; returns JSON-stringified result
-- `list_console_messages(max_results?)` — returns formatted list of CDP-captured console messages (enables Runtime capture on first call)
-- `get_console_message(index)` — returns full details of a single console message
-- `list_network_requests(max_results?)` — returns formatted list of CDP-captured network requests (enables Network capture on first call)
-- `get_network_request(index)` — returns full details of a single network request
-- Frame management: `switch_frame(frame_selector?)` — uses CDP `get_all_frame_ids()` as fallback for cross-origin iframes, stores CDP frame info in `_active_frame_type="cdp"`
+**Actions** go through `_act(fn, ref?, mode)`: refuses to act while a dialog is open, races the action against dialog events (`asyncio.wait`), lets a triggered navigation settle, and returns `summary + _state(mode)`. Errors raise `RuntimeError` carrying an explanation and a fresh full snapshot; stale refs say so explicitly.
 
-**Internal**:
-- `_target()` — returns `_active_frame` if set and is a Playwright Frame; if `_active_frame_type == "cdp"`, falls back to `current_page` (cross-origin content handled by `_get_cross_origin_snapshot_section()`). Returns `current_page` if no frame active.
-- Frame references are cleared on `navigate()`, `go_back()`, `go_forward()`, and `reload()` (both `_active_frame` and `_active_frame_type`). Console and network event buffers are also cleared on these navigation actions.
-- `_post_action(result, pre_fingerprint?, is_navigation?)` — common post-action hook; optionally takes screenshot+snapshot after any interaction.
-- `_detect_new_tab(tabs_before_count)` — compares `len(self._pages)` before/after an action.
-- Snapshot elements are cached in `_last_snapshot_elements` after each `snapshot()` call. Cache is invalidated on `navigate()`, `go_back()`, `go_forward()`, `reload()`, and `switch_tab()` to prevent stale element references across page changes.
-- CDP support via `self._cdp` (CDPManager instance): used in `snapshot()` for cross-origin iframe a11y content, in `switch_frame()` for cross-origin frame detection, and in `close_tab()` to invalidate stale sessions.
+**Ref resolution and humanize**: CloakBrowser's humanized `Locator` methods cannot resolve `aria-ref` selectors, so `_handle(page, ref)` resolves the ref to an element handle first (a ref with no match, or an unknown frame prefix, raises `StaleRefError` immediately). Handle methods are humanized by CloakBrowser. When its engine cannot map a handle ("cloakbrowser humanize: cannot identify ...", seen inside iframes), `_humanized()` falls back to the humanized `page.mouse` / `page.keyboard` at the element's box (`_center()` scrolls it into view and adds a little jitter).
 
-**Snapshot JS** (`_SNAPSHOT_JS`): Extracts:
-- **Shadow DOM piercing**: Uses `queryShadow()` to recursively walk into `.shadowRoot` on every element, making web components inside Shadow DOM visible
-- **Ancestor visibility checking**: `isVisible()` now walks up ALL ancestors (not just the element itself) — detects CSS-hidden parents, `display:none`, `visibility:hidden`, `opacity:0` at any level. Prevents selecting elements that are invisible due to hidden parent containers.
-- **Off-viewport detection**: `isInViewport()` checks if the element intersects the viewport (with 1000px margin below for scroll-reachable elements). Elements flagged with `_offscreen: true` to help the model distinguish "hidden because scrolled past" vs "hidden because off-screen".
-- Interactive elements with computed CSS selectors (id > name > data-testid > class path)
-- Hidden radio/checkbox inputs (always included, even when CSS-hidden — commonly used in quiz forms)
-- Associated `<label>` text for radio/checkbox inputs (via `label[for]` and wrapping `<label>`)
-- **Question context** for radio/checkbox/select elements: walks up the DOM via `findQuestionContext()` to find the nearest question text (Moodle `.qtext`, `.formulation`, headings, "Question N" patterns). Included as `context` field on element entries. For matching questions (Moodle dropdown tables), also extracts the left-side label text (e.g. "el fósforo") and appends it to the context as `"label → question text"`.
-- Headings (h1-h4)
-- Text blocks (p, label, li, dt, dd) — up to 40 blocks (increased from 20)
-- Form state (input values, textarea content, select options with visible text and value attributes)
-- Additional ARIA roles: `radio`, `checkbox`, `option`, `listbox`, `combobox`, `menuitemcheckbox`, `menuitemradio`
+| Method | Behaviour |
+|--------|-----------|
+| `navigate(url)` | `goto`, or `back` / `forward` / `reload`; clears the tab's network buffer; full snapshot |
+| `snapshot()` | Full page state |
+| `click(ref?, button, double, x?, y?)` | Handle click, or coordinates |
+| `type(ref, text, submit)` | Humanized `fill` (keyboard fallback); dispatch timeout grows with text length |
+| `fill_form(fields)` | textbox → type; combobox → `select_option`; checkbox/radio → `set_checked` |
+| `select(ref, values)` / `hover(ref)` / `drag(...)` / `press_key(key)` / `scroll(direction, pages, ref?)` | As named; drag/scroll use the humanized mouse |
+| `wait_for(text?, text_gone?, seconds?, timeout)` | Text visibility waits or a sleep (max 60 s) |
+| `evaluate(expression, ref?)` | `page.evaluate` (expressions or functions) or element-handle evaluate; no snapshot |
+| `handle_dialog(accept, prompt_text?)` | Answers the pending dialog, then returns the diff state |
+| `tabs(action, index?, url?)` | list / new / select / close |
+| `screenshot(full_page, ref?)` | Returns `(png, message, data_url)`; saves to `~/.kairos/screenshots/` |
+| `search_page(pattern, regex, case_sensitive, max_results)` | Regex/text search over `document.body.innerText` with context |
+| `console(index?, errors_only, max_results)` | See below |
+| `network(index?, filter?, max_results)` | Requests captured from tab creation via Playwright `request` / `response` / `requestfinished` / `requestfailed` events: method, URL, type, status, duration, headers |
 
-**Click fallback chain** (with post-click verification):
-1. CSS selector click via Playwright `locator(selector).click()`
-2. `page.get_by_text()` — matches visible text
-3. Label click — finds `<label for="id">`, `aria-labelledby` target (Moodle pattern), or wrapping `<label>` and clicks it (for hidden radio/checkbox)
-4. JavaScript `el.click()` — last resort force-click: parses `[id="..."]` attribute selectors to extract raw ID, then uses `document.getElementById(id).click()` (immune to colons and special chars that break `querySelector`).
-
-**Post-click verification**: Before clicking, snapshots URL and title. After clicking, checks for URL change, title change, modal/dropdown appearance, and radio/checkbox state. Reports what changed or warns "no visible page state change detected" so the agent knows the click may not have had the expected effect.
+**Console**: CloakBrowser's binary suppresses Playwright's live console stream (enabling the CDP Runtime domain is a bot signal). `_console_replay()` opens a CDP session, sends `Runtime.enable` (Chrome replays the current document's `consoleAPICalled` and `exceptionThrown` events), waits 0.2 s, sends `Runtime.disable` and detaches. Messages therefore cover the current document since it loaded.
 
 ### `kairos/tools/base.py` — ToolResult
 
@@ -676,7 +599,7 @@ Child token reports use the child's independent `TokenCounter`; they include ses
 
 **Sub-agent restrictions** (enforced in `Agent._get_tool_schema()`):
 - No `spawn_subagent` / `get_subagent_result`
-- No browser tools (23 tools removed)
+- No browser tools (every `browser_*` tool is removed)
 - Has: read, write, edit, search, git, all 5 terminal tools, and 3 skill tools (13 total)
 
 ### `kairos/tools/skills.py` — SkillManager
@@ -701,46 +624,10 @@ Skills are stored under `<workspace>/skills/<skill_name>/SKILL.md`. Only skill n
 
 ### `kairos/tools/browser.py` — Browser Tools
 
-30 callable wrapper classes, each takes a `BrowserManager` instance:
+- `BrowserTool(method, failure_label)` wraps one `BrowserManager` method and returns `ToolResult(True, output)`, or `ToolResult(False, "", "<label> failed: <error>")`. `ImportError` returns an installation message.
+- `BrowserScreenshotTool(bm)` returns the screenshot as `image_url` for vision injection.
 
-| Class | Method Called |
-|-------|-------------|
-| `BrowserLaunchTool` | `bm.launch(profile, headless, proxy, humanize, chrome_profile, connect_cdp)` — policy forces headed + humanized mode |
-| `BrowserNavigateTool` | `bm.navigate(url)` |
-| `BrowserGoBackTool` | `bm.go_back()` |
-| `BrowserGoForwardTool` | `bm.go_forward()` |
-| `BrowserReloadTool` | `bm.reload()` |
-| `BrowserClickTool` | `bm.click(selector)` |
-| `BrowserClickIndexTool` | `bm.click_by_index(index)` |
-| `BrowserTypeTool` | `bm.type_text(selector, text, press_enter)` |
-| `BrowserTypeIndexTool` | `bm.type_by_index(index, text, press_enter)` |
-| `BrowserSelectTool` | `bm.select_option(selector, value)` |
-| `BrowserSelectIndexTool` | `bm.select_option_by_index(index, value)` — PREFERRED |
-| `BrowserScrollTool` | `bm.scroll(direction, pages)` |
-| `BrowserWaitTool` | `bm.wait(seconds)` |
-| `BrowserWaitForTool` | `bm.wait_for(selector?, text?, timeout?)` — wait for element/text condition |
-| `BrowserSendKeysTool` | `bm.send_keys(keys)` |
-| `BrowserSearchPageTool` | `bm.search_page(pattern, regex, case_sensitive, max_results)` |
-| `BrowserFindElementsTool` | `bm.find_elements(selector, max_results)` |
-| `BrowserSnapshotTool` | `bm.snapshot()` |
-| `BrowserScreenshotTool` | `bm.screenshot(full_page)` |
-| `BrowserTabListTool` | `bm.list_tabs()` |
-| `BrowserTabSwitchTool` | `bm.switch_tab(index, url_pattern)` |
-| `BrowserTabOpenTool` | `bm.open_new_tab(url)` |
-| `BrowserEvaluateTool` | `bm.evaluate(expression)` |
-| `BrowserCloseTool` | `bm.close()` |
-| `BrowserClickXYTool` | `bm.click_xy(x, y)` — coordinate-based click for vision fallback |
-| `BrowserHoverTool` | `bm.hover(selector)` — hover for dropdowns/tooltips |
-| `BrowserHoverIndexTool` | `bm.hover_by_index(index)` — PREFERRED |
-| `BrowserDragTool` | `bm.drag(selector_from, selector_to)` — drag-and-drop |
-| `BrowserDragXYTool` | `bm.drag_xy(x1, y1, x2, y2)` — coordinate-based drag |
-| `BrowserSwitchFrameTool` | `bm.switch_frame(frame_selector)` — switch into/out of iframes |
-| `BrowserListConsoleMessagesTool` | `bm.list_console_messages(max_results)` — list CDP-captured console messages |
-| `BrowserGetConsoleMessageTool` | `bm.get_console_message(index)` — inspect a single console message |
-| `BrowserListNetworkRequestsTool` | `bm.list_network_requests(max_results)` — list CDP-captured network requests |
-| `BrowserGetNetworkRequestTool` | `bm.get_network_request(index)` — inspect a single network request |
-
-Each returns `ToolResult`. `BrowserLaunchTool` catches `ImportError` specifically to give installation instructions. Browser launches are always headed and humanized; legacy `headless` and `humanize` values are ignored. Skills directory (`skills/`) is gitignored — skills stay local and are never pushed to GitHub.
+`Agent.__init__` builds `self.browser_tools`, a dict from tool name to `BrowserTool`, plus `self.browser_screenshot_tool`. Schema parameter names equal the `BrowserManager` keyword arguments, so `_execute_tool` dispatches with `tool(**args)`; `tests/test_browser.py` checks this. The 20 tools: `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_fill_form`, `browser_select`, `browser_hover`, `browser_drag`, `browser_press_key`, `browser_scroll`, `browser_wait_for`, `browser_screenshot`, `browser_evaluate`, `browser_search_page`, `browser_tabs`, `browser_handle_dialog`, `browser_console`, `browser_network`, `browser_profile`, `browser_close`. Sub-agents receive none of them (`_get_tool_schema` drops every `browser_*` name). Skills directory (`skills/`) is gitignored — skills stay local and are never pushed to GitHub.
 
 ### `kairos/tools/session.py` — SessionManager
 
@@ -790,7 +677,7 @@ No fuzzy/prefix matching — each session is tracked by its ID. This prevents di
 
 ## Tests
 
-`tests/test_compaction.py` contains focused regression coverage for function-tool/schema accounting, message metadata, bounded vision estimates, pending-user preflight, safe tool-chain boundaries, compaction-prompt limits, and normalization of oversized legacy saved results. `tests/test_sessions.py` covers deterministic workspace IDs, home-directory storage, JSON workspace metadata, workspace isolation, and loading/migrating legacy workspace-local chats. `tests/test_desktop_manager.py` covers Cua Driver response/image extraction and lazy lifecycle behavior without requiring a native desktop. Run the suite with `python -m unittest discover -s tests -v`.
+`tests/test_compaction.py` contains focused regression coverage for function-tool/schema accounting, message metadata, bounded vision estimates, pending-user preflight, safe tool-chain boundaries, compaction-prompt limits, and normalization of oversized legacy saved results. `tests/test_sessions.py` covers deterministic workspace IDs, home-directory storage, JSON workspace metadata, workspace isolation, and loading/migrating legacy workspace-local chats. `tests/test_desktop_manager.py` covers Cua Driver response/image extraction and lazy lifecycle behavior without requiring a native desktop. `tests/test_browser.py` drives a real headed CloakBrowser against `tests/fixtures/` (refs, diff snapshots, form filling, alert/confirm handling, stale refs, iframe refs, refs after navigation, console/network, tabs, hard-stop cancellation, profile seeds and double-open refusal) and checks that browser tool schemas match `BrowserManager` signatures; set `KAIROS_SKIP_BROWSER_TESTS=1` to skip the real-browser part. Run the suite with `python -m unittest discover -s tests -v`.
 
 ## Design Principles
 
@@ -800,7 +687,7 @@ No fuzzy/prefix matching — each session is tracked by its ID. This prevents di
 4. **Interruptible** — Ctrl+C hard-interrupts; Escape gracefully stops between steps
 5. **Token Aware** — Session, context, and turn token counts displayed
 6. **Lazy Config** — Environment loaded on first access, not import
-7. **Minimal Dependencies** — `openai`, `python-dotenv`, `rich`, `prompt_toolkit`, `tiktoken`, `playwright`
+7. **Minimal Dependencies** — `openai`, `python-dotenv`, `rich`, `prompt_toolkit`, `tiktoken`, `playwright`, `cloakbrowser`
 
 ## Adding New Tools
 

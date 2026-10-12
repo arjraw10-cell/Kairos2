@@ -1,2266 +1,875 @@
 """
-BrowserManager — manages Playwright/CloakBrowser lifecycle, profiles, and pages.
+BrowserManager — CloakBrowser stealth Chromium driven by Playwright's async API.
 
-Runs ALL Playwright operations in a dedicated worker thread with NO asyncio
-event loop, avoiding conflicts with the main thread's asyncio (from
-rich/prompt_toolkit).
+Playwright runs on a dedicated worker thread with its own asyncio loop, so it
+never conflicts with the main thread's event loop (rich/prompt_toolkit) and
+actions can be raced against JavaScript dialogs.
 
-Uses CloakBrowser's stealth Chromium binary, fingerprint patches, and human-like
-interaction layer for every browser session. Plain Playwright is rejected because
-it cannot guarantee the required humanized behavior.
-
-Supports:
-  - CloakBrowser stealth Chromium (source-level fingerprint patches)
-  - Named persistent profiles (cookies, localStorage, cache survive across sessions)
-  - Ephemeral sessions (incognito-like)
-  - Human-like mouse/keyboard/scroll behavior (via CloakBrowser humanize)
-  - Multi-tab management
-  - Screenshot capture (returns file path)
-  - Compact page snapshots (accessibility tree / DOM summary)
-  - Headed, humanized browser sessions only (CDP attachment is rejected because
-    an already-running browser's headed state cannot be guaranteed)
-  - Chrome profile copying
-  - CDP-based DOM extraction (cross-origin iframes, a11y tree, layout data)
-  - Auto new-tab detection after clicks
-  - In-page text search and CSS element querying
-  - Index-based element interaction (click/type by snapshot index)
+Design:
+  - Snapshots use Playwright's ``aria_snapshot(mode="ai")``: real ARIA roles and
+    names, ``[ref=eN]`` handles (``f1eN`` inside iframes and after the page
+    navigates), and iframe contents inline.
+  - Every action returns the resulting page state. On the same URL only the
+    changed snapshot lines are returned; after navigation, the full snapshot.
+  - Actions race against ``dialog`` events, so alert/confirm/prompt are reported
+    to the agent instead of blocking or being silently dismissed.
+  - Always headed and always humanized (CloakBrowser human layer). Refs are
+    resolved to element handles first, because CloakBrowser's humanized Locator
+    methods cannot resolve ``aria-ref`` selectors; when its humanize engine
+    cannot map a handle (iframes), the humanized page mouse/keyboard is used
+    at the element's box instead.
+  - The browser launches lazily on the first browser tool call and relaunches
+    if a human closes the window.
+  - Named profiles persist logins and pin a fingerprint seed per profile.
 """
 
+import asyncio
 import base64
 import json
-import os
-import re as _re
+import random
+import re
 import threading
-import queue
 import time as _time
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple, Callable
-from urllib.parse import urlparse
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .cdp_manager import CDPManager
+SNAPSHOT_MAX_CHARS = 15_000
+ACTION_TIMEOUT_MS = 10_000
+_REF = re.compile(r"^(f\d+)?e\d+$")
+_HUMANIZE_MISS = "cloakbrowser humanize: cannot identify"
+_BUFFER_LIMIT = 500
 
-# --- CloakBrowser stealth integration ---
-_CLOAKBROWSER_AVAILABLE = False
-_cloakbinary_path: Optional[str] = None
-_cloak_ignore_args: Optional[List[str]] = None
+# Profile directories open in this process. Chromium cannot open one profile
+# directory twice, so a second gateway conversation gets a clear error.
+_open_profiles: set = set()
+_open_profiles_lock = threading.Lock()
 
-try:
-    import cloakbrowser
-    from cloakbrowser import ensure_binary, build_args
-    from cloakbrowser.browser import IGNORE_DEFAULT_ARGS as _CLOAK_IGNORE_DEFAULT_ARGS
 
-    _cloakbinary_path = ensure_binary()
-    _cloak_ignore_args = _CLOAK_IGNORE_DEFAULT_ARGS
-    _CLOAKBROWSER_AVAILABLE = True
-except ImportError:
-    pass
-except Exception:
+class StaleRefError(Exception):
     pass
 
 
-class _WorkerThread:
-    """A dedicated thread that hosts a persistent Playwright instance."""
+class _Worker:
+    """Thread hosting an asyncio loop and a persistent async Playwright instance."""
 
     def __init__(self):
-        self._task_queue: queue.Queue = queue.Queue()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
-        self._started = threading.Event()
-        self._pw = None
+        self.pw = None
+        self._current = None  # concurrent.futures.Future of the running call
 
     def start(self):
         if self._thread and self._thread.is_alive():
             return
-        self._started.clear()
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="playwright-worker"
-        )
+        ready = threading.Event()
+
+        def run():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            from playwright.async_api import async_playwright
+
+            self.pw = self._loop.run_until_complete(async_playwright().start())
+            ready.set()
+            self._loop.run_forever()
+
+        self._thread = threading.Thread(target=run, daemon=True, name="playwright-worker")
         self._thread.start()
-        self._started.wait(timeout=10)
+        if not ready.wait(timeout=30):
+            raise RuntimeError("Playwright worker failed to start")
 
-    def _run(self):
-        from playwright.sync_api import sync_playwright
-
-        self._pw = sync_playwright().start()
-        self._started.set()
-        while True:
-            task = self._task_queue.get()
-            if task is None:
-                break
-            fn, result_holder = task
-            try:
-                result_holder["result"] = fn()
-            except Exception as e:
-                result_holder["error"] = e
-            finally:
-                result_holder["_done"].set()
+    def run(self, coro_fn: Callable, timeout: float = 120):
+        self.start()
+        fut = asyncio.run_coroutine_threadsafe(coro_fn(), self._loop)
+        self._current = fut
         try:
-            self._pw.stop()
-        except Exception:
-            pass
-        self._pw = None
+            return fut.result(timeout=timeout)
+        except TimeoutError:
+            fut.cancel()
+            raise TimeoutError(f"Browser operation timed out after {timeout:.0f}s.")
+        finally:
+            self._current = None
 
-    @property
-    def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def dispatch(self, fn, timeout=30):
-        if not self._thread or not self._thread.is_alive():
-            raise RuntimeError("Worker thread is not running")
-        done = threading.Event()
-        result_holder: Dict[str, Any] = {"_done": done}
-        self._task_queue.put((fn, result_holder))
-        # Block with zero latency until the worker signals completion or timeout
-        completed = done.wait(timeout=timeout + 5)
-        if "error" in result_holder:
-            raise result_holder["error"]
-        if "result" in result_holder:
-            return result_holder["result"]
-        raise TimeoutError(
-            f"Browser operation timed out after {timeout + 5}s. "
-            "The page may be unresponsive or the operation is taking too long."
-        )
+    def cancel_current(self):
+        fut = self._current
+        if fut is not None:
+            fut.cancel()
 
     def stop(self):
-        if self._thread and self._thread.is_alive():
-            self._task_queue.put(None)
-            self._thread.join(timeout=10)
+        if not (self._thread and self._thread.is_alive()):
+            return
+
+        async def shutdown():
+            if self.pw:
+                await self.pw.stop()
+
+        try:
+            asyncio.run_coroutine_threadsafe(shutdown(), self._loop).result(timeout=10)
+        except Exception:
+            pass
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=10)
         self._thread = None
-        self._pw = None
+        self.pw = None
 
 
 class BrowserManager:
-    """Manages a single Playwright browser instance in a dedicated thread."""
+    """One headed, humanized CloakBrowser session per agent."""
 
     DEFAULT_PROFILES_DIR = Path("~/.kairos/profiles").expanduser()
 
     def __init__(self):
+        self._worker = _Worker()
+        self._lock = threading.Lock()
         self._browser = None
         self._context = None
-        self._pages: List = []
-        self._current_idx = 0
-        self._profile_name: Optional[str] = None
-        self._headless: bool = False
-        self._lock = threading.Lock()
-        # Agent hard-stop sets this event so cancellable waits/polls return
-        # immediately instead of holding the request worker until timeout.
-        self._cancel_event = threading.Event()
-        self._worker = _WorkerThread()
-        self._active_frame = None
-        self._active_frame_type = None  # "playwright" or "cdp"
-        # CDP support
-        self._cdp = CDPManager()
-        # Snapshot cache for index-based interactions
-        self._last_snapshot_elements: List[Dict[str, Any]] = []
+        self._pages: List[Any] = []
+        self._current = None
+        self._new_tabs: List[Any] = []
+        self._dialog = None
+        self._modal_waiters: List[asyncio.Future] = []
+        self._network: Dict[Any, List[Dict]] = {}
+        self._last_snapshot: Optional[Tuple[Any, str, set]] = None
+        self._profile_dir: Optional[Path] = None
+        self._proxy: Optional[str] = None
 
     # ------------------------------------------------------------------
-
+    #  Public state
     # ------------------------------------------------------------------
-    #  Auto-snapshot fingerprinting
-    # ------------------------------------------------------------------
-
-    _FINGERPRINT_JS = """() => {
-        return {
-            url: location.href,
-            title: document.title || '',
-            elementCount: document.querySelectorAll('*').length,
-            bodyTextLength: (document.body.innerText || '').length,
-            hasOverlay: !!document.querySelector('.modal.show, [role="dialog"]:not([hidden]), .popup:not([hidden]), .overlay:not([hidden])'),
-            overlayCount: document.querySelectorAll('.modal.show, [role="dialog"]:not([hidden]), .popup:not([hidden])').length,
-            alertCount: document.querySelectorAll('[role="alert"], .toast.show').length,
-            iframeCount: document.querySelectorAll('iframe').length
-        };
-    }"""
-
-    def _capture_fingerprint(self) -> Dict[str, Any]:
-        """Capture a lightweight DOM fingerprint to detect significant page changes."""
-        target = self._target()
-        if not target:
-            return {}
-        try:
-            return self._worker.dispatch(
-                lambda: target.evaluate(self._FINGERPRINT_JS), timeout=5
-            )
-        except Exception:
-            return {}
-
-    @staticmethod
-    def _has_significant_change(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
-        """Compare two fingerprints to decide if a snapshot+auto-screenshot is warranted."""
-        if not before or not after:
-            return True  # Missing data → be safe and snapshot
-        # URL changed → navigation
-        if before.get("url") != after.get("url"):
-            return True
-        # Title changed → usually a new page/view
-        if before.get("title") != after.get("title"):
-            return True
-        # Modal/popup appeared
-        if after.get("hasOverlay") and not before.get("hasOverlay"):
-            return True
-        if after.get("overlayCount", 0) > before.get("overlayCount", 0):
-            return True
-        # Alert appeared (error messages, success toasts)
-        if after.get("alertCount", 0) > before.get("alertCount", 0):
-            return True
-        # New iframe loaded
-        if after.get("iframeCount", 0) > before.get("iframeCount", 0):
-            return True
-        # Big DOM change (>20% element count shift)
-        before_e = before.get("elementCount", 0)
-        if before_e > 0:
-            delta = abs(after.get("elementCount", 0) - before_e) / before_e
-            if delta > 0.20:
-                return True
-        # Big text content change (>50% body text length shift)
-        before_t = before.get("bodyTextLength", 0)
-        if before_t > 0:
-            delta = abs(after.get("bodyTextLength", 0) - before_t) / before_t
-            if delta > 0.50:
-                return True
-        return False
-
-    # ------------------------------------------------------------------
-    #  Properties
-    # ------------------------------------------------------------------
-
-    def cancel_active_operation(self) -> None:
-        """Request cancellation of cancellable waits and polling operations."""
-        self._cancel_event.set()
-
-    def _clear_cancel(self) -> None:
-        self._cancel_event.clear()
 
     @property
     def is_open(self) -> bool:
-        return self._browser is not None or self._context is not None
-
-    def _target(self):
-        if self._active_frame is not None:
-            if self._active_frame_type == "cdp":
-                # CDP cross-origin frame — can't use Playwright Frame API on it.
-                # Return current_page; cross-origin content is handled separately
-                # by _get_cross_origin_snapshot_section() in snapshot().
-                return self.current_page
-            return self._active_frame
-        return self.current_page
-
-    @property
-    def current_page(self):
-        if not self._pages:
-            return None
-        if self._current_idx >= len(self._pages):
-            self._current_idx = len(self._pages) - 1
-        return self._pages[self._current_idx]
-
-    @property
-    def current_page_index(self) -> int:
-        return self._current_idx
-
-    @property
-    def pages(self) -> List:
-        return list(self._pages)
-
-    @property
-    def context(self):
-        return self._context
+        return self._context is not None
 
     @property
     def profile_name(self) -> Optional[str]:
-        return self._profile_name
+        return self._profile_dir.name if self._profile_dir else None
+
+    def cancel_active_operation(self) -> None:
+        """Agent hard stop: cancel the in-flight browser call."""
+        self._worker.cancel_current()
+
+    def _run(self, coro_fn: Callable, timeout: float = 120):
+        with self._lock:
+            return self._worker.run(coro_fn, timeout)
 
     # ------------------------------------------------------------------
-    #  Post-action helpers
-    # ------------------------------------------------------------------
-
-    def _post_action(
-        self,
-        action_result: str,
-        pre_fingerprint: Optional[Dict[str, Any]] = None,
-        is_navigation: bool = False,
-    ) -> str:
-        """Smart auto-screenshot and auto-snapshot based on page state changes.
-
-        - is_navigation=True: always auto-screenshot + auto-snapshot (page fundamentally changed)
-        - pre_fingerprint provided: compare before/after, auto-append if significant change detected
-        - Neither: just return the result (e.g. error states, non-visual actions)
-        """
-        parts = [action_result]
-        should_snapshot = False
-
-        if is_navigation:
-            # Navigations always warrant a snapshot
-            should_snapshot = True
-        elif pre_fingerprint is not None:
-            post_fingerprint = self._capture_fingerprint()
-            should_snapshot = self._has_significant_change(
-                pre_fingerprint, post_fingerprint
-            )
-
-        if should_snapshot:
-            try:
-                snap = self.snapshot()
-                parts.append(f"\n\n[Page State]\n{snap}")
-            except Exception:
-                pass
-            try:
-                _png, msg, _data_url = self.screenshot(full_page=False)
-                if _png is not None:
-                    parts.append(f"\n\n{msg}")
-            except Exception:
-                pass
-
-        return "".join(parts)
-
-    def _detect_new_tab(self, tabs_before_count: int) -> str:
-        """Check if a new tab was opened and switch to it. Returns a message or empty string."""
-        if len(self._pages) > tabs_before_count:
-            new_idx = len(self._pages) - 1
-            self._current_idx = new_idx
-
-            def _get_title():
-                return self.current_page.title() or "(no title)"
-
-            try:
-                title = self._worker.dispatch(_get_title, timeout=5)
-            except Exception:
-                title = "(no title)"
-            return f" [Auto-switched to new tab: {title}]"
-        return ""
-
-    # ------------------------------------------------------------------
-    #  Launch
+    #  Launch / close
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _require_humanized_policy() -> None:
-        "Require CloakBrowser's human interaction layer for every session."
-        if not _CLOAKBROWSER_AVAILABLE or not _cloakbinary_path:
-            raise ImportError(
-                "CloakBrowser is required for Kairos browser automation. "
-                "Install it with: pip install cloakbrowser"
-            )
+    def _cloak():
         try:
-            from cloakbrowser.human import patch_context  # noqa: F401
-            from cloakbrowser.human.config import resolve_config  # noqa: F401
+            from cloakbrowser import build_args, ensure_binary
+            from cloakbrowser.browser import IGNORE_DEFAULT_ARGS
+            from cloakbrowser.human import patch_context_async
+            from cloakbrowser.human.config import resolve_config
         except ImportError as exc:
             raise ImportError(
-                "This CloakBrowser installation lacks its humanization layer. "
-                "Reinstall it with: pip install --upgrade cloakbrowser"
+                "CloakBrowser with its humanize layer is required: pip install --upgrade cloakbrowser"
             ) from exc
+        return build_args, ensure_binary, IGNORE_DEFAULT_ARGS, patch_context_async, resolve_config
 
-    @classmethod
-    def _apply_humanization(cls, target) -> None:
-        "Patch a browser or context so supported interactions use human-like behavior."
-        cls._require_humanized_policy()
-        from cloakbrowser.human import patch_browser, patch_context
-        from cloakbrowser.human.config import resolve_config
-
-        config = resolve_config("default", None)
-        if hasattr(target, "contexts") and hasattr(target, "new_context"):
-            patch_browser(target, config)
-        else:
-            patch_context(target, config)
-
-    def launch(
-        self,
-        profile=None,
-        headless=False,
-        proxy=None,
-        humanize=True,
-        viewport_width=1280,
-        viewport_height=720,
-        extra_args=None,
-        chrome_profile=None,
-        connect_cdp=None,
-    ) -> str:
-        with self._lock:
-            if self._browser or self._context:
-                return "Browser is already running. Close it first with browser_close."
-        # These policy arguments remain in the API for compatibility, but cannot
-        # disable headed, humanized browser automation.
-        headless = False
-        humanize = True
-        self._require_humanized_policy()
-        self._headless = False
-        if connect_cdp:
-            raise RuntimeError(
-                "CDP attachment is disabled: Kairos requires a browser it can "
-                "launch as headed and humanized."
-            )
-        if chrome_profile:
-            return self._launch_chrome_profile(
-                chrome_profile,
-                headless,
-                proxy,
-                humanize,
-                viewport_width,
-                viewport_height,
-                extra_args,
-            )
-        self._worker.start()
-        self._profile_name = profile
-        launch_args = list(extra_args or [])
-        return self._worker.dispatch(
-            lambda: self._do_launch(
-                profile,
-                headless,
-                proxy,
-                humanize,
-                viewport_width,
-                viewport_height,
-                launch_args,
-            ),
-            timeout=60,
-        )
-
-    def _do_launch(self, profile, headless, proxy, humanize, vw, vh, launch_args):
-        # Keep the invariant here too, so internal callers cannot bypass the
-        # public launch policy.
-        headless = False
-        humanize = True
-        pw = self._worker._pw
-        executable_path = None
-        ignore_default_args = []
-        chrome_args = list(launch_args)
-        if _CLOAKBROWSER_AVAILABLE and _cloakbinary_path:
-            executable_path = _cloakbinary_path
-            chrome_args = build_args(
-                stealth_args=True, extra_args=launch_args, headless=headless
-            )
-            if _cloak_ignore_args:
-                ignore_default_args = list(_cloak_ignore_args)
-        launch_kwargs = {}
-        if executable_path:
-            launch_kwargs["executable_path"] = executable_path
-        if ignore_default_args:
-            launch_kwargs["ignore_default_args"] = ignore_default_args
-        if proxy:
-            launch_kwargs["proxy"] = {"server": proxy}
-        if profile:
-            profile_dir = str(self.DEFAULT_PROFILES_DIR / profile)
-            self._context = pw.chromium.launch_persistent_context(
-                profile_dir,
-                headless=False,
-                viewport={"width": vw, "height": vh},
-                args=chrome_args,
-                **launch_kwargs,
-            )
-            self._apply_humanization(self._context)
-            self._browser = None
-            self._pages = list(self._context.pages)
-            if not self._pages:
-                self._pages.append(self._context.new_page())
-            self._current_idx = 0
-            engine = "CloakBrowser" if _CLOAKBROWSER_AVAILABLE else "Playwright"
-            return (
-                f"Launched {engine} browser with profile '{profile}' at {profile_dir}"
-            )
-        else:
-            self._browser = pw.chromium.launch(
-                headless=False, args=chrome_args, **launch_kwargs
-            )
-            ctx_kwargs = {"viewport": {"width": vw, "height": vh}}
-            if proxy:
-                ctx_kwargs["proxy"] = {"server": proxy}
-            self._context = self._browser.new_context(**ctx_kwargs)
-            self._apply_humanization(self._context)
-            self._pages = []
-            page = self._context.new_page()
-            self._pages.append(page)
-            self._current_idx = 0
-            engine = "CloakBrowser" if _CLOAKBROWSER_AVAILABLE else "Playwright"
-            return f"Launched headed, humanized ephemeral {engine} browser"
-
-    def _launch_cdp(self, cdp_url: str) -> str:
-        raise RuntimeError(
-            "CDP attachment is disabled: Kairos requires a browser it can "
-            "launch as headed and humanized."
-        )
-
-    def _do_cdp_connect(self, cdp_url: str):
-        raise RuntimeError(
-            "CDP attachment is disabled: Kairos requires a browser it can "
-            "launch as headed and humanized."
-        )
-
-    def _launch_chrome_profile(
-        self, chrome_profile, headless, proxy, humanize, vw, vh, extra_args
-    ) -> str:
-        headless = False
-        humanize = True
-        from shutil import copytree, rmtree
-
-        src = Path(chrome_profile).expanduser().resolve()
-        if not src.exists():
-            return f"Chrome profile not found at: {src}"
-        if (src / "SingletonLock").exists():
-            return f"Chrome profile is LOCKED. Close Chrome first, or use connect_cdp."
-        copy_name = f"_chrome_copy_{src.name}"
-        copy_dir = self.DEFAULT_PROFILES_DIR / copy_name
-        if copy_dir.exists():
-            rmtree(copy_dir, ignore_errors=True)
+    def _profile_seed(self, profile_dir: Path) -> int:
+        """Each profile keeps one fingerprint seed so a logged-in identity is always the same device."""
+        meta = profile_dir / ".kairos-browser.json"
         try:
-            copytree(src, copy_dir)
-        except Exception as e:
-            return f"Failed to copy Chrome profile: {e}"
-        self._profile_name = f"chrome:{src.name}"
-        self._worker.start()
-        result = self._worker.dispatch(
-            lambda: self._do_persistent_launch(
-                str(copy_dir), headless, list(extra_args or []), proxy, vw, vh
-            ),
-            timeout=60,
-        )
-        return f"Copied Chrome profile '{src.name}' to {copy_dir}\n{result}"
+            seed = json.loads(meta.read_text(encoding="utf-8"))["seed"]
+            if isinstance(seed, int):
+                return seed
+        except Exception:
+            pass
+        seed = random.randint(1, 2**31 - 1)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        meta.write_text(json.dumps({"seed": seed}), encoding="utf-8")
+        return seed
 
-    def _do_persistent_launch(self, profile_dir, headless, launch_args, proxy, vw, vh):
-        headless = False
-        pw = self._worker._pw
-        executable_path = None
-        ignore_default_args = []
-        chrome_args = list(launch_args)
-        if _CLOAKBROWSER_AVAILABLE and _cloakbinary_path:
-            executable_path = _cloakbinary_path
-            chrome_args = build_args(
-                stealth_args=True, extra_args=launch_args, headless=headless
-            )
-            if _cloak_ignore_args:
-                ignore_default_args = list(_cloak_ignore_args)
-        ctx_kwargs = {
+    async def _ensure(self):
+        if self._context is not None:
+            return self._context
+        build_args, ensure_binary, ignore_args, patch_context_async, resolve_config = self._cloak()
+        pw = self._worker.pw
+        extra = []
+        if self._profile_dir:
+            extra.append(f"--fingerprint={self._profile_seed(self._profile_dir)}")
+        kwargs: Dict[str, Any] = {
             "headless": False,
-            "viewport": {"width": vw, "height": vh},
-            "args": chrome_args,
+            "executable_path": ensure_binary(),
+            "ignore_default_args": list(ignore_args),
+            "args": build_args(stealth_args=True, extra_args=extra, headless=False),
+            "viewport": {"width": 1280, "height": 720},
         }
-        if executable_path:
-            ctx_kwargs["executable_path"] = executable_path
-        if ignore_default_args:
-            ctx_kwargs["ignore_default_args"] = ignore_default_args
-        if proxy:
-            ctx_kwargs["proxy"] = {"server": proxy}
-        self._context = pw.chromium.launch_persistent_context(profile_dir, **ctx_kwargs)
-        self._apply_humanization(self._context)
-        self._browser = None
-        self._pages = list(self._context.pages)
-        if not self._pages:
-            self._pages.append(self._context.new_page())
-        self._current_idx = 0
-        engine = "CloakBrowser" if _CLOAKBROWSER_AVAILABLE else "Playwright"
-        return f"Launched headed, humanized {engine} browser with your Chrome data."
+        if self._proxy:
+            kwargs["proxy"] = {"server": self._proxy}
 
-    # ------------------------------------------------------------------
-    #  Close
-    # ------------------------------------------------------------------
+        if self._profile_dir:
+            key = str(self._profile_dir.resolve())
+            with _open_profiles_lock:
+                if key in _open_profiles:
+                    raise RuntimeError(
+                        f"Profile '{self._profile_dir.name}' is already open in another Kairos browser "
+                        "(another conversation). Close it there, or use a different profile."
+                    )
+                _open_profiles.add(key)
+            try:
+                ctx = await pw.chromium.launch_persistent_context(str(self._profile_dir), **kwargs)
+            except Exception as e:
+                with _open_profiles_lock:
+                    _open_profiles.discard(key)
+                raise RuntimeError(
+                    f"Could not open profile '{self._profile_dir.name}' (it may be open in another "
+                    f"browser window): {str(e).splitlines()[0]}"
+                )
+            self._browser = None
+        else:
+            viewport = kwargs.pop("viewport")
+            proxy = kwargs.pop("proxy", None)
+            self._browser = await pw.chromium.launch(**kwargs)
+            ctx = await self._browser.new_context(viewport=viewport, **({"proxy": proxy} if proxy else {}))
+
+        patch_context_async(ctx, resolve_config("default", None))
+        self._context = ctx
+        ctx.on("page", self._on_new_page)
+        ctx.on("close", lambda _ctx: self._reset() if self._context is ctx else None)
+        for p in ctx.pages:
+            self._attach(p)
+        self._current = self._pages[0] if self._pages else None
+        return ctx
+
+    def _on_new_page(self, page):
+        self._attach(page)
+        self._new_tabs.append(page)
+
+    def _attach(self, page):
+        if page in self._pages:
+            return
+        self._pages.append(page)
+        network: List[Dict] = []
+        self._network[page] = network
+
+        def push(buf, item):
+            buf.append(item)
+            if len(buf) > _BUFFER_LIMIT:
+                del buf[0]
+
+        by_request: Dict[Any, Dict] = {}
+
+        def on_request(req):
+            entry = {"method": req.method, "url": req.url, "type": req.resource_type, "status": None,
+                     "request_headers": req.headers, "response_headers": None,
+                     "duration_ms": None, "failure": None, "time": _time.strftime("%H:%M:%S")}
+            by_request[req] = entry
+            push(network, entry)
+
+        def on_response(resp):
+            entry = by_request.get(resp.request)
+            if entry:
+                entry["status"] = resp.status
+                entry["response_headers"] = resp.headers
+
+        def on_finished(req):
+            entry = by_request.pop(req, None)
+            end = (req.timing or {}).get("responseEnd", -1)
+            if entry and end and end > 0:
+                entry["duration_ms"] = round(end)
+
+        def on_failed(req):
+            entry = by_request.pop(req, None)
+            if entry:
+                entry["failure"] = req.failure or "failed"
+
+        def on_dialog(dialog):
+            self._dialog = dialog
+            self._notify_modal()
+
+        def on_close(_page):
+            if page in self._pages:
+                self._pages.remove(page)
+            if page in self._new_tabs:
+                self._new_tabs.remove(page)
+            if self._current is page:
+                self._current = self._pages[-1] if self._pages else None
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("requestfinished", on_finished)
+        page.on("requestfailed", on_failed)
+        page.on("dialog", on_dialog)
+        page.on("close", on_close)
+
+    def _notify_modal(self):
+        for fut in self._modal_waiters:
+            if not fut.done():
+                fut.set_result(True)
+        self._modal_waiters.clear()
+
+    def _reset(self):
+        if self._profile_dir:
+            with _open_profiles_lock:
+                _open_profiles.discard(str(self._profile_dir.resolve()))
+        self._browser = None
+        self._context = None
+        self._pages = []
+        self._current = None
+        self._new_tabs = []
+        self._dialog = None
+        self._network = {}
+        self._last_snapshot = None
+
+    async def _page(self):
+        ctx = await self._ensure()
+        if self._current is None or self._current.is_closed():
+            self._current = next((p for p in self._pages if not p.is_closed()), None) or await ctx.new_page()
+            if self._current in self._new_tabs:
+                self._new_tabs.remove(self._current)
+        return self._current
+
+    async def _close(self):
+        ctx, browser = self._context, self._browser
+        self._reset()
+        for closer in (ctx, browser):
+            if closer is not None:
+                try:
+                    await closer.close()
+                except Exception:
+                    pass
 
     def close(self) -> str:
-        with self._lock:
-            if not self._browser and not self._context:
-                self._worker.stop()
-                return "No browser is running."
-            try:
-                self._worker.dispatch(self._do_close_internal, timeout=15)
-            except Exception:
-                pass
-            if self._profile_name and self._profile_name.startswith("chrome:"):
-                copy_name = f"_chrome_copy_{self._profile_name.split(':', 1)[1]}"
-                copy_dir = self.DEFAULT_PROFILES_DIR / copy_name
-                if copy_dir.exists():
-                    try:
-                        from shutil import rmtree
-
-                        rmtree(copy_dir, ignore_errors=True)
-                    except Exception:
-                        pass
-            self._browser = None
-            self._context = None
-            self._pages = []
-            self._current_idx = 0
-            self._profile_name = None
-            self._cdp.invalidate_all()
-            self._cdp._console_messages.clear()
-            self._cdp._console_enabled = False
-            self._cdp._network_requests.clear()
-            self._cdp._network_enabled = False
-            self._last_snapshot_elements = []
+        if not self.is_open:
             self._worker.stop()
-            return "Browser closed."
+            return "No browser is running."
+        try:
+            self._run(self._close, timeout=30)
+        finally:
+            self._worker.stop()
+        return "Browser closed."
 
-    def _do_close_internal(self):
-        try:
-            if self._context:
-                self._context.close()
-        except Exception:
-            pass
-        try:
-            if self._browser:
-                self._browser.close()
-        except Exception:
-            pass
+    def profile(self, action: str, name: Optional[str] = None, proxy: Optional[str] = None) -> str:
+        """list | use <name> | ephemeral. use/ephemeral relaunch the browser."""
+        if action == "list":
+            root = self.DEFAULT_PROFILES_DIR
+            names = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
+            active = self.profile_name or "(ephemeral)"
+            listing = "\n".join(f"  {n}" for n in names) or "  (none)"
+            return f"Active: {active}\nProfiles in {root}:\n{listing}"
+        if action not in ("use", "ephemeral"):
+            raise ValueError("action must be list, use or ephemeral")
+        if action == "use":
+            if not name or not re.fullmatch(r"[\w-]+", name):
+                raise ValueError("use needs a profile name of letters, digits, _ or -")
+            target = self.DEFAULT_PROFILES_DIR / name
+        else:
+            target = None
+
+        async def relaunch():
+            await self._close()
+            self._profile_dir = target
+            self._proxy = proxy
+            await self._page()
+            label = f"profile '{name}'" if target else "an ephemeral profile"
+            return f"Relaunched in {label}.\n\n{await self._state('full')}"
+
+        return self._run(relaunch)
 
     # ------------------------------------------------------------------
-    #  Navigation
+    #  Snapshot and page state
+    # ------------------------------------------------------------------
+
+    async def _snapshot_text(self, page, mode: str) -> str:
+        snap = await page.aria_snapshot(mode="ai", timeout=10_000)
+        lines = snap.split("\n")
+        keys = {line.strip() for line in lines}  # ignore re-indentation from inserted wrappers
+        prev = self._last_snapshot
+        self._last_snapshot = (page, page.url, keys)
+        if mode == "diff" and prev and prev[0] is page and prev[1] == page.url:
+            added = [line for line in lines if line.strip() not in prev[2]]
+            removed = len(prev[2] - keys)
+            if not added and not removed:
+                return "Snapshot: unchanged since the last one."
+            diff = "\n".join(added)
+            if len(diff) < SNAPSHOT_MAX_CHARS // 2:
+                return (f"Snapshot changes (new or updated lines; {removed} lines gone; unchanged parts "
+                        f"omitted, browser_snapshot shows the full page):\n{diff}")
+        if len(snap) > SNAPSHOT_MAX_CHARS:
+            snap = (snap[:SNAPSHOT_MAX_CHARS] + f"\n... [snapshot truncated: {len(snap) - SNAPSHOT_MAX_CHARS} "
+                    "more chars. Scroll, or use browser_search_page / browser_evaluate for specific content]")
+        return f"Snapshot:\n{snap}"
+
+    async def _state(self, mode: str = "full") -> str:
+        page = self._current
+        if page is None or page.is_closed():
+            return "No open page."
+        lines = []
+        opened = [p for p in self._new_tabs if not p.is_closed()]
+        if opened:
+            # Match the old behavior: follow a tab the action opened.
+            self._current = page = opened[-1]
+            lines.append(f"New tab opened by the page; switched to it: {page.url}")
+            self._new_tabs = []
+        if len(self._pages) > 1:
+            lines.append(f"Tabs: {len(self._pages)} open, current is [{self._pages.index(page)}]")
+        if self._dialog is not None:
+            d = self._dialog
+            lines.append(f'Dialog: {d.type} "{d.message[:300]}" is blocking the page. '
+                         "Call browser_handle_dialog before anything else.")
+            return "\n".join([f"Page URL: {page.url}"] + lines)
+        try:
+            title = await page.title()
+        except Exception:
+            title = ""
+        lines = [f"Page URL: {page.url}", f"Page title: {title}"] + lines
+        if mode != "none":
+            try:
+                lines.append(await self._snapshot_text(page, mode))
+            except Exception as e:
+                lines.append(f"(snapshot unavailable: {str(e).splitlines()[0]})")
+        return "\n".join(lines)
+
+    def snapshot(self) -> str:
+        async def do():
+            await self._page()
+            return await self._state("full")
+
+        return self._run(do)
+
+    # ------------------------------------------------------------------
+    #  Action plumbing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _explain(e: Exception, ref: Optional[str]) -> str:
+        if isinstance(e, StaleRefError):
+            return (f"Ref {ref} no longer exists: the page changed since the last snapshot. "
+                    "Use a ref from the fresh snapshot below.")
+        first = (str(e).splitlines() or [type(e).__name__])[0]
+        if "Timeout" in first:
+            return f"{first} The element may be hidden, covered, or not rendered yet; check the snapshot below."
+        return first
+
+    async def _act(self, fn: Callable, ref: Optional[str] = None, mode: str = "diff") -> str:
+        """Run an action raced against dialogs, then report the resulting page state."""
+        page = await self._page()
+        if self._dialog is not None:
+            raise RuntimeError(f'A {self._dialog.type} dialog is open ("{self._dialog.message[:200]}"). '
+                               "Call browser_handle_dialog first.")
+        modal = asyncio.get_running_loop().create_future()
+        self._modal_waiters.append(modal)
+        work = asyncio.ensure_future(fn(page))
+        try:
+            done, _ = await asyncio.wait({work, modal}, return_when=asyncio.FIRST_COMPLETED)
+            if work in done:
+                summary = work.result()
+                await self._settle(self._current or page)
+            else:
+                # The action keeps running behind the dialog; it finishes once the dialog is handled.
+                work.add_done_callback(lambda t: t.cancelled() or t.exception())
+                summary = "The action opened a dialog."
+            return f"{summary}\n\n{await self._state(mode)}"
+        except asyncio.CancelledError:
+            work.cancel()
+            raise
+        except Exception as e:
+            raise RuntimeError(f"{self._explain(e, ref)}\n\n{await self._state('full')}") from None
+        finally:
+            if modal in self._modal_waiters:
+                self._modal_waiters.remove(modal)
+
+    @staticmethod
+    async def _settle(page):
+        """Let a navigation triggered by the action commit and reach DOMContentLoaded."""
+        await asyncio.sleep(0.4)
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=5_000)
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _handle(page, ref: str):
+        loc = page.locator(f"aria-ref={ref}") if _REF.match(ref) else page.locator(ref)
+        if _REF.match(ref):
+            try:
+                count = await loc.count()
+            except Exception:  # unknown frame prefix
+                count = 0
+            if count == 0:
+                raise StaleRefError(ref)
+        handle = await loc.first.element_handle(timeout=ACTION_TIMEOUT_MS)
+        if handle is None:
+            raise StaleRefError(ref)
+        return handle
+
+    @staticmethod
+    async def _center(handle) -> Tuple[float, float]:
+        await handle.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest'})")
+        box = await handle.bounding_box()
+        if not box:
+            raise RuntimeError("Element has no visible box (hidden or detached).")
+        jitter = lambda size: (random.random() - 0.5) * min(size * 0.3, 10)
+        return box["x"] + box["width"] / 2 + jitter(box["width"]), box["y"] + box["height"] / 2 + jitter(box["height"])
+
+    @staticmethod
+    async def _humanized(action: Callable, fallback: Callable):
+        """Prefer CloakBrowser's humanized handle action; when its engine cannot map the
+        element (e.g. inside iframes), use the humanized page mouse/keyboard instead."""
+        try:
+            return await action()
+        except Exception as e:
+            if _HUMANIZE_MISS not in str(e):
+                raise
+            return await fallback()
+
+    async def _click(self, page, ref: str, button: str = "left", double: bool = False):
+        h = await self._handle(page, ref)
+
+        async def native():
+            if double:
+                await h.dblclick(button=button, timeout=ACTION_TIMEOUT_MS)
+            else:
+                await h.click(button=button, timeout=ACTION_TIMEOUT_MS)
+
+        async def by_mouse():
+            x, y = await self._center(h)
+            await page.mouse.click(x, y, button=button, click_count=2 if double else 1)
+
+        await self._humanized(native, by_mouse)
+
+    async def _type(self, page, ref: str, text: str):
+        h = await self._handle(page, ref)
+
+        async def by_keyboard():
+            x, y = await self._center(h)
+            await page.mouse.click(x, y)
+            await page.keyboard.press("ControlOrMeta+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.type(text)
+
+        await self._humanized(lambda: h.fill(text, timeout=ACTION_TIMEOUT_MS), by_keyboard)
+
+    # ------------------------------------------------------------------
+    #  Actions
     # ------------------------------------------------------------------
 
     def navigate(self, url: str) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page. Launch the browser first."
-        self._active_frame = None
-        self._active_frame_type = None
-        self._last_snapshot_elements = []
-        self._cdp.clear_console_buffer()
-        self._cdp.clear_network_buffer()
-
-        def _do():
-            resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            status = resp.status if resp else "unknown"
-            title = page.title() or "(no title)"
-            return status, title
-
-        try:
-            status, title = self._worker.dispatch(_do, timeout=35)
-            result = f"Navigated to {url}\nStatus: {status}\nTitle: {title}"
-        except TimeoutError:
-            result = f"Navigation timed out: {url}"
-        except Exception as e:
-            err_str = str(e)
-            if "ERR_NAME_NOT_RESOLVED" in err_str:
-                result = f"Navigation failed: DNS error for: {url}"
-            elif "ERR_CONNECTION" in err_str or "ERR_TIMED_OUT" in err_str:
-                result = f"Navigation failed: connection error for {url}"
+        async def go(page):
+            self._network.get(page, []).clear()
+            if url == "back":
+                await page.go_back(wait_until="domcontentloaded", timeout=60_000)
+            elif url == "forward":
+                await page.go_forward(wait_until="domcontentloaded", timeout=60_000)
+            elif url == "reload":
+                await page.reload(wait_until="domcontentloaded", timeout=60_000)
             else:
-                result = f"Navigation failed: {e}"
-        return self._post_action(result, is_navigation=True)
+                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            return f"Navigated ({url})."
 
-    def go_back(self) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page."
-        self._active_frame = None
-        self._active_frame_type = None
-        self._last_snapshot_elements = []
-        self._cdp.clear_console_buffer()
-        self._cdp.clear_network_buffer()
-        try:
-            url = self._worker.dispatch(
-                lambda: (page.go_back(wait_until="domcontentloaded"), page.url)[1],
-                timeout=15,
-            )
-            result = f"Went back. Now on: {url}"
-        except Exception as e:
-            result = f"Go back failed: {e}"
-        return self._post_action(result, is_navigation=True)
+        return self._run(lambda: self._act(go, mode="full"))
 
-    def go_forward(self) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page."
-        self._active_frame = None
-        self._active_frame_type = None
-        self._last_snapshot_elements = []
-        self._cdp.clear_console_buffer()
-        self._cdp.clear_network_buffer()
-        try:
-            url = self._worker.dispatch(
-                lambda: (page.go_forward(wait_until="domcontentloaded"), page.url)[1],
-                timeout=15,
-            )
-            result = f"Went forward. Now on: {url}"
-        except Exception as e:
-            result = f"Go forward failed: {e}"
-        return self._post_action(result, is_navigation=True)
+    def click(self, ref: Optional[str] = None, button: str = "left", double: bool = False,
+              x: Optional[float] = None, y: Optional[float] = None) -> str:
+        async def do(page):
+            if ref:
+                await self._click(page, ref, button, double)
+                return f"Clicked {ref}."
+            if x is None or y is None:
+                raise ValueError("Pass a ref, or x and y.")
+            await page.mouse.click(x, y, button=button, click_count=2 if double else 1)
+            return f"Clicked at ({x}, {y})."
 
-    def reload(self) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page."
-        self._active_frame = None
-        self._last_snapshot_elements = []
-        self._cdp.clear_console_buffer()
-        self._cdp.clear_network_buffer()
-        try:
-            url = self._worker.dispatch(
-                lambda: (page.reload(wait_until="domcontentloaded"), page.url)[1],
-                timeout=15,
-            )
-            result = f"Page reloaded: {url}"
-        except Exception as e:
-            result = f"Reload failed: {e}"
-        return self._post_action(result, is_navigation=True)
+        return self._run(lambda: self._act(do, ref))
 
-    # ------------------------------------------------------------------
-    #  Scroll (NEW)
-    # ------------------------------------------------------------------
+    def type(self, ref: str, text: str, submit: bool = False) -> str:
+        async def do(page):
+            await self._type(page, ref, text)
+            if submit:
+                await page.keyboard.press("Enter")
+            return f"Typed into {ref}{' and pressed Enter' if submit else ''}."
 
-    def scroll(self, direction: str = "down", pages: float = 1.0) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page."
-        fp = self._capture_fingerprint()
-        try:
+        # Humanized typing runs at human speed, so long text needs more time.
+        return self._run(lambda: self._act(do, ref), timeout=120 + len(text) * 0.5)
 
-            def _do():
-                vp = page.viewport_size
-                vh = vp["height"] if vp else 720
-                vw = vp["width"] if vp else 1280
-                scroll_px = int(vh * pages)
-                if direction == "up":
-                    scroll_px = -scroll_px
-                page.mouse.move(vw // 2, vh // 2)
-                page.mouse.wheel(0, scroll_px)
-                return direction, abs(int(scroll_px)), vh
-
-            d, px, vh = self._worker.dispatch(_do, timeout=10)
-            # Small delay to let scroll complete
-            _time.sleep(0.15)
-            result = (
-                f"Scrolled {d} {px}px (~{pages} viewport{'s' if pages != 1 else ''})"
-            )
-        except Exception as e:
-            result = f"Scroll failed: {e}"
-        return self._post_action(result, pre_fingerprint=fp)
-
-    # ------------------------------------------------------------------
-    #  Wait (NEW)
-    # ------------------------------------------------------------------
-
-    def wait(self, seconds: int = 3) -> str:
-        fp = self._capture_fingerprint()
-        actual = min(max(seconds, 0), 30)
-        if self._cancel_event.wait(actual):
-            self._clear_cancel()
-            return "Browser wait cancelled by user."
-        return self._post_action(f"Waited {actual} seconds", pre_fingerprint=fp)
-
-    # ------------------------------------------------------------------
-    #  Wait For (element/text condition)
-    # ------------------------------------------------------------------
-
-    def wait_for(self, selector=None, text=None, timeout=10) -> str:
-        """Wait for a specific element to become visible or text to appear.
-
-        More efficient than blind sleeping for AJAX/dynamic content.
-        Provide either selector (CSS) or text to wait for.
-        """
-        target = self._target()
-        if not target:
-            return "No active page."
-        if not selector and not text:
-            return "Must provide either selector or text to wait for."
-        fp = self._capture_fingerprint()
-        timeout_s = min(max(timeout, 1), 30)
-        timeout_ms = timeout_s * 1000
-        try:
-            if selector:
-
-                def _do_wait():
-                    target.wait_for_selector(
-                        selector, state="visible", timeout=timeout_ms
-                    )
-
-                self._worker.dispatch(_do_wait, timeout=timeout_s + 10)
-                result = f"Element '{selector}' appeared on page"
-            else:
-                # Poll in a loop with short sleeps so we detect text
-                # as soon as it appears instead of checking once and failing.
-                poll_interval = 0.5  # seconds between checks
-                elapsed = 0.0
-
-                def _check_text():
-                    return target.evaluate(
-                        "text => document.body.innerText.includes(text)", text
-                    )
-
-                while elapsed < timeout_s:
-                    if self._cancel_event.is_set():
-                        self._clear_cancel()
-                        return "Browser wait_for cancelled by user."
-                    try:
-                        found = self._worker.dispatch(_check_text, timeout=5)
-                    except Exception:
-                        found = False
-                    if found:
-                        break
-                    _time.sleep(min(poll_interval, timeout_s - elapsed))
-                    elapsed += poll_interval
-
-                if elapsed < timeout_s:
-                    result = f"Text '{text}' found on page"
+    def fill_form(self, fields: List[Dict[str, str]]) -> str:
+        async def do(page):
+            for f in fields:
+                ref, kind, value = f["ref"], f.get("type", "textbox"), str(f["value"])
+                if kind == "textbox":
+                    await self._type(page, ref, value)
+                elif kind == "combobox":
+                    await (await self._handle(page, ref)).select_option(value, timeout=ACTION_TIMEOUT_MS)
+                elif kind in ("checkbox", "radio"):
+                    await (await self._handle(page, ref)).set_checked(value.lower() == "true", timeout=ACTION_TIMEOUT_MS)
                 else:
-                    result = f"Timed out waiting ({timeout_s}s) for text: {text}"
-        except Exception as e:
-            err_str = str(e)
-            if (
-                "Timeout" in err_str
-                or "timeout" in err_str
-                or "not found" in err_str.lower()
-            ):
-                target_desc = selector or text
-                result = f"Timed out waiting ({timeout_s}s) for: {target_desc}"
+                    raise ValueError(f"Unknown field type {kind!r}")
+            return f"Filled {len(fields)} field(s)."
+
+        chars = sum(len(str(f.get("value", ""))) for f in fields)
+        return self._run(lambda: self._act(do), timeout=120 + chars * 0.5)
+
+    def select(self, ref: str, values: List[str]) -> str:
+        async def do(page):
+            picked = await (await self._handle(page, ref)).select_option(values, timeout=ACTION_TIMEOUT_MS)
+            return f"Selected {', '.join(picked)}."
+
+        return self._run(lambda: self._act(do, ref))
+
+    def hover(self, ref: str) -> str:
+        async def do(page):
+            h = await self._handle(page, ref)
+
+            async def by_mouse():
+                x, y = await self._center(h)
+                await page.mouse.move(x, y)
+
+            await self._humanized(lambda: h.hover(timeout=ACTION_TIMEOUT_MS), by_mouse)
+            return f"Hovered {ref}."
+
+        return self._run(lambda: self._act(do, ref))
+
+    def drag(self, from_ref: Optional[str] = None, to_ref: Optional[str] = None,
+             x1: Optional[float] = None, y1: Optional[float] = None,
+             x2: Optional[float] = None, y2: Optional[float] = None) -> str:
+        async def do(page):
+            if from_ref and to_ref:
+                start = await self._center(await self._handle(page, from_ref))
+                end = await self._center(await self._handle(page, to_ref))
+            elif None not in (x1, y1, x2, y2):
+                start, end = (x1, y1), (x2, y2)
             else:
-                result = f"wait_for failed: {e}"
-        return self._post_action(result, pre_fingerprint=fp)
-
-    # ------------------------------------------------------------------
-    #  Send Keys (NEW)
-    # ------------------------------------------------------------------
-
-    def send_keys(self, keys: str) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page."
-        fp = self._capture_fingerprint()
-        try:
-
-            def _do():
-                page.keyboard.press(keys)
-                return True
-
-            self._worker.dispatch(_do, timeout=5)
-            result = f"Sent keys: {keys}"
-        except Exception as e:
-            result = f"Send keys failed: {e}"
-        return self._post_action(result, pre_fingerprint=fp)
-
-    # ------------------------------------------------------------------
-    #  Click (selector-based, existing)
-    # ------------------------------------------------------------------
-
-    def click(self, selector: str) -> str:
-        target = self._target()
-        if not target:
-            return "No active page."
-
-        tabs_before = len(self._pages)
-        fp = self._capture_fingerprint()
-
-        # Pre-click state
-        try:
-            pre_state = self._worker.dispatch(
-                lambda: {"url": target.url, "title": target.title() or ""}, timeout=5
-            )
-        except Exception:
-            pre_state = {}
-
-        # Fallback chain: CSS -> text -> label -> JS
-        clicked_method = None
-        try:
-            self._worker.dispatch(
-                lambda: target.locator(selector).click(timeout=10000), timeout=15
-            )
-            clicked_method = "CSS selector"
-        except Exception:
-            pass
-        if not clicked_method:
-            try:
-                self._worker.dispatch(
-                    lambda: target.get_by_text(selector, exact=False).first.click(
-                        timeout=5000
-                    ),
-                    timeout=10,
-                )
-                clicked_method = "visible text"
-            except Exception:
-                pass
-        if not clicked_method:
-            clicked_method = self._worker.dispatch(
-                lambda: self._click_label_fallback(target, selector), timeout=10
-            )
-        if not clicked_method:
-            return self._post_action(
-                f"Click failed for '{selector}': no matching element",
-                pre_fingerprint=fp,
-            )
-
-        # Post-click verification
-        try:
-            post_state = self._worker.dispatch(
-                lambda: {
-                    "url": target.url,
-                    "title": target.title() or "",
-                    "modal_visible": bool(
-                        target.locator(
-                            ".modal.show, [role='dialog']:not([hidden])"
-                        ).count()
-                    ),
-                    "dropdown_visible": bool(
-                        target.locator(
-                            ".dropdown-menu.show, [role='listbox']:not([hidden])"
-                        ).count()
-                    ),
-                },
-                timeout=5,
-            )
-        except Exception:
-            post_state = {}
-
-        changes = []
-        if post_state.get("url") != pre_state.get("url"):
-            changes.append(f"URL changed: {post_state['url']}")
-        if post_state.get("title") != pre_state.get("title"):
-            changes.append(f"Title changed: {post_state['title']}")
-        if post_state.get("modal_visible"):
-            changes.append("modal appeared")
-        if post_state.get("dropdown_visible"):
-            changes.append("dropdown appeared")
-
-        try:
-
-            def _check():
-                loc = target.locator(selector)
-                tag = loc.evaluate("el => el.tagName.toLowerCase()")
-                if tag == "input":
-                    return loc.evaluate("el => el.type"), loc.evaluate(
-                        "el => el.checked"
-                    )
-                return None, None
-
-            input_type, checked = self._worker.dispatch(_check, timeout=5)
-            if input_type in ("radio", "checkbox"):
-                changes.append(f"{input_type} checked={checked}")
-        except Exception:
-            pass
-
-        result = f"Clicked: {selector} (via {clicked_method})"
-        if changes:
-            result += f" — {'; '.join(changes)}"
-        else:
-            result += " — no visible page state change detected"
-
-        # Auto new-tab detection
-        tab_msg = self._detect_new_tab(tabs_before)
-        result += tab_msg
-
-        return self._post_action(result, pre_fingerprint=fp)
-
-    def _click_label_fallback(self, target, selector):
-        """Label wrapping and JS force-click fallback."""
-        el = target.locator(selector).first
-        if el.count() == 0:
-            return None
-        el_id = el.get_attribute("id")
-        if el_id:
-            label_loc = target.locator(f'label[for="{el_id}"]')
-            if label_loc.count() > 0:
-                label_loc.first.click(timeout=3000)
-                return "label[for]"
-            aria_id = el.get_attribute("aria-labelledby")
-            if aria_id:
-                aria_loc = target.locator(f'[id="{aria_id}"]')
-                if aria_loc.count() > 0:
-                    aria_loc.first.click(timeout=3000)
-                    return "aria-labelledby"
-        wrapping = target.locator(f"label:has({selector})").first
-        if wrapping.count() > 0:
-            wrapping.click(timeout=3000)
-            return "wrapping label"
-        try:
-            result = target.evaluate(
-                """(sel) => {
-                const idMatch = sel.match(/^\\[id="(.+)"\\]$/);
-                let el = idMatch ? document.getElementById(idMatch[1]) : document.querySelector(sel);
-                if (el) { el.click(); return true; }
-                return false;
-            }""",
-                selector,
-            )
-            if result:
-                return "JS force-click"
-        except Exception:
-            pass
-        return None
-
-    # ------------------------------------------------------------------
-    #  Click by Index (NEW)
-    # ------------------------------------------------------------------
-
-    def click_by_index(self, index: int) -> str:
-        if not self._last_snapshot_elements:
-            # Re-snapshot to populate the cache
-            try:
-                self.snapshot()
-            except Exception:
-                pass
-        if index < 0 or index >= len(self._last_snapshot_elements):
-            return self._post_action(
-                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements) - 1}",
-            )
-        el = self._last_snapshot_elements[index]
-        selector = el.get("selector", "")
-        text = el.get("text", el.get("name", ""))
-        if not selector:
-            return self._post_action(
-                f"Element [{index}] has no clickable selector ({text})"
-            )
-        return self.click(selector)
-
-    # ------------------------------------------------------------------
-    #  Click XY
-    # ------------------------------------------------------------------
-
-    def click_xy(self, x: float, y: float) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page."
-        tabs_before = len(self._pages)
-        fp = self._capture_fingerprint()
-        try:
-            self._worker.dispatch(lambda: page.mouse.click(x, y), timeout=10)
-            result = f"Clicked at ({x}, {y})"
-            result += self._detect_new_tab(tabs_before)
-        except Exception as e:
-            result = f"Click at ({x}, {y}) failed: {e}"
-        return self._post_action(result, pre_fingerprint=fp)
-
-    # ------------------------------------------------------------------
-    #  Hover (selector-based)
-    # ------------------------------------------------------------------
-
-    def hover(self, selector: str) -> str:
-        """Hover over an element to trigger hover states (dropdowns, tooltips, etc.)."""
-        target = self._target()
-        if not target:
-            return "No active page."
-        fp = self._capture_fingerprint()
-        # Pre-hover state
-        try:
-            pre_state = self._worker.dispatch(
-                lambda: {"url": target.url, "title": target.title() or ""}, timeout=5
-            )
-        except Exception:
-            pre_state = {}
-        try:
-            self._worker.dispatch(
-                lambda: target.locator(selector).hover(timeout=10000), timeout=15
-            )
-            result = f"Hovered over: {selector}"
-        except Exception:
-            # Fallback: try visible text
-            try:
-                self._worker.dispatch(
-                    lambda: target.get_by_text(selector, exact=False).first.hover(
-                        timeout=5000
-                    ),
-                    timeout=10,
-                )
-                result = f"Hovered over: {selector} (via text)"
-            except Exception as e:
-                return self._post_action(
-                    f"Hover failed for '{selector}': {e}", pre_fingerprint=fp
-                )
-        # Post-hover verification
-        try:
-            post_state = self._worker.dispatch(
-                lambda: {
-                    "url": target.url,
-                    "title": target.title() or "",
-                    "dropdown_visible": bool(
-                        target.locator(
-                            ".dropdown-menu.show, [role='listbox']:not([hidden])"
-                        ).count()
-                    ),
-                    "tooltip_visible": bool(
-                        target.locator(
-                            ".tooltip.show, .popover.show, [role='tooltip']:not([hidden])"
-                        ).count()
-                    ),
-                },
-                timeout=5,
-            )
-        except Exception:
-            post_state = {}
-        changes = []
-        if post_state.get("dropdown_visible"):
-            changes.append("dropdown appeared")
-        if post_state.get("tooltip_visible"):
-            changes.append("tooltip appeared")
-        if changes:
-            result += f" — {'; '.join(changes)}"
-        else:
-            result += " — no visible hover state change detected"
-        return self._post_action(result, pre_fingerprint=fp)
-
-    # ------------------------------------------------------------------
-    #  Hover by Index
-    # ------------------------------------------------------------------
-
-    def hover_by_index(self, index: int) -> str:
-        """Hover over an element by its snapshot index number."""
-        if not self._last_snapshot_elements:
-            try:
-                self.snapshot()
-            except Exception:
-                pass
-        if index < 0 or index >= len(self._last_snapshot_elements):
-            return self._post_action(
-                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements) - 1}",
-            )
-        el = self._last_snapshot_elements[index]
-        selector = el.get("selector", "")
-        text = el.get("text", el.get("name", ""))
-        if not selector:
-            return self._post_action(
-                f"Element [{index}] has no clickable selector ({text})"
-            )
-        return self.hover(selector)
-
-    # ------------------------------------------------------------------
-    #  Drag (selector-based)
-    # ------------------------------------------------------------------
-
-    def drag(self, selector_from: str, selector_to: str) -> str:
-        """Drag an element to another element."""
-        target = self._target()
-        if not target:
-            return "No active page."
-        page = self.current_page
-        if not page:
-            return "No active page."
-        fp = self._capture_fingerprint()
-        try:
-
-            def _do():
-                source = target.locator(selector_from).first
-                dest = target.locator(selector_to).first
-                source_box = source.bounding_box(timeout=5000)
-                dest_box = dest.bounding_box(timeout=5000)
-                if not source_box:
-                    return None, "Source element not visible"
-                if not dest_box:
-                    return None, "Destination element not visible"
-                sx = source_box["x"] + source_box["width"] / 2
-                sy = source_box["y"] + source_box["height"] / 2
-                dx = dest_box["x"] + dest_box["width"] / 2
-                dy = dest_box["y"] + dest_box["height"] / 2
-                page.mouse.move(sx, sy)
-                page.mouse.down()
-                # Smooth drag with intermediate steps
-                steps = 10
-                for i in range(1, steps + 1):
-                    cx = sx + (dx - sx) * i / steps
-                    cy = sy + (dy - sy) * i / steps
-                    page.mouse.move(cx, cy)
-                page.mouse.up()
-                return True, None
-
-            success, err = self._worker.dispatch(_do, timeout=15)
-            if not success:
-                result = f"Drag failed: {err}"
-            else:
-                result = f"Dragged from '{selector_from}' to '{selector_to}'"
-        except Exception as e:
-            result = f"Drag failed: {e}"
-        return self._post_action(result, pre_fingerprint=fp)
-
-    # ------------------------------------------------------------------
-    #  Drag XY
-    # ------------------------------------------------------------------
-
-    def drag_xy(self, x1: float, y1: float, x2: float, y2: float) -> str:
-        """Drag from one coordinate to another."""
-        page = self.current_page
-        if not page:
-            return "No active page."
-        fp = self._capture_fingerprint()
-        try:
-
-            def _do():
-                page.mouse.move(x1, y1)
-                page.mouse.down()
-                steps = 10
-                for i in range(1, steps + 1):
-                    cx = x1 + (x2 - x1) * i / steps
-                    cy = y1 + (y2 - y1) * i / steps
-                    page.mouse.move(cx, cy)
-                page.mouse.up()
-                return True
-
-            self._worker.dispatch(_do, timeout=10)
-            result = f"Dragged from ({x1}, {y1}) to ({x2}, {y2})"
-        except Exception as e:
-            result = f"Drag from ({x1}, {y1}) to ({x2}, {y2}) failed: {e}"
-        return self._post_action(result, pre_fingerprint=fp)
-
-    # ------------------------------------------------------------------
-    #  Type (selector-based, existing)
-    # ------------------------------------------------------------------
-
-    def type_text(self, selector: str, text: str, press_enter=False) -> str:
-        target = self._target()
-        if not target:
-            return "No active page."
-
-        fp = self._capture_fingerprint()
-
-        def _do_fill():
-            loc = target.locator(selector)
-            loc.fill(text, timeout=5000)
-            return loc.input_value(timeout=3000)
-
-        def _do_keys():
-            loc = target.locator(selector)
-            loc.click(timeout=5000)
-            loc.fill("", timeout=3000)
-            loc.type(text, delay=30)
-            return loc.input_value(timeout=3000)
-
-        actual = None
-        try:
-            actual = self._worker.dispatch(_do_fill, timeout=15)
-        except Exception:
-            pass
-        if actual != text:
-            try:
-                actual = self._worker.dispatch(_do_keys, timeout=20)
-            except Exception:
-                pass
-        if actual != text:
-            try:
-
-                def _do_ph():
-                    loc = target.get_by_placeholder(selector, exact=False).first
-                    loc.fill(text, timeout=5000)
-                    return loc.input_value(timeout=3000)
-
-                actual = self._worker.dispatch(_do_ph, timeout=15)
-            except Exception:
-                pass
-
-        if actual == text:
-            result = f"Typed into {selector}: '{text}'"
-        elif actual is not None and actual.strip() == text.strip():
-            result = f"Typed into {selector}: '{text}' (stripped match — value is '{actual}')"
-        elif actual is not None:
-            result = f"WARNING: Typed into {selector} but value mismatch.\n  Expected: '{text}'\n  Actual:   '{actual}'"
-        else:
-            result = f"Typed into {selector}: '{text}' (could not verify)"
-
-        if press_enter:
-            try:
-                self._worker.dispatch(
-                    lambda: target.locator(selector).press("Enter"), timeout=5
-                )
-                result += " + Enter"
-            except Exception:
-                result += " + Enter (failed)"
-
-        return self._post_action(result, pre_fingerprint=fp)
-
-    # ------------------------------------------------------------------
-    #  Type by Index (NEW)
-    # ------------------------------------------------------------------
-
-    def type_by_index(self, index: int, text: str, press_enter=False) -> str:
-        if not self._last_snapshot_elements:
-            try:
-                self.snapshot()
-            except Exception:
-                pass
-        if index < 0 or index >= len(self._last_snapshot_elements):
-            return self._post_action(
-                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements) - 1}",
-            )
-        el = self._last_snapshot_elements[index]
-        selector = el.get("selector", "")
-        if not selector:
-            return self._post_action(f"Element [{index}] has no input selector")
-        return self.type_text(selector, text, press_enter)
-
-    # ------------------------------------------------------------------
-    #  Select Option
-    # ------------------------------------------------------------------
-
-    def select_option(self, selector: str, value: str) -> str:
-        target = self._target()
-        if not target:
-            return "No active page."
-
-        fp = self._capture_fingerprint()
-
-        def _do_select():
-            loc = target.locator(selector)
-            for attempt in [("value", {"value": value}), ("label", {"label": value})]:
-                try:
-                    loc.select_option(**attempt[1], timeout=3000)
-                    return attempt[0], loc.input_value(timeout=3000)
-                except Exception:
-                    pass
-            try:
-                loc.select_option(index=int(value), timeout=3000)
-                return "index", loc.input_value(timeout=3000)
-            except Exception:
-                return None, None
-
-        method, actual = self._worker.dispatch(_do_select, timeout=10)
-        if not method:
-            return self._post_action(
-                f"Select failed for '{selector}': '{value}' not found",
-                pre_fingerprint=fp,
-            )
-
-        if actual and actual.strip() == value.strip():
-            result = f"Selected '{value}' in {selector} (matched by {method}, verified)"
-        elif actual:
-            result = f"Selected '{value}' in {selector} via {method}, but verification shows: '{actual}'"
-        else:
-            result = f"Selected '{value}' in {selector} via {method}"
-        return self._post_action(result, pre_fingerprint=fp)
-
-    # ------------------------------------------------------------------
-    #  Select Option by Index
-    # ------------------------------------------------------------------
-
-    def select_option_by_index(self, index: int, value: str) -> str:
-        """Select an option from a <select> by snapshot index (PREFERRED)."""
-        if not self._last_snapshot_elements:
-            try:
-                self.snapshot()
-            except Exception:
-                pass
-        if index < 0 or index >= len(self._last_snapshot_elements):
-            return self._post_action(
-                f"Element index {index} not found. Available: 0-{len(self._last_snapshot_elements) - 1}",
-            )
-        el = self._last_snapshot_elements[index]
-        if el.get("tag") != "select":
-            text = el.get("text", el.get("name", ""))
-            return self._post_action(
-                f"Element [{index}] is not a <select> (it's a {el.get('tag', '?')}): {text}"
-            )
-        selector = el.get("selector", "")
-        if not selector:
-            return self._post_action(f"Element [{index}] has no selector")
-        return self.select_option(selector, value)
-
-    # ------------------------------------------------------------------
-    #  Search Page (NEW)
-    # ------------------------------------------------------------------
-
-    def search_page(
-        self, pattern: str, regex=False, case_sensitive=False, max_results=20
-    ) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page."
-
-        def _do():
-            js = f"""(() => {{
-                var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-                var fullText = '';
-                var nodeOffsets = [];
-                while (walker.nextNode()) {{
-                    var node = walker.currentNode;
-                    var text = node.textContent;
-                    if (text && text.trim()) {{
-                        nodeOffsets.push({{offset: fullText.length, length: text.length, node: node}});
-                        fullText += text;
-                    }}
-                }}
-                var flags = {"g" if case_sensitive else "gi"};
-                var pattern = {json.dumps(pattern)};
-                var re;
-                try {{
-                    re = {json.dumps(pattern) if regex else "null"};
-                    if ({"true" if regex else "false"}) {{
-                        re = new RegExp(pattern, flags);
-                    }} else {{
-                        re = new RegExp(pattern.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&'), flags);
-                    }}
-                }} catch(e) {{ return {{error: 'Invalid regex: ' + e.message, matches: [], total: 0}}; }}
-                var matches = [];
-                var totalFound = 0;
-                var match;
-                while ((match = re.exec(fullText)) !== null) {{
-                    totalFound++;
-                    if (matches.length < {max_results}) {{
-                        var start = Math.max(0, match.index - 40);
-                        var end = Math.min(fullText.length, match.index + match[0].length + 40);
-                        var context = fullText.slice(start, end);
-                        matches.push({{
-                            match_text: match[0],
-                            context: (start > 0 ? '...' : '') + context + (end < fullText.length ? '...' : '')
-                        }});
-                    }}
-                    if (match[0].length === 0) re.lastIndex++;
-                }}
-                return {{matches: matches, total: totalFound, has_more: totalFound > {max_results}}};
-            }})()"""
-            return page.evaluate(js)
-
-        try:
-            data = self._worker.dispatch(_do, timeout=10)
-        except Exception as e:
-            return f"search_page failed: {e}"
-
-        if isinstance(data, dict) and data.get("error"):
-            return f"search_page: {data['error']}"
-        if not isinstance(data, dict):
-            return f"search_page returned unexpected result: {data}"
-
-        matches = data.get("matches", [])
-        total = data.get("total", 0)
-        has_more = data.get("has_more", False)
-
-        if total == 0:
-            return f'No matches found for "{pattern}" on page.'
-
-        lines = [
-            f'Found {total} match{"es" if total != 1 else ""} for "{pattern}" on page:'
-        ]
-        for i, m in enumerate(matches):
-            lines.append(f"[{i + 1}] {m.get('context', '')}")
-        if has_more:
-            lines.append(f"\n... showing {len(matches)} of {total} total matches.")
-        return "\n".join(lines)
-
-    # ------------------------------------------------------------------
-    #  Find Elements (NEW)
-    # ------------------------------------------------------------------
-
-    def find_elements(self, selector: str, max_results=50) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page."
-
-        def _do():
-            try:
-                elements = page.query_selector_all(selector)
-            except Exception as e:
-                return {
-                    "error": f"Invalid CSS selector: {e}",
-                    "elements": [],
-                    "total": 0,
-                }
-            total = len(elements)
-            limit = min(total, max_results)
-            results = []
-            for i in range(limit):
-                el = elements[i]
-                tag = el.evaluate("el => el.tagName.toLowerCase()")
-                text = (el.inner_text() or "").strip()
-                if len(text) > 120:
-                    text = text[:120] + "..."
-                item = {"index": i, "tag": tag, "text": text}
-                href = el.get_attribute("href")
-                if href:
-                    item["href"] = href
-                name_attr = el.get_attribute("name")
-                if name_attr:
-                    item["name"] = name_attr
-                results.append(item)
-            return {"elements": results, "total": total, "showing": limit}
-
-        try:
-            data = self._worker.dispatch(_do, timeout=10)
-        except Exception as e:
-            return f"find_elements failed: {e}"
-
-        if isinstance(data, dict) and data.get("error"):
-            return f"find_elements: {data['error']}"
-
-        elements = data.get("elements", [])
-        total = data.get("total", 0)
-        showing = data.get("showing", 0)
-
-        if total == 0:
-            return f'No elements found matching "{selector}".'
-
-        lines = [
-            f'Found {total} element{"s" if total != 1 else ""} matching "{selector}":'
-        ]
-        for el in elements:
-            idx = el.get("index", 0)
-            tag = el.get("tag", "?")
-            text = el.get("text", "")
-            parts = [f"[{idx}] <{tag}>"]
+                raise ValueError("Pass from_ref and to_ref, or x1, y1, x2, y2.")
+            await page.mouse.move(*start)
+            await page.mouse.down()
+            await page.mouse.move(*end, steps=12)
+            await page.mouse.up()
+            return "Dragged."
+
+        return self._run(lambda: self._act(do, from_ref))
+
+    def press_key(self, key: str) -> str:
+        async def do(page):
+            await page.keyboard.press(key)
+            return f"Pressed {key}."
+
+        return self._run(lambda: self._act(do))
+
+    def scroll(self, direction: str = "down", pages: float = 1.0, ref: Optional[str] = None) -> str:
+        async def do(page):
+            if ref:
+                await page.mouse.move(*(await self._center(await self._handle(page, ref))))
+            height = (page.viewport_size or {"height": 720})["height"]
+            dy = height * pages * (-1 if direction == "up" else 1)
+            await page.mouse.wheel(0, dy)
+            return f"Scrolled {direction} {pages} page(s)."
+
+        return self._run(lambda: self._act(do, ref))
+
+    def wait_for(self, text: Optional[str] = None, text_gone: Optional[str] = None,
+                 seconds: Optional[float] = None, timeout: float = 30) -> str:
+        async def do(page):
+            if seconds:
+                await asyncio.sleep(min(float(seconds), 60))
             if text:
-                parts.append(f'"{text}"')
-            attrs = []
-            for k in ["href", "name"]:
-                if el.get(k):
-                    attrs.append(f'{k}="{el[k]}"')
-            if attrs:
-                parts.append("{" + ", ".join(attrs) + "}")
-            lines.append(" ".join(parts))
-        if showing < total:
-            lines.append(f"\nShowing {showing} of {total} total elements.")
-        return "\n".join(lines)
+                await page.get_by_text(text).first.wait_for(state="visible", timeout=timeout * 1000)
+            if text_gone:
+                await page.get_by_text(text_gone).first.wait_for(state="hidden", timeout=timeout * 1000)
+            if not (seconds or text or text_gone):
+                raise ValueError("Pass text, text_gone, or seconds.")
+            return "Wait finished."
 
-    # ------------------------------------------------------------------
-    #  Evaluate JS
-    # ------------------------------------------------------------------
+        return self._run(lambda: self._act(do), timeout=timeout + 70)
 
-    def evaluate(self, expression: str) -> str:
-        target = self._target()
-        if not target:
-            return "No active page."
-        try:
+    def evaluate(self, expression: str, ref: Optional[str] = None) -> str:
+        async def do(page):
+            if ref:
+                result = await (await self._handle(page, ref)).evaluate(expression)
+            else:
+                result = await page.evaluate(expression)
+            text = result if isinstance(result, str) else json.dumps(result, indent=2, default=str)
+            return f"Result:\n{text}"
+
+        return self._run(lambda: self._act(do, ref, mode="none"))
+
+    def handle_dialog(self, accept: bool, prompt_text: Optional[str] = None) -> str:
+        async def do():
+            d = self._dialog
+            if d is None:
+                return "No dialog is open."
+            self._dialog = None
             try:
-                result = self._worker.dispatch(
-                    lambda: target.evaluate(expression), timeout=15
-                )
-            except SyntaxError:
-                result = self._worker.dispatch(
-                    lambda: target.evaluate(f"() => {{ {expression} }}"), timeout=15
-                )
-            if result is None:
-                return "JavaScript executed (returned null/undefined)"
-            if isinstance(result, str):
-                return (
-                    result if len(result) < 10000 else result[:10000] + "...[truncated]"
-                )
-            return json.dumps(result, indent=2, default=str)
-        except SyntaxError:
-            return f"JavaScript syntax error in: {expression!r}\nUse 'return' with full function body."
-        except Exception as e:
-            return f"JavaScript error: {type(e).__name__}: {e}"
-
-    # ------------------------------------------------------------------
-    #  Frame management (enhanced for cross-origin)
-    # ------------------------------------------------------------------
-
-    def switch_frame(self, frame_selector=None) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page."
-        if not frame_selector:
-            self._active_frame = None
-            return "Switched back to top-level page."
-
-        def _do():
-            frames = page.frames
-            sel_lower = frame_selector.lower()
-            # 1. Try matching by URL or name in all Playwright frames
-            for f in frames:
-                if f == page.main_frame:
-                    continue
-                if (
-                    sel_lower in (f.url or "").lower()
-                    or sel_lower in (f.name or "").lower()
-                ):
-                    return f, "playwright"
-            # 2. Try CDP frame tree for cross-origin frames
-            try:
-                cdp_frames = self._cdp.get_all_frame_ids(page)
-                for cf in cdp_frames:
-                    if (
-                        sel_lower in cf.get("url", "").lower()
-                        or sel_lower in cf.get("name", "").lower()
-                    ):
-                        # Found a cross-origin frame — mark it for a11y-based access
-                        return cf, "cdp_cross_origin"
+                if accept:
+                    await (d.accept(prompt_text) if prompt_text is not None else d.accept())
+                else:
+                    await d.dismiss()
             except Exception:
                 pass
-            return None, None
+            await self._settle(self._current)
+            return f"{'Accepted' if accept else 'Dismissed'} {d.type} dialog.\n\n{await self._state('diff')}"
+
+        return self._run(do)
+
+    def tabs(self, action: str = "list", index: Optional[int] = None, url: Optional[str] = None) -> str:
+        async def do():
+            ctx = await self._ensure()
+            await self._page()
+            if action == "new":
+                page = await ctx.new_page()
+                if page in self._new_tabs:
+                    self._new_tabs.remove(page)
+                self._current = page
+                if url:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            elif action == "select":
+                if index is None or not 0 <= index < len(self._pages):
+                    raise ValueError(f"No tab at index {index}; {len(self._pages)} open.")
+                self._current = self._pages[index]
+                await self._current.bring_to_front()
+            elif action == "close":
+                target = self._current if index is None else (self._pages[index] if 0 <= index < len(self._pages) else None)
+                if target is None:
+                    raise ValueError(f"No tab at index {index}.")
+                await target.close()
+                await self._page()
+            elif action != "list":
+                raise ValueError("action must be list, new, select or close")
+            listing = "\n".join(f"{'*' if p is self._current else ' '} [{i}] {p.url}" for i, p in enumerate(self._pages))
+            return f"{listing}\n\n{await self._state('none' if action == 'list' else 'full')}"
+
+        return self._run(do)
+
+    def screenshot(self, full_page: bool = False, ref: Optional[str] = None) -> Tuple[Optional[bytes], str, Optional[str]]:
+        async def do():
+            page = await self._page()
+            if ref:
+                return await (await self._handle(page, ref)).screenshot(type="png"), page.url
+            return await page.screenshot(full_page=full_page, type="png"), page.url
 
         try:
-            frame, frame_type = self._worker.dispatch(_do, timeout=10)
+            png, url = self._run(do)
         except Exception as e:
-            return f"Frame switch failed: {e}"
+            return None, f"Screenshot failed: {str(e).splitlines()[0]}", None
+        folder = Path("~/.kairos/screenshots").expanduser()
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"screenshot_{_time.strftime('%Y%m%d_%H%M%S')}.png"
+        path.write_bytes(png)
+        data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        return png, f"Screenshot captured ({len(png) / 1024:.0f} KB) — {url}\nSaved to: {path}", data_url
 
-        if frame is None:
-            avail = []
-            for f in page.frames:
-                if f != page.main_frame:
-                    avail.append(f"  - name={f.name!r} url={f.url}")
-            return (
-                f"No frame matching '{frame_selector}'.\nAvailable frames:\n"
-                + "\n".join(avail)[:2000]
-            )
+    def search_page(self, pattern: str, regex: bool = False, case_sensitive: bool = False, max_results: int = 20) -> str:
+        js = """([pattern, isRegex, caseSensitive, max]) => {
+            const text = document.body ? document.body.innerText : '';
+            let re;
+            try {
+                re = new RegExp(isRegex ? pattern : pattern.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'),
+                                caseSensitive ? 'g' : 'gi');
+            } catch (e) { return {error: 'Invalid regex: ' + e.message}; }
+            const matches = []; let total = 0, m;
+            while ((m = re.exec(text)) !== null) {
+                total++;
+                if (matches.length < max) {
+                    const s = Math.max(0, m.index - 40), e = Math.min(text.length, m.index + m[0].length + 40);
+                    matches.push((s > 0 ? '...' : '') + text.slice(s, e).replace(/\\s+/g, ' ') + (e < text.length ? '...' : ''));
+                }
+                if (m[0].length === 0) re.lastIndex++;
+            }
+            return {matches, total};
+        }"""
 
-        if frame_type == "cdp_cross_origin":
-            # Store the CDP frame info for snapshot to use
-            self._active_frame = frame  # Store the dict, not a Frame object
-            self._active_frame_type = "cdp"
-            return f"Switched to cross-origin frame: {frame.get('url', '')}"
+        async def do():
+            page = await self._page()
+            return await page.evaluate(js, [pattern, regex, case_sensitive, max_results])
 
-        self._active_frame = frame
-        self._active_frame_type = "playwright"
-        try:
-            url = frame.url or ""
-        except Exception:
-            url = ""
-        return f"Switched to frame: {url}"
-
-    # ------------------------------------------------------------------
-    #  Screenshot
-    # ------------------------------------------------------------------
-
-    def screenshot(self, full_page=False) -> Tuple[Optional[bytes], str, Optional[str]]:
-        page = self.current_page
-        if not page:
-            return None, "No active page.", None
-        screenshots_dir = Path("~/.kairos/screenshots").expanduser()
-        screenshots_dir.mkdir(parents=True, exist_ok=True)
-        ts = _time.strftime("%Y%m%d_%H%M%S")
-        filepath = screenshots_dir / f"screenshot_{ts}.png"
-
-        def _do():
-            png_bytes = page.screenshot(full_page=full_page, type="png")
-            filepath.write_bytes(png_bytes)
-            data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode(
-                "ascii"
-            )
-            return png_bytes, page.url, len(png_bytes), data_url
-
-        try:
-            png_bytes, url, size_bytes, data_url = self._worker.dispatch(
-                _do, timeout=30
-            )
-            msg = f"Screenshot captured ({size_bytes / 1024:.0f} KB) — {url}\nSaved to: {filepath}"
-            return png_bytes, msg, data_url
-        except Exception as e:
-            return None, f"Screenshot failed: {e}", None
-
-    # ------------------------------------------------------------------
-    #  Snapshot (enhanced with CDP cross-origin a11y)
-    # ------------------------------------------------------------------
-
-    def snapshot(self) -> str:
-        target = self._target()
-        if not target:
-            return "No active page."
-        try:
-            data = self._worker.dispatch(
-                lambda: target.evaluate(_SNAPSHOT_JS), timeout=15
-            )
-            # Cache elements for index-based interactions
-            self._last_snapshot_elements = data.get("elements", [])
-            result = self._format_snapshot(data)
-            # Append cross-origin iframe a11y data if available
-            result += self._get_cross_origin_snapshot_section()
-            return result
-        except Exception as e:
-            try:
-                title = self._worker.dispatch(
-                    lambda: target.title() if hasattr(target, "title") else "",
-                    timeout=5,
-                )
-                url = self._worker.dispatch(
-                    lambda: target.url if hasattr(target, "url") else "", timeout=5
-                )
-                text = self._worker.dispatch(
-                    lambda: (
-                        target.inner_text("body")
-                        if hasattr(target, "inner_text")
-                        else ""
-                    ),
-                    timeout=10,
-                )
-                if len(text) > 3000:
-                    text = text[:3000] + "\n...[truncated]"
-                return f"Page: {title}\nURL: {url}\n\n{text}"
-            except Exception as e2:
-                return f"Snapshot failed: {e}\nFallback also failed: {e2}"
-
-    def _get_cross_origin_snapshot_section(self) -> str:
-        """Get a11y content for cross-origin iframes via CDP."""
-        page = self.current_page
-        if not page:
-            return ""
-        try:
-            main_url = self._worker.dispatch(lambda: page.url, timeout=5)
-            cross_origin_data = self._worker.dispatch(
-                lambda: self._cdp.get_cross_origin_iframe_content(page, main_url),
-                timeout=15,
-            )
-        except Exception:
-            return ""
-        if not cross_origin_data:
-            return ""
-        lines = ["", "[Cross-Origin Iframes]"]
-        for iframe in cross_origin_data:
-            url = iframe.get("url", "")
-            name = iframe.get("name", "")
-            elements = iframe.get("elements", [])
-            if not elements:
-                continue
-            label = name or url[:60]
-            lines.append(f"  Frame: {label}")
-            for el in elements[:30]:
-                role = el.get("role", "")
-                name_text = el.get("name", "")
-                desc = el.get("description", "")
-                is_interactive = el.get("is_interactive", False)
-                prefix = "  →" if is_interactive else "    "
-                desc_str = f" ({desc})" if desc else ""
-                lines.append(f"{prefix} [{role}] {name_text}{desc_str}")
-        return "\n".join(lines)
-
-    def _format_snapshot(self, data: Dict[str, Any]) -> str:
-        lines = []
-        title = data.get("title", "(no title)")
-        url = data.get("url", "")
-        lines.append(f"[Page] {title}")
-        if url:
-            lines.append(f"[URL] {url}")
-        lines.append("")
-
-        if len(self._pages) > 1:
-
-            def _get_tab_titles():
-                result = []
-                for i, p in enumerate(self._pages):
-                    try:
-                        t = p.title() or p.url[:30]
-                    except Exception:
-                        t = "(error)"
-                    result.append(
-                        f"{'*' if i == self._current_idx else ' '} Tab {i}: {t}"
-                    )
-                return result
-
-            try:
-                tab_titles = self._worker.dispatch(_get_tab_titles, timeout=10)
-            except Exception:
-                tab_titles = [
-                    f"{'*' if i == self._current_idx else ' '} Tab {i}: (error)"
-                    for i in range(len(self._pages))
-                ]
-            lines.append(f"[Tabs] {' | '.join(tab_titles)}")
-            lines.append("")
-
-        headings = data.get("headings", [])
-        if headings:
-            lines.append("[Content]")
-            for h in headings:
-                level = h.get("level", "h2")
-                indent = "  " * (int(level[1]) - 1) if len(level) > 1 else ""
-                lines.append(f"  {indent}{h['text']}")
-            lines.append("")
-
-        elements = data.get("elements", [])
-        if elements:
-            lines.append("[Interactive Elements]")
-            for i, el in enumerate(elements):
-                tag = el.get("tag", "?")
-                selector = el.get("selector", "")
-                text = el.get("text", "")
-                parts = [f"  [{i}]"]
-                if tag == "a":
-                    parts.append(f'Link: "{text}"')
-                elif tag == "button":
-                    parts.append(f'Button: "{text}"')
-                elif tag == "input":
-                    itype = el.get("input_type", "text")
-                    placeholder = el.get("placeholder", "")
-                    value = el.get("value", "")
-                    if itype in ("checkbox", "radio"):
-                        label_text = el.get("label", "")
-                        display = label_text or text or placeholder or value
-                        checked = "✓" if el.get("checked") else "✗"
-                        label_sel = el.get("label_selector", "")
-                        if label_sel:
-                            parts.append(
-                                f'{itype}: "{display}" {checked} (label: {label_sel})'
-                            )
-                        else:
-                            parts.append(f'{itype}: "{display}" {checked}')
-                    else:
-                        display = placeholder or text or itype
-                        val_str = f' = "{value}"' if value else ""
-                        parts.append(f'Input({itype}): "{display}"{val_str}')
-                elif tag == "textarea":
-                    parts.append(f'Textarea: "{el.get("placeholder", "")}"')
-                elif tag == "select":
-                    selected = el.get("selected", "")
-                    opts = el.get("options", [])
-                    if opts:
-                        opt_strs = [
-                            f'"{o.get("text", "")}" (val="{o.get("value", "")}"){" *" if o.get("selected") else ""}'
-                            for o in opts
-                        ]
-                        parts.append(
-                            f'Select: "{text}" selected="{selected}" options=[{", ".join(opt_strs)}]'
-                        )
-                    else:
-                        parts.append(f'Select: "{text}" selected="{selected}"')
-                else:
-                    role = el.get("role", "")
-                    parts.append(f'{tag}({role}): "{text}"')
-                role = el.get("role", "")
-                aria = el.get("aria_label", "")
-                if role and role not in ("", "button", "link"):
-                    parts.append(f"[role={role}]")
-                if aria:
-                    parts.append(f'[aria="{aria}"]')
-                parts.append(f" -> {selector}")
-                lines.append(" ".join(parts))
-                ctx = el.get("context", "")
-                if ctx:
-                    lines.append(f"       ↳ Q: {ctx}")
-            lines.append("")
-
-        text_blocks = data.get("text_blocks", [])
-        if text_blocks:
-            lines.append("[Text]")
-            for t in text_blocks:
-                lines.append(f"  {t}")
-            lines.append("")
-
-        inputs = [
-            e for e in elements if e.get("tag") in ("input", "textarea", "select")
-        ]
-        if inputs:
-            lines.append("[Form State]")
-            for inp in inputs:
-                tag = inp.get("tag", "")
-                sel = inp.get("selector", "?")
-                if tag == "input":
-                    val = inp.get("value", "")
-                    if val:
-                        lines.append(f'  {sel} = "{val}"')
-                elif tag == "textarea":
-                    val = inp.get("value", "")
-                    if val:
-                        preview = val[:60] + "..." if len(val) > 60 else val
-                        lines.append(f'  {sel} = "{preview}"')
-                elif tag == "select":
-                    lines.append(f'  {sel} = "{inp.get("selected", "")}"')
-
+        data = self._run(do)
+        if data.get("error"):
+            return f"search_page: {data['error']}"
+        total = data["total"]
+        if total == 0:
+            return f'No matches for "{pattern}" on the page.'
+        lines = [f'Found {total} match{"es" if total != 1 else ""} for "{pattern}":']
+        lines += [f"[{i + 1}] {m}" for i, m in enumerate(data["matches"])]
+        if total > len(data["matches"]):
+            lines.append(f"... showing {len(data['matches'])} of {total}.")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    #  Tab management
+    #  Console and network
     # ------------------------------------------------------------------
 
-    def open_new_tab(self, url=None) -> str:
-        if not self._context:
-            return "No browser context. Launch the browser first."
+    async def _console_replay(self, page) -> List[Dict]:
+        """CloakBrowser suppresses the live console stream (Runtime.enable is a bot signal),
+        but enabling Runtime briefly makes Chrome replay the current document's console
+        messages and uncaught exceptions. Enable, collect, disable."""
+        session = await page.context.new_cdp_session(page)
+        msgs: List[Dict] = []
 
-        def _do():
-            page = self._context.new_page()
-            if url:
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            return page
+        def where(stack):
+            frame = ((stack or {}).get("callFrames") or [{}])[0]
+            return frame.get("url", ""), frame.get("lineNumber", 0) + 1, frame.get("columnNumber", 0) + 1
 
+        def on_console(p):
+            text = " ".join(str(a.get("value", a.get("description", a.get("type", "")))) for a in p.get("args", []))
+            url, line, col = where(p.get("stackTrace"))
+            level = {"warning": "warn"}.get(p.get("type", "log"), p.get("type", "log"))
+            msgs.append({"level": level, "text": text, "url": url, "line": line, "column": col})
+
+        def on_exception(p):
+            d = p.get("exceptionDetails", {})
+            text = (d.get("exception") or {}).get("description") or d.get("text", "Uncaught exception")
+            url, line, col = where(d.get("stackTrace"))
+            msgs.append({"level": "pageerror", "text": text, "url": url or d.get("url", ""), "line": line, "column": col})
+
+        session.on("Runtime.consoleAPICalled", on_console)
+        session.on("Runtime.exceptionThrown", on_exception)
         try:
-            page = self._worker.dispatch(_do, timeout=35)
-            self._pages.append(page)
-            self._current_idx = len(self._pages) - 1
-            if url:
-                try:
-                    title = self._worker.dispatch(
-                        lambda: page.title() or "(no title)", timeout=5
-                    )
-                except Exception:
-                    title = "(no title)"
-                return f"Opened new tab ({len(self._pages)} tabs) — {title} — {url}"
-            return f"Opened new tab ({len(self._pages)} tabs) — about:blank"
-        except Exception as e:
-            return f"Failed to open tab: {e}"
+            await session.send("Runtime.enable")
+            await asyncio.sleep(0.2)  # replayed events arrive right after enable
+            await session.send("Runtime.disable")
+        finally:
+            await session.detach()
+        return msgs[-_BUFFER_LIMIT:]
 
-    def switch_tab(self, index=None, url_pattern=None) -> str:
-        if not self._pages:
-            return "No tabs open."
-        self._last_snapshot_elements = []
+    def console(self, index: Optional[int] = None, errors_only: bool = False, max_results: int = 50) -> str:
+        async def do():
+            return await self._console_replay(await self._page())
 
-        def _get_tab_title(page):
-            try:
-                return self._worker.dispatch(
-                    lambda: page.title() or "(no title)", timeout=5
-                )
-            except Exception:
-                return "(error)"
+        msgs = self._run(do)
+        if index is not None:
+            if not 0 <= index < len(msgs):
+                return f"No console message at index {index} ({len(msgs)} captured)."
+            m = msgs[index]
+            return (f"Level:  {m['level'].upper()}\nText:   {m['text']}\nURL:    {m['url']}\n"
+                    f"Line:   {m['line']}:{m['column']}")
+        rows = [(i, m) for i, m in enumerate(msgs) if not errors_only or m["level"] in ("error", "pageerror")]
+        if not rows:
+            return "No console messages captured."
+        out = []
+        for i, m in rows[-max_results:]:
+            text = m["text"][:160] + ("..." if len(m["text"]) > 160 else "")
+            where = f" {m['url'].rsplit('/', 1)[-1]}:{m['line']}" if m["url"] else ""
+            out.append(f"[{i}] {m['level'].upper()}: {text}{where}")
+        return "\n".join(out)
 
-        if url_pattern:
-            for i, page in enumerate(self._pages):
-                try:
-                    page_url = self._worker.dispatch(lambda p=page: p.url, timeout=5)
-                except Exception:
-                    page_url = ""
-                if url_pattern.lower() in page_url.lower():
-                    self._current_idx = i
-                    return f"Switched to tab {i}: {_get_tab_title(page)} — {page_url}"
-            return f"No tab matches URL pattern: '{url_pattern}'"
-        if index is None:
-            return "Specify tab index or url_pattern."
-        if index < 0 or index >= len(self._pages):
-            return f"Invalid tab index {index}. Valid: 0-{len(self._pages) - 1}"
-        self._current_idx = index
-        return f"Switched to tab {index}: {_get_tab_title(self._pages[index])} — {self._pages[index].url}"
+    def network(self, index: Optional[int] = None, filter: Optional[str] = None, max_results: int = 50) -> str:
+        async def do():
+            return list(self._network.get(await self._page(), []))
 
-    def list_tabs(self) -> str:
-        if not self._pages:
-            return "No tabs open."
-
-        def _get_all_tab_info():
-            result = []
-            for i, p in enumerate(self._pages):
-                try:
-                    t = p.title() or "(no title)"
-                except Exception:
-                    t = "(error)"
-                try:
-                    u = p.url
-                except Exception:
-                    u = "(error)"
-                result.append((i, t, u))
-            return result
-
-        try:
-            tab_data = self._worker.dispatch(_get_all_tab_info, timeout=10)
-        except Exception:
-            return "Failed to get tab info."
-        lines = [
-            f"  Tab {i}{'*' if i == self._current_idx else ' '}  {t}  —  {u}"
-            for i, t, u in tab_data
-        ]
-        return f"Open tabs ({len(self._pages)}):\n" + "\n".join(lines)
-
-    def close_tab(self, index=None) -> str:
-        if not self._pages:
-            return "No tabs open."
-        if index is None:
-            index = self._current_idx
-        if index < 0 or index >= len(self._pages):
-            return f"Invalid tab index {index}."
-        if len(self._pages) == 1:
-            return "Can't close the last tab. Use browser_close instead."
-        try:
-            p = self._pages[index]
-            self._worker.dispatch(lambda: p.close(), timeout=10)
-            self._cdp.invalidate_session(p)
-        except Exception:
-            pass
-        self._pages.pop(index)
-        if self._current_idx >= len(self._pages):
-            self._current_idx = len(self._pages) - 1
-        return f"Closed tab {index}. Now on tab {self._current_idx}."
-
-    def get_page_info(self) -> str:
-        page = self.current_page
-        if not page:
-            return "No active page."
-        try:
-            title, url = self._worker.dispatch(
-                lambda: (page.title() or "(no title)", page.url), timeout=5
-            )
-            return f"Title: {title}\nURL: {url}\nTab: {self._current_idx} of {len(self._pages)}\nProfile: {self._profile_name or '(ephemeral)'}"
-        except Exception as e:
-            return f"Error: {e}"
-
-    # ------------------------------------------------------------------
-    #  Console & network monitoring (CDP events)
-    # ------------------------------------------------------------------
-
-    def list_console_messages(self, max_results: int = 50) -> str:
-        """Return a formatted list of captured console messages.
-
-        Enables CDP Runtime console capture on first call.
-        """
-        page = self.current_page
-        if not page:
-            return "No active page. Launch the browser first."
-        self._cdp.enable_console(page)
-        msgs = self._cdp._console_messages
-        if not msgs:
-            return "No console messages captured yet."
-        items = msgs[-max_results:]
-        lines = []
-        for i, m in enumerate(msgs):
-            level = m["level"].upper()
-            text = m["text"][:120] + ("..." if len(m["text"]) > 120 else "")
-            url_short = m["url"].split("/")[-1] if m["url"] else ""
-            loc = f" {url_short}:{m['line']}" if m["line"] else ""
-            lines.append(f"[{i}] {level}: {text}{loc}")
-        return "\n".join(lines)
-
-    def get_console_message(self, index: int) -> str:
-        """Return full details of a single console message."""
-        page = self.current_page
-        if not page:
-            return "No active page. Launch the browser first."
-        self._cdp.enable_console(page)
-        msgs = self._cdp._console_messages
-        if index < 0 or index >= len(msgs):
-            return f"Invalid index {index}. Use list_console_messages to see available indices (0–{len(msgs) - 1})."
-        m = msgs[index]
-        lines = [
-            f"Level:  {m['level'].upper()}",
-            f"Text:   {m['text']}",
-            f"Source: {m['source']}",
-            f"URL:    {m['url']}",
-            f"Line:   {m['line']}",
-            f"Column: {m['column']}",
-            f"Time:   {m['timestamp']}",
-        ]
-        return "\n".join(lines)
-
-    def list_network_requests(self, max_results: int = 50) -> str:
-        """Return a formatted list of captured network requests.
-
-        Enables CDP Network capture on first call.
-        """
-        page = self.current_page
-        if not page:
-            return "No active page. Launch the browser first."
-        self._cdp.enable_network(page)
-        reqs = self._cdp._network_requests
-        if not reqs:
-            return "No network requests captured yet."
-        items = reqs[-max_results:]
-        lines = []
-        for i, r in enumerate(reqs):
-            status = str(r["status"]) if r["status"] is not None else "pending"
-            url_short = r["url"][:80] + ("..." if len(r["url"]) > 80 else "")
+        reqs = self._run(do)
+        if index is not None:
+            if not 0 <= index < len(reqs):
+                return f"No request at index {index} ({len(reqs)} captured)."
+            r = reqs[index]
+            lines = [f"Method:   {r['method']}", f"URL:      {r['url']}", f"Type:     {r['type']}",
+                     f"Status:   {r['status'] if r['status'] is not None else r['failure'] or 'pending'}"]
+            if r["duration_ms"] is not None:
+                lines.append(f"Duration: {r['duration_ms']}ms")
+            for title, headers in (("Request headers", r["request_headers"]), ("Response headers", r["response_headers"])):
+                if headers:
+                    lines.append(f"{title}:")
+                    lines += [f"  {k}: {v}" for k, v in headers.items()]
+            return "\n".join(lines)
+        rows = [(i, r) for i, r in enumerate(reqs) if not filter or filter in r["url"]]
+        if not rows:
+            return "No network requests captured."
+        out = []
+        for i, r in rows[-max_results:]:
+            status = r["status"] if r["status"] is not None else (f"FAILED {r['failure']}" if r["failure"] else "pending")
             dur = f" {r['duration_ms']}ms" if r["duration_ms"] is not None else ""
-            lines.append(f"[{i}] {r['method']} {status} {url_short}{dur}")
-        return "\n".join(lines)
-
-    def get_network_request(self, index: int) -> str:
-        """Return full details of a single network request."""
-        page = self.current_page
-        if not page:
-            return "No active page. Launch the browser first."
-        self._cdp.enable_network(page)
-        reqs = self._cdp._network_requests
-        if index < 0 or index >= len(reqs):
-            return f"Invalid index {index}. Use list_network_requests to see available indices (0–{len(reqs) - 1})."
-        r = reqs[index]
-        lines = [
-            f"Method:   {r['method']}",
-            f"URL:      {r['url']}",
-            f"Status:   {r['status'] if r['status'] is not None else 'pending'}",
-        ]
-        if r["request_headers"]:
-            lines.append("Request Headers:")
-            for k, v in r["request_headers"].items():
-                lines.append(f"  {k}: {v}")
-        if r["response_headers"]:
-            lines.append("Response Headers:")
-            for k, v in r["response_headers"].items():
-                lines.append(f"  {k}: {v}")
-        if r["duration_ms"] is not None:
-            lines.append(f"Duration: {r['duration_ms']}ms")
-        lines.append(f"Time:     {r['timestamp']}")
-        return "\n".join(lines)
-
-
-# ------------------------------------------------------------------
-#  Snapshot JS — enhanced with ancestor visibility checking
-# ------------------------------------------------------------------
-
-_SNAPSHOT_JS = """() => {
-    const result = { title: document.title || '', url: window.location.href, elements: [], headings: [], text_blocks: [] };
-
-    function queryShadow(root, selector, maxDepth) {
-        maxDepth = maxDepth || 10;
-        const found = [];
-        function walk(node, depth) {
-            if (depth > maxDepth) return;
-            const els = node.querySelectorAll(selector);
-            for (let i = 0; i < els.length; i++) found.push(els[i]);
-            const allEls = node.querySelectorAll('*');
-            for (let i = 0; i < allEls.length; i++) {
-                if (allEls[i].shadowRoot) walk(allEls[i].shadowRoot, depth + 1);
-            }
-        }
-        walk(root, 0);
-        return found;
-    }
-
-    function getSelector(el) {
-        if (el.id) return '[id="' + el.id + '"]';
-        if (el.name) return el.tagName.toLowerCase() + '[name="' + el.name + '"]';
-        if (el.dataset && el.dataset.testid) return '[data-testid="' + el.dataset.testid + '"]';
-        const path = [];
-        let current = el;
-        while (current && current !== document.body && path.length < 4) {
-            let selector = current.tagName.toLowerCase();
-            if (current.id) {
-                path.unshift('[id="' + current.id + '"]');
-                break;
-            }
-            if (current.className && typeof current.className === 'string') {
-                const classes = current.className.trim().split(/\\s+/).filter(c => c && !c.startsWith('css-'));
-                if (classes.length > 0 && classes.length <= 3) {
-                    selector += '.' + classes.map(c => CSS.escape(c)).join('.');
-                }
-            }
-            const parent = current.parentElement;
-            if (parent) {
-                const siblings = Array.from(parent.children).filter(s => s.tagName === current.tagName);
-                if (siblings.length > 1) {
-                    selector += ':nth-of-type(' + (siblings.indexOf(current) + 1) + ')';
-                }
-            }
-            path.unshift(selector);
-            current = current.parentElement;
-        }
-        return path.join(' > ');
-    }
-
-    function getText(el, maxLen) {
-        maxLen = maxLen || 80;
-        let text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
-        if (text.length > maxLen) text = text.substring(0, maxLen) + '...';
-        return text;
-    }
-
-    function isVisible(el) {
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-        // Walk up ancestors and check for hidden parents
-        let current = el.parentElement;
-        while (current && current !== document.body) {
-            const cs = window.getComputedStyle(current);
-            if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
-            current = current.parentElement;
-        }
-        return true;
-    }
-
-    function isInViewport(el) {
-        // Check if element intersects the viewport (accounting for scrolling)
-        const rect = el.getBoundingClientRect();
-        const vh = window.innerHeight || document.documentElement.clientHeight;
-        const vw = window.innerWidth || document.documentElement.clientWidth;
-        // Allow 1000px below viewport for elements that are "scroll-reachable"
-        return rect.bottom >= -1000 && rect.top <= vh + 1000 &&
-               rect.right >= -1000 && rect.left <= vw + 1000;
-    }
-
-    function findQuestionContext(el) {
-        const questionSelectors = [
-            '.qtext', '.formulation', '.question-text', '.quiz-problem',
-            'fieldset', 'legend', '[role="group"]', '[role="radiogroup"]'
-        ];
-        let current = el;
-        let questionText = '';
-        for (let i = 0; i < 10 && current && current !== document.body; i++) {
-            current = current.parentElement;
-            if (!current) break;
-            for (const sel of questionSelectors) {
-                if (current.matches && current.matches(sel)) {
-                    const qtextEl = current.querySelector('.qtext') || current;
-                    let text = getText(qtextEl, 300);
-                    if (text && text.length > 3) { questionText = text; break; }
-                }
-            }
-            if (questionText) break;
-            if (/^H[1-4]$/.test(current.tagName)) {
-                const text = getText(current, 150);
-                if (text && text.length > 3) { questionText = text; break; }
-            }
-        }
-        // For matching questions: find the left-side label text (e.g. "el fósforo")
-        // Walk up from the element to find a row/container with a text-only sibling
-        let row = el;
-        for (let i = 0; i < 8 && row && row !== document.body; i++) {
-            row = row.parentElement;
-            if (!row) break;
-            const siblings = Array.from(row.children);
-            for (const sib of siblings) {
-                if (sib === el || sib.contains(el) || el.contains(sib)) continue;
-                if (sib.querySelector('select, input, button, textarea')) continue;
-                const t = getText(sib, 100);
-                if (t && t.length > 1 && !/^\s*Answer \d/.test(t)) {
-                    return t + (questionText ? ' → ' + questionText : '');
-                }
-            }
-        }
-        return questionText;
-    }
-
-    const interactiveSelectors = 'a, button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="radio"], [role="checkbox"], [role="option"], [role="listbox"], [role="combobox"], [role="menuitemcheckbox"], [role="menuitemradio"], [onclick]';
-    queryShadow(document, interactiveSelectors).forEach(el => {
-        const tag = el.tagName.toLowerCase();
-        if (tag === 'input') {
-            const inputType = el.type || 'text';
-            if (inputType !== 'radio' && inputType !== 'checkbox' && !isVisible(el)) return;
-        } else {
-            if (!isVisible(el)) return;
-        }
-        // Soft visibility: note if off-viewport but still in DOM
-        const inViewport = isInViewport(el);
-        const entry = { tag: tag, selector: getSelector(el), text: getText(el, 60) };
-        if (!inViewport) entry._offscreen = true;
-
-        if (tag === 'input' || tag === 'select') {
-            const inputType = el.type || (tag === 'select' ? 'select' : 'text');
-            if (inputType === 'radio' || inputType === 'checkbox' || tag === 'select') {
-                const ctx = findQuestionContext(el);
-                if (ctx) entry.context = ctx;
-            }
-        }
-        if (tag === 'input') {
-            entry.input_type = el.type || 'text';
-            entry.placeholder = el.placeholder || '';
-            entry.value = el.value || '';
-            entry.checked = el.checked || false;
-            if (entry.input_type === 'radio' || entry.input_type === 'checkbox') {
-                const inputId = el.id;
-                if (inputId) {
-                    const label = document.querySelector('label[for="' + inputId + '"]');
-                    if (label) entry.label = getText(label, 80);
-                }
-                if (!entry.label) {
-                    const parentLabel = el.closest('label');
-                    if (parentLabel) {
-                        const clone = parentLabel.cloneNode(true);
-                        clone.querySelectorAll('input').forEach(inp => inp.remove());
-                        const lt = getText(clone, 80);
-                        if (lt) entry.label = lt;
-                    }
-                }
-                const ariaLB = el.getAttribute('aria-labelledby');
-                if (ariaLB && !entry.label) {
-                    const ariaEl = document.getElementById(ariaLB);
-                    if (ariaEl) { const at = getText(ariaEl, 80); if (at) entry.label = at; }
-                }
-                if (ariaLB) {
-                    const ariaEl = document.getElementById(ariaLB);
-                    if (ariaEl) entry.label_selector = getSelector(ariaEl);
-                }
-            }
-        } else if (tag === 'textarea') {
-            entry.placeholder = el.placeholder || '';
-            entry.value = (el.value || '').substring(0, 100);
-        } else if (tag === 'select') {
-            entry.selected = el.value || '';
-            entry.options = Array.from(el.options).slice(0, 20).map(o => ({
-                value: o.value, text: o.text.substring(0, 50), selected: o.selected
-            }));
-        } else if (tag === 'a') {
-            entry.href = el.href || '';
-        }
-        const role = el.getAttribute('role');
-        if (role) entry.role = role;
-        const ariaLabel = el.getAttribute('aria-label');
-        if (ariaLabel) entry.aria_label = ariaLabel;
-        result.elements.push(entry);
-    });
-
-    const labels = queryShadow(document, 'label');
-    let labelCount = 0;
-    labels.forEach(el => {
-        if (labelCount >= 30) return;
-        const text = getText(el, 100);
-        if (!text || text.length < 2) return;
-        const forAttr = el.getAttribute('for');
-        const input = forAttr ? document.getElementById(forAttr) : el.querySelector('input');
-        if (input) {
-            const t = input.type || 'text';
-            if (t === 'radio' || t === 'checkbox') return;
-        }
-        result.text_blocks.push(text);
-        labelCount++;
-    });
-
-    queryShadow(document, 'h1, h2, h3, h4').forEach(el => {
-        if (!isVisible(el)) return;
-        const text = getText(el, 100);
-        if (text) result.headings.push({ level: el.tagName.toLowerCase(), text: text });
-    });
-
-    const textEls = queryShadow(document, 'p, label, li, dt, dd, [role="text"], [role="heading"]');
-    let textCount = 0;
-    textEls.forEach(el => {
-        if (!isVisible(el) || textCount >= 40) return;
-        const text = getText(el, 120);
-        if (text && text.length > 5) { result.text_blocks.push(text); textCount++; }
-    });
-
-    return result;
-}
-"""
+            url = r["url"][:100] + ("..." if len(r["url"]) > 100 else "")
+            out.append(f"[{i}] {r['method']} {status} {r['type']} {url}{dur}")
+        return "\n".join(out)
