@@ -28,6 +28,7 @@ class DesktopManager:
 
     STARTUP_TIMEOUT = 15.0
     CALL_TIMEOUT = 45.0
+    LOG_PATH = Path("~/.kairos/cua-driver.log")  # the daemon's stderr, rewritten at each start
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -141,22 +142,24 @@ class DesktopManager:
             # Let _run_client produce the canonical installation message.
             self._run_client(["status"], timeout=5)
             return
-        daemon = subprocess.Popen(
-            [executable, "serve"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}),
-        )
+        # stderr goes to a log file: a pipe nobody reads would block the
+        # daemon once its buffer (a few KB) is full.
+        log_path = self.LOG_PATH.expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as log:
+            daemon = subprocess.Popen(
+                [executable, "serve"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=log,
+                **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}),
+            )
         with self._lock:
             self._daemon = daemon
         deadline = time.monotonic() + self.STARTUP_TIMEOUT
         while time.monotonic() < deadline:
             if daemon.poll() is not None:
-                stderr = (daemon.stderr.read() if daemon.stderr else "").strip()
+                stderr = log_path.read_text(encoding="utf-8", errors="replace").strip()
                 raise RuntimeError(
                     "Cua Driver daemon exited during startup"
                     + (f": {stderr[-2000:]}" if stderr else "")

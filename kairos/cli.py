@@ -16,7 +16,6 @@ from rich.panel import Panel
 from rich.markdown import Markdown, MarkdownElement, MarkdownContext, TableElement as _BaseTableElement
 from rich.markup import escape
 from rich.segment import Segment
-from rich.syntax import Syntax
 from rich.text import Text
 from rich.live import Live
 from rich.table import Table
@@ -518,7 +517,8 @@ class CLI:
         self._stream_view: Optional[_StreamView] = None
         self._stream_text = ""
         self._streaming = False
-        self._skip_print_response = False
+        self._skip_print_response = False  # the user turn's reply is on screen
+        self._skip_print_wake = False  # the wake turn's reply is on screen
 
         # Background work (wake turns, sub-agent status) renders from other
         # threads, also while the user is typing at the prompt.
@@ -547,7 +547,7 @@ class CLI:
 
         # Escape key listener (active during agent execution). The listener
         # shares stdin with the next prompt, so ordinary characters captured
-        # during the response-to-prompt handoff are buffered and replayed
+        # during a turn are buffered and pre-filled into the next prompt
         # instead of being silently discarded.
         self._escape_listening = False
         self._escape_stop_event = threading.Event()
@@ -570,9 +570,6 @@ class CLI:
             banner.append(f"  {workspace}", style="dim")
         self.console.print(banner)
         self.console.print()
-
-    def print_workspace(self, path: str):
-        self.console.print(f"[dim]Workspace:[/dim] [bold cyan]{path}[/bold cyan]")
 
     def print_info(self, message: str):
         self.console.print(Text(message, style="dim"))
@@ -684,9 +681,10 @@ class CLI:
     def finalize_stream_as_response(self):
         with self._lock:
             text = self._stream_text
+            printed = False
             if self._above is not None:
                 self.print_response(text)
-                self._skip_print_response = True
+                printed = True
             elif self._live:
                 try:
                     display = KairosMarkdown(text) if text else Text("")
@@ -695,21 +693,32 @@ class CLI:
                 self._live.update(Panel(display, border_style="green", padding=(1, 2)))
                 self._live.stop()
                 self._live = None
-                self._skip_print_response = True
+                printed = True
+            if printed:
+                # A wake turn has its own flag: it can start right after a
+                # user reply was printed, before that turn's finish_turn.
+                if self._wake:
+                    self._skip_print_wake = True
+                else:
+                    self._skip_print_response = True
             self._stream_text = ""
             self._streaming = False
             self._invalidate()
 
-    def finish_turn(self, outcome: str, payload: Optional[str]):
+    def finish_turn(self, outcome: str, payload: Optional[str], wake: bool = False):
         """Print how a turn ended (user turns and wake turns alike)."""
+        printed = self._skip_print_wake if wake else self._skip_print_response
         if outcome == "completed":
-            if payload and not self._skip_print_response:
+            if payload and not printed:
                 self.print_response(payload)
         elif outcome == "failed":
             self.print_error(payload or "Request failed.")
         else:
             self.print_info("Interrupted.")
-        self._skip_print_response = False
+        if wake:
+            self._skip_print_wake = False
+        else:
+            self._skip_print_response = False
 
     # ------------------------------------------------------------------ #
     #  Background work: wake turns, sub-agent status                      #
@@ -718,7 +727,7 @@ class CLI:
     def _begin_wake(self, notifications: list):
         with self._lock:
             self._wake = True
-            self._skip_print_response = False
+            self._skip_print_wake = False
             what = ", ".join(describe_notification(n) for n in notifications) or "background work finished"
             self.console.print(Text.assemble(("» woke: ", "cyan"), (what, "dim")))
             self._invalidate()
@@ -730,7 +739,7 @@ class CLI:
             if self._streaming:
                 self.finish_stream()  # a stopped reply stays as the grey trace
             self._wake = False
-            self.finish_turn(outcome, payload)
+            self.finish_turn(outcome, payload, wake=True)
             self._invalidate()
 
     def _update_subagents(self, statuses: list, replace: bool = False):
@@ -809,16 +818,6 @@ class CLI:
         self.console.print(f"  [dim]\u2192[/dim] {summary}")
 
     # ------------------------------------------------------------------ #
-    #  Thinking trace                                                      #
-    # ------------------------------------------------------------------ #
-
-    def print_thinking_trace(self, text: str):
-        self.console.print(
-            Panel(f"[italic dim]{text}[/italic dim]", border_style="dim",
-                  padding=(0, 1))
-        )
-
-    # ------------------------------------------------------------------ #
     #  Token status bar                                                    #
     # ------------------------------------------------------------------ #
 
@@ -839,25 +838,6 @@ class CLI:
         except Exception:
             self.console.print(Panel(content, border_style="green", padding=(1, 2)))
 
-    def print_code(self, code: str, language: str = "python"):
-        syntax = Syntax(code, language, theme="monokai", line_numbers=True)
-        self.console.print(syntax)
-
-    def print_tool_call(self, tool_name: str, args: dict):
-        args_str = ", ".join(f"{k}=[yellow]{v}[/yellow]" for k, v in args.items())
-        self.console.print(f"[blue]\u2192[/blue] [bold]{tool_name}[/bold]({args_str})")
-
-    def print_tool_result(self, success: bool, output: str, error: Optional[str] = None):
-        if success:
-            if output and len(output) < 200:
-                self.console.print(f"[green]\u2713[/green] {output}")
-            else:
-                self.console.print(f"[green]\u2713[/green] Command executed")
-        else:
-            error_msg = error or output
-            self.console.print(Panel(f"[red]{error_msg}[/red]", border_style="red",
-                                     title="Tool Error"))
-
     # ------------------------------------------------------------------ #
     #  Chat list picker                                                    #
     # ------------------------------------------------------------------ #
@@ -867,10 +847,7 @@ class CLI:
     ) -> Optional[str]:
         """Prompt for and return a saved-session ID.
 
-        ``initial_choice`` supports commands such as ``/resume 1``. Pending
-        input captured by the Escape handoff is consumed here as well as by
-        the normal prompt, so a quickly entered ``/resume`` followed by
-        ``1`` cannot fall through to the agent as an ordinary request.
+        ``initial_choice`` supports commands such as ``/resume 1``.
         """
         if not sessions:
             self.console.print("[yellow]No saved chats found.[/yellow]")
@@ -904,17 +881,14 @@ class CLI:
             choice = None
 
     def ask(self, label: str) -> Optional[str]:
-        """Prompt for one line (also taking input typed during a handoff).
+        """Prompt for one line (pre-filled with input typed during a turn).
 
         Returns None on Ctrl+C / Ctrl+D.
         """
-        pending_line, pending_default = self._take_pending_input_for_prompt()
-        if pending_line is not None:
-            return pending_line.strip()
         try:
             return self._prompt(
                 FormattedText([("class:prompt", label)]),
-                default=pending_default,
+                default=self._take_pending_input(),
             ).strip()
         except (EOFError, KeyboardInterrupt):
             return None
@@ -1023,34 +997,20 @@ class CLI:
         if not text:
             return
         with self._pending_input_lock:
-            self._pending_input += text
+            if text in ("\x08", "\x7f"):  # Backspace (Windows, Unix)
+                self._pending_input = self._pending_input[:-1]
+            else:
+                self._pending_input += text
 
-    def _take_pending_input_for_prompt(self) -> tuple[Optional[str], str]:
-        """Take a complete intercepted line or return a partial line as default.
+    def _take_pending_input(self) -> str:
+        """Text typed while a turn ran, to pre-fill the next prompt.
 
-        ``PromptSession`` must remain the owner of normal editing, but a user
-        can press keys during the response-to-prompt handoff. Complete lines
-        are returned directly; a partial line is pre-filled into the next
-        prompt so it can be edited or submitted normally.
+        It is never submitted on its own: the user sees it, can edit it, and
+        sends it with Enter (several typed or pasted lines become one message).
         """
         with self._pending_input_lock:
-            pending = self._pending_input
-            self._pending_input = ""
-
-        if not pending:
-            return None, ""
-
-        for index, char in enumerate(pending):
-            if char not in "\r\n":
-                continue
-            remainder_start = index + 1
-            if char == "\r" and remainder_start < len(pending) and pending[remainder_start] == "\n":
-                remainder_start += 1
-            with self._pending_input_lock:
-                self._pending_input = pending[remainder_start:]
-            return pending[:index], ""
-
-        return None, pending
+            pending, self._pending_input = self._pending_input, ""
+        return pending.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
 
     def _escape_listener_loop(self):
         try:
@@ -1070,9 +1030,12 @@ class CLI:
                     if self._on_escape:
                         self._on_escape()
                     return
-                # Extended-key prefixes are not useful as text in the next
-                # prompt. Preserve ordinary characters, including Enter.
-                if ch not in ("\x00", "\xe0"):
+                if ch in ("\x00", "\xe0"):
+                    # Arrow and function keys arrive as a prefix plus a code
+                    # letter (Up = "\xe0H"); neither is text.
+                    msvcrt.getwch()
+                else:
+                    # Ordinary characters, Enter and Backspace.
                     self._buffer_intercepted_input(ch)
             self._escape_stop_event.wait(0.05)
 
@@ -1110,14 +1073,6 @@ class CLI:
             _reset_paste_counters()
             _paste_registry.clear()
 
-            pending_line, pending_default = self._take_pending_input_for_prompt()
-            if pending_line is not None:
-                # The Escape listener may have captured a complete command
-                # while the previous request was finishing. Return it as the
-                # next prompt submission instead of making the user type it
-                # again.
-                return pending_line.strip()
-
             # Text and image pastes are handled by explicit key bindings above.
             # Bracketed-paste events carry their own payload, while Ctrl+V
             # reads the clipboard only because the user explicitly pressed it.
@@ -1129,7 +1084,8 @@ class CLI:
             result = self._prompt(
                 HTML(f'<style class="prompt">{prefix}</style>'),
                 rprompt=FormattedText([("class:rprompt", status)]),
-                default=pending_default,
+                # Text typed while the last turn ran: shown, not auto-sent.
+                default=self._take_pending_input(),
             ).strip()
 
             # Note: paste token resolution happens in main.py, not here.

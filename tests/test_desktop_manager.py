@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,6 +42,29 @@ class DesktopManagerTests(unittest.TestCase):
         self.assertFalse(manager.is_open)
         manager.close()
         self.assertFalse(manager.is_open)
+
+    def test_daemon_stderr_goes_to_a_log_file_not_an_unread_pipe(self):
+        launches = []
+
+        class FakeDaemon:
+            def __init__(self, args, **kwargs):
+                launches.append(kwargs)
+                kwargs["stderr"].write("driver: permission denied\n")
+                kwargs["stderr"].flush()
+
+            def poll(self):
+                return 1  # exits during startup
+
+        manager = DesktopManager()
+        with tempfile.TemporaryDirectory() as root:
+            manager.LOG_PATH = Path(root) / "logs" / "cua-driver.log"
+            with patch.object(manager, "_executable", return_value="cua-driver"), \
+                    patch.object(manager, "_status_ok", return_value=False), \
+                    patch("kairos.desktop_manager.subprocess.Popen", FakeDaemon):
+                with self.assertRaises(RuntimeError) as cm:
+                    manager._ensure_daemon()
+        self.assertNotIn(launches[0]["stderr"], (subprocess.PIPE, None))
+        self.assertIn("permission denied", str(cm.exception))
 
     def test_drag_maps_public_coordinates_to_cua_fields(self):
         class FakeManager:

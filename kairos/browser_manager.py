@@ -30,6 +30,7 @@ import random
 import re
 import threading
 import time as _time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -131,6 +132,7 @@ class BrowserManager:
         self._last_snapshot: Optional[Tuple[Any, str, set]] = None
         self._profile_dir: Optional[Path] = None
         self._proxy: Optional[str] = None
+        self._closing: set = set()  # closes of launches that finished after a cancel
 
     # ------------------------------------------------------------------
     #  Public state
@@ -183,6 +185,32 @@ class BrowserManager:
         meta.write_text(json.dumps({"seed": seed}), encoding="utf-8")
         return seed
 
+    def _close_later(self, opened) -> None:
+        """Close a browser or context in the background (also from a cancelled call)."""
+        async def close():
+            try:
+                await opened.close()
+            except Exception:
+                pass
+
+        closing = asyncio.ensure_future(close())
+        self._closing.add(closing)  # asyncio keeps only weak references to tasks
+        closing.add_done_callback(self._closing.discard)
+
+    async def _launch(self, start):
+        """Await a browser launch. If this call is cancelled meanwhile, the
+        launch still finishes in Playwright; close what it opens then."""
+        task = asyncio.ensure_future(start)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            def discard(t):
+                if not t.cancelled() and t.exception() is None:
+                    self._close_later(t.result())
+
+            task.add_done_callback(discard)
+            raise
+
     async def _ensure(self):
         if self._context is not None:
             return self._context
@@ -201,8 +229,8 @@ class BrowserManager:
         if self._proxy:
             kwargs["proxy"] = {"server": self._proxy}
 
-        if self._profile_dir:
-            key = str(self._profile_dir.resolve())
+        key = str(self._profile_dir.resolve()) if self._profile_dir else None
+        if key:
             with _open_profiles_lock:
                 if key in _open_profiles:
                     raise RuntimeError(
@@ -210,26 +238,37 @@ class BrowserManager:
                         "(another conversation). Close it there, or use a different profile."
                     )
                 _open_profiles.add(key)
-            try:
-                ctx = await pw.chromium.launch_persistent_context(str(self._profile_dir), **kwargs)
-            except Exception as e:
+        browser = ctx = None
+        try:
+            if key:
+                try:
+                    ctx = await self._launch(pw.chromium.launch_persistent_context(str(self._profile_dir), **kwargs))
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Could not open profile '{self._profile_dir.name}' (it may be open in another "
+                        f"browser window): {str(e).splitlines()[0]}"
+                    )
+            else:
+                viewport = kwargs.pop("viewport")
+                proxy = kwargs.pop("proxy", None)
+                browser = await self._launch(pw.chromium.launch(**kwargs))
+                ctx = await browser.new_context(viewport=viewport, **({"proxy": proxy} if proxy else {}))
+            patch_context_async(ctx, resolve_config("default", None))
+            ctx.on("page", self._on_new_page)
+            ctx.on("close", lambda _ctx: self._reset() if self._context is ctx else None)
+        except BaseException:
+            # Also on Esc or the call timeout (CancelledError): otherwise the
+            # profile stays locked for the rest of the process.
+            if key:
                 with _open_profiles_lock:
                     _open_profiles.discard(key)
-                raise RuntimeError(
-                    f"Could not open profile '{self._profile_dir.name}' (it may be open in another "
-                    f"browser window): {str(e).splitlines()[0]}"
-                )
-            self._browser = None
-        else:
-            viewport = kwargs.pop("viewport")
-            proxy = kwargs.pop("proxy", None)
-            self._browser = await pw.chromium.launch(**kwargs)
-            ctx = await self._browser.new_context(viewport=viewport, **({"proxy": proxy} if proxy else {}))
+            for opened in (ctx, browser):
+                if opened is not None:
+                    self._close_later(opened)
+            raise
 
-        patch_context_async(ctx, resolve_config("default", None))
+        self._browser = browser
         self._context = ctx
-        ctx.on("page", self._on_new_page)
-        ctx.on("close", lambda _ctx: self._reset() if self._context is ctx else None)
         for p in ctx.pages:
             self._attach(p)
         self._current = self._pages[0] if self._pages else None
@@ -746,7 +785,8 @@ class BrowserManager:
             return None, f"Screenshot failed: {str(e).splitlines()[0]}", None
         folder = Path("~/.kairos/screenshots").expanduser()
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"screenshot_{_time.strftime('%Y%m%d_%H%M%S')}.png"
+        # Microseconds: screenshots taken within one second must not overwrite each other.
+        path = folder / f"screenshot_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
         path.write_bytes(png)
         data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
         return png, f"Screenshot captured ({len(png) / 1024:.0f} KB) — {url}\nSaved to: {path}", data_url
@@ -870,6 +910,7 @@ class BrowserManager:
         for i, r in rows[-max_results:]:
             status = r["status"] if r["status"] is not None else (f"FAILED {r['failure']}" if r["failure"] else "pending")
             dur = f" {r['duration_ms']}ms" if r["duration_ms"] is not None else ""
-            url = r["url"][:100] + ("..." if len(r["url"]) > 100 else "")
+            # Elide the middle: the tail (file, endpoint, query) is the informative part.
+            url = r["url"] if len(r["url"]) <= 100 else f"{r['url'][:50]}...{r['url'][-47:]}"
             out.append(f"[{i}] {r['method']} {status} {r['type']} {url}{dur}")
         return "\n".join(out)
