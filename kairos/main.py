@@ -1,27 +1,41 @@
+"""Kairos CLI entry point.
+
+Gateway mode (default) is a thin client of the gateway's WebSocket API.
+Offline mode (``--offline``) runs the Agent in-process. Both modes feed the
+same agent events (``assistant.token``, ``tool.started``, ...) to
+``CLI.handle_event``, so they look the same.
+"""
+import argparse
 import os
-import sys
+import re
 import signal
+import sys
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 
-from kairos.config import Config
-from kairos.agent import Agent
+from rich.text import Text
+
 from kairos.cli import CLI, _paste_registry
-from kairos.tools.session import SessionManager
+from kairos.gateway_client import GatewayClient, GatewayError
 from kairos.resume import sanitize_history_for_resume
 
 # Backwards-compatible private name for callers that imported the original
 # helper from kairos.main before the shared resume module was introduced.
 _sanitize_history_for_resume = sanitize_history_for_resume
 
-_EXIT_COMMANDS = frozenset(("exit", "quit", "q", "/exit", "/quit"))
+COMMANDS = ("/quit", "/clear", "/reset", "/compact", "/resume", "/model", "/effort")
+PROVIDERS = ("openai", "anthropic", "openrouter")
+CONTINUE_INSTRUCTION = "Continue where you left off. Pick up the next step."
+_RUN_ENDED = frozenset(("run.completed", "run.interrupted", "run.failed", "run.cancelled"))
 
 
 def _resolve_paste_input(user_input: str) -> tuple[str, str | None]:
     """Replace visible paste tokens before command dispatch.
 
     Command aliases must be checked after paste resolution. Otherwise a
-    pasted ``/exit`` (or ``/resume``, ``/compact``, etc.) is mistaken for a
+    pasted ``/quit`` (or ``/resume``, ``/compact``, etc.) is mistaken for a
     normal agent request because the prompt returns its placeholder token.
     """
     paste_image_data_url = None
@@ -37,34 +51,441 @@ def _resolve_paste_input(user_input: str) -> tuple[str, str | None]:
     return user_input, paste_image_data_url
 
 
-def _is_exit_command(user_input: str) -> bool:
-    """Return whether input is one of the CLI's exit aliases."""
-    return user_input.strip().casefold() in _EXIT_COMMANDS
+def parse_command(text: str) -> tuple[str, list[str]] | None:
+    """Return ``(command, args)`` for a slash command, else None.
+
+    Only a first word made of letters counts, so ``/etc/hosts ...`` is sent
+    to the agent as a message. Unknown commands are returned too, so the
+    caller can report them instead of sending a typo to the model.
+    """
+    parts = text.strip().split()
+    if not parts or not re.fullmatch(r"/[A-Za-z]+", parts[0]):
+        return None
+    return parts[0].lower(), parts[1:]
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="kairos", description="Kairos coding agent.")
+    parser.add_argument(
+        "workspace", nargs="?",
+        help="workspace folder ('.' = current folder); omit it to start in a new folder",
+    )
+    parser.add_argument(
+        "--offline", action="store_true",
+        help="run the agent in this process instead of through the gateway",
+    )
+    args = parser.parse_args(argv)
+    if args.workspace is not None:
+        path = Path(args.workspace).expanduser().resolve()
+        if not path.is_dir():
+            parser.error(f"not a folder: {path}")
+        args.workspace = str(path)
+    return args
+
+
+def _error_text(exc: BaseException) -> str:
+    # APIRequestError already carries concise diagnostics; never print a
+    # traceback (gateway failures can dump pages of httpx internals).
+    detail = str(exc)
+    if type(exc).__name__ not in ("Exception", "GatewayError"):
+        detail = f"{type(exc).__name__}: {detail}"
+    return detail
+
+
+def _same_path(a: str | Path, b: str | Path) -> bool:
+    return os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(b)))
+
+
+def _local_time(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return iso or ""
+
+
+def _text(content) -> str:
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return content or ""
+
+
+def _remember(configured: dict, changes: dict) -> None:
+    """Track /model and /effort choices so a new conversation keeps them."""
+    if "setup" in changes or "model" in changes:
+        # A different model has its own efforts; keep only the new choice.
+        configured.clear()
+    configured.update(changes)
+
+
+def _close_agent(agent) -> None:
+    for terminal_id in list(agent.terminal_manager.terminals):
+        agent.terminal_manager.close_terminal(terminal_id)
+    if agent.browser_manager.is_open:
+        try:
+            agent.browser_manager.close()
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------ #
-#  Auto-save state (shared between REPL and signal handlers)           #
+#  Backends: the REPL talks to one of these                            #
 # ------------------------------------------------------------------ #
 
-_session_mgr: SessionManager | None = None
-_agent: Agent | None = None
-_auto_save_lock = threading.Lock()
+class OfflineBackend:
+    """In-process Agent with sessions under ~/.kairos (the old behavior)."""
+
+    mode = "offline"
+
+    def __init__(self, workspace: str | None):
+        from kairos.tools.session import SessionManager
+
+        self._explicit = workspace is not None
+        if workspace is None:
+            from kairos.workspaces import new_workspace
+
+            workspace = str(new_workspace())
+            # Fresh folders are siblings; one chat list covers all of them.
+            store = str(Path(workspace).parent)
+        else:
+            store = workspace
+        self.workspace = workspace
+        self.sessions = SessionManager(store)
+        self._configured: dict = {}
+        self._on_event = None
+        self._muted = False
+        self._worker: threading.Thread | None = None
+        self._save_lock = threading.Lock()
+        self.agent = self._new_agent(workspace)
+
+    def _new_agent(self, workspace: str):
+        from kairos.agent import Agent
+
+        agent = Agent(workspace)
+        emit = self._emit
+
+        def tokens(counter) -> dict:
+            return {
+                "session_input": counter.session_input,
+                "session_output": counter.session_output,
+                "context_pct": counter.context_pct,
+                "turn_input": counter.turn_input,
+                "turn_output": counter.turn_output,
+            }
+
+        # Same event names and payloads as the gateway manager emits.
+        agent.on_stream_start = lambda: emit("assistant.stream_started", {})
+        agent.on_stream_token = lambda token: emit("assistant.token", {"delta": token})
+        agent.on_stream_end = lambda text, has_tools: emit(
+            "assistant.stream_ended", {"content": text, "has_tool_calls": has_tools}
+        )
+        agent.on_tool_call = lambda name, args: emit(
+            "tool.started", {"name": name, "summary": agent._tool_summary(name, args)}
+        )
+        agent.on_token_update = lambda counter: emit("token.updated", tokens(counter))
+        agent.on_compact = lambda message: emit("conversation.compacted", {"message": message})
+        # Background completions show immediately; the agent also keeps them
+        # queued for the next API turn.
+        agent.on_background_notification = lambda message: emit("terminal.completed", {"message": message})
+        subagents = agent.subagent_tool
+        subagents._tool_printer = lambda summary: emit("tool.started", {"name": "subagent", "summary": summary})
+        subagents._stream_start = lambda: emit("assistant.stream_started", {"subagent": True})
+        subagents._stream_token = lambda token: emit("assistant.token", {"delta": token, "subagent": True})
+        subagents._stream_end = lambda text, has_tools: emit(
+            "assistant.stream_ended", {"content": text, "has_tool_calls": has_tools, "subagent": True}
+        )
+        subagents._token_update = lambda subagent_id, counter: emit(
+            "token.updated", {**tokens(counter), "subagent_id": subagent_id}
+        )
+        if self._configured:
+            self._apply(agent, **self._configured)
+        return agent
+
+    @staticmethod
+    def _apply(agent, setup=None, model=None, provider=None, effort=None) -> None:
+        if setup or model:
+            agent.set_model(setup=setup, model=model, provider=provider)
+        if effort:
+            agent.set_effort(effort)
+
+    def _emit(self, event: str, data: dict) -> None:
+        # After Esc the prompt is already back; drop the stopped run's output.
+        if not self._muted and self._on_event:
+            self._on_event(event, data)
+
+    def _wait_previous(self) -> None:
+        """Let a run stopped with Esc reach its cleanup before reusing the Agent."""
+        if self._worker is not None:
+            self._worker.join()
+            self._worker = None
+            self.save()
+
+    def save(self) -> None:
+        with self._save_lock:
+            self.sessions.save_chat(self.agent.get_history())
+
+    def run(self, text: str, image_url: str | None, stop: threading.Event, on_event):
+        self._wait_previous()
+        self._on_event, self._muted = on_event, False
+        result: dict = {}
+
+        def work():
+            try:
+                result["response"] = self.agent.run(text, image_url=image_url)
+            except Exception as exc:
+                result["error"] = exc
+
+        worker = threading.Thread(target=work, daemon=True)
+        self._worker = worker
+        worker.start()
+        while worker.is_alive():
+            try:
+                if stop.wait(0.05):
+                    break
+            except KeyboardInterrupt:
+                stop.set()
+        if worker.is_alive():
+            # Return to the prompt at once; the next command joins the worker.
+            self._muted = True
+            self.agent.interrupt()
+            return "interrupted", None
+        self._worker = None
+        self.save()
+        if "error" in result:
+            return "failed", _error_text(result["error"])
+        response = result.get("response") or ""
+        if response == "[Interrupted]" or response.startswith("[Stopped"):
+            return "interrupted", None
+        return "completed", response
+
+    def continue_run(self, stop: threading.Event, on_event):
+        return self.run(CONTINUE_INSTRUCTION, None, stop, on_event)
+
+    def compact(self) -> str:
+        self._wait_previous()
+        result = self.agent.compact()
+        self.save()
+        return result
+
+    def reset(self) -> None:
+        self._wait_previous()
+        self.save()
+        self.sessions.new_session()
+        if self._explicit:
+            self.agent.reset()
+            return
+        from kairos.workspaces import new_workspace
+
+        _close_agent(self.agent)
+        self.workspace = str(new_workspace())
+        self.agent = self._new_agent(self.workspace)
+
+    def list_conversations(self) -> list[dict]:
+        return self.sessions.list_sessions()
+
+    def resume(self, conversation_id: str) -> tuple[str, bool]:
+        self._wait_previous()
+        history = self.sessions.load_session(conversation_id)
+        sanitized, last, mid_execution = (
+            sanitize_history_for_resume(history) if history else (None, "", False)
+        )
+        if sanitized is None:
+            raise ValueError("That chat has no resumable state.")
+        self.save()
+        self.agent.reset()
+        self.agent.conversation_history = sanitized
+        self.sessions.set_current_session(conversation_id)
+        return last, mid_execution
+
+    def models(self) -> tuple[list[dict], dict]:
+        from kairos.providers import list_setups
+
+        return list_setups(), self.agent.model_info()
+
+    def model_info(self) -> dict:
+        return self.agent.model_info()
+
+    def configure(self, **changes) -> dict:
+        self._wait_previous()
+        self._apply(self.agent, **changes)
+        _remember(self._configured, changes)
+        return self.agent.model_info()
+
+    def close(self) -> None:
+        self._wait_previous()
+        self.save()
+        # Background shells are owned by the agent and should not survive
+        # CLI shutdown. Close them only after the final save.
+        _close_agent(self.agent)
+        self.sessions.new_session()
+
+
+class GatewayBackend:
+    """Thin client: the gateway owns the conversation, Agent and history."""
+
+    mode = "gateway"
+
+    def __init__(self, workspace: str | None, client: GatewayClient | None = None):
+        self.client = client or GatewayClient()
+        self.client.connect()
+        self._explicit = workspace
+        self._configured: dict = {}
+        self._abandoned: set[str] = set()
+        self.conversation: dict | None = None
+        self._open(self._create())
+
+    @property
+    def workspace(self) -> str:
+        return self.conversation["workspace_path"]
+
+    @property
+    def _id(self) -> str:
+        return self.conversation["id"]
+
+    def _create(self) -> dict:
+        # Without a workspace the gateway creates a fresh folder.
+        payload = {"workspace": self._explicit} if self._explicit else {}
+        return self.client.request("conversation.create", payload=payload)["conversation"]
+
+    def _open(self, conversation: dict) -> None:
+        """Make *conversation* current and subscribe to its new events."""
+        if self.conversation is not None:
+            self.client.request("conversation.unsubscribe", self._id)
+        self._abandoned.clear()
+        self.conversation = conversation
+        self.client.request(
+            "conversation.subscribe", self._id,
+            {"after_event_id": conversation.get("last_event_id", 0)},
+        )
+
+    def _wait(self, run_id: str, stop: threading.Event, on_event):
+        """Render this run's events until it ends or the user stops it."""
+        while True:
+            try:
+                if stop.is_set():
+                    # Do not wait for the run to wind down: the prompt comes
+                    # back now and later events for this run are dropped.
+                    self._abandoned.add(run_id)
+                    try:
+                        self.client.request("run.cancel", self._id, {"run_id": run_id})
+                    except GatewayError:
+                        pass
+                    return "interrupted", None
+                event = self.client.next_event(0.05)
+            except KeyboardInterrupt:
+                stop.set()
+                continue
+            if event is None:
+                continue
+            name, data = event.get("event"), event.get("data") or {}
+            if event.get("run_id") != run_id:
+                if name in _RUN_ENDED:
+                    self._abandoned.discard(event.get("run_id"))
+                continue
+            if name == "run.completed":
+                return "completed", data.get("response")
+            if name == "run.failed":
+                return "failed", data.get("error") or "Run failed."
+            if name in _RUN_ENDED:
+                return "interrupted", None
+            on_event(name, data)
+
+    def _settle(self, timeout: float = 30.0) -> None:
+        """Wait for runs stopped with Esc to end before a control command."""
+        deadline = time.monotonic() + timeout
+        while self._abandoned and time.monotonic() < deadline:
+            event = self.client.next_event(0.1)
+            if event and event.get("event") in _RUN_ENDED:
+                self._abandoned.discard(event.get("run_id"))
+
+    def run(self, text: str, image_url: str | None, stop: threading.Event, on_event):
+        payload = {"content": text, "source": "cli"}
+        if image_url:
+            payload["image_url"] = image_url
+        ack = self.client.request("message.send", self._id, payload)
+        return self._wait(ack["run_id"], stop, on_event)
+
+    def continue_run(self, stop: threading.Event, on_event):
+        ack = self.client.request(
+            "conversation.continue", self._id,
+            {"instruction": CONTINUE_INSTRUCTION, "source": "cli"},
+        )
+        return self._wait(ack["run_id"], stop, on_event)
+
+    def compact(self) -> str:
+        self._settle()
+        return self.client.request("conversation.compact", self._id, timeout=600)["message"]
+
+    def reset(self) -> None:
+        self._settle()
+        self._open(self._create())
+        if self._configured:
+            self.configure(**self._configured)
+
+    def list_conversations(self) -> list[dict]:
+        items = self.client.request("conversation.list", payload={"limit": 500})["items"]
+        here = Path(self.workspace)
+
+        def belongs(conversation: dict) -> bool:
+            path = Path(conversation["workspace_path"])
+            if self._explicit:
+                return _same_path(path, here)
+            # No path given: fresh folders are siblings, list all of them.
+            return _same_path(path.parent, here.parent)
+
+        return [
+            {
+                "id": c["id"],
+                "timestamp": _local_time(c.get("updated_at", "")),
+                "preview": c.get("title") or c.get("preview") or "",
+            }
+            for c in items
+            if c.get("message_count") and belongs(c)
+        ]
+
+    def resume(self, conversation_id: str) -> tuple[str, bool]:
+        self._settle()
+        data = self.client.request("conversation.load", conversation_id)
+        self._open(data["conversation"])
+        last = next(
+            (_text(m.get("content")) for m in reversed(data.get("history") or []) if m.get("role") == "assistant"),
+            "",
+        )
+        return last, bool(data.get("needs_continue"))
+
+    def models(self) -> tuple[list[dict], dict]:
+        setups = self.client.request("model.list").get("setups") or []
+        return setups, self.model_info()
+
+    def model_info(self) -> dict:
+        return self.client.request(
+            "conversation.configure", self._id, {"conversation_id": self._id}
+        )
+
+    def configure(self, **changes) -> dict:
+        self._settle()
+        info = self.client.request(
+            "conversation.configure", self._id, {"conversation_id": self._id, **changes}
+        )
+        _remember(self._configured, changes)
+        return info
+
+    def save(self) -> None:
+        """The gateway persists the conversation."""
+
+    def close(self) -> None:
+        self.client.close()
+
+
+# ------------------------------------------------------------------ #
+#  Offline auto-save state (shared with signal handlers)               #
+# ------------------------------------------------------------------ #
+
+_backend = None
 
 
 def _save_now():
-    """Save current chat history to disk (thread-safe)."""
-    with _auto_save_lock:
-        if _session_mgr and _agent:
-            _session_mgr.save_chat(_agent.get_history())
-
-
-def _handle_sigint(sig, frame):
-    """Stop the active request; Ctrl+C while idle still exits."""
-    if _agent is not None and _agent.is_processing:
-        _agent.interrupt()
-        return
-    _save_now()
-    sys.exit(0)
+    if _backend is not None:
+        _backend.save()
 
 
 def _handle_sigterm(sig, frame):
@@ -80,17 +501,14 @@ def _handle_sighup(sig, frame):
 
 
 def _start_signal_handlers():
-    """Install signal handlers so chat is saved when the window closes."""
-    # SIGTERM / SIGINT -- works on all platforms
+    """Save the chat when the window closes. Ctrl+C arrives as
+    KeyboardInterrupt and stops the running request."""
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    signal.signal(signal.SIGINT, _handle_sigint)
-
-    # SIGHUP only exists on Unix
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, _handle_sighup)
 
 
-def _start_auto_save(agent: Agent, interval_seconds: int = 60):
+def _start_auto_save(interval_seconds: int = 60):
     """Periodically save chat history in a background thread."""
 
     def _loop():
@@ -98,282 +516,218 @@ def _start_auto_save(agent: Agent, interval_seconds: int = 60):
             time.sleep(interval_seconds)
             _save_now()
 
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
+    threading.Thread(target=_loop, daemon=True).start()
 
 
-def process_request(
-    cli: CLI, agent: Agent, user_input: str, image_url: str | None = None
-) -> str | None:
-    """
-    Run the agent in a background thread so the main thread can catch
-    KeyboardInterrupt cleanly.
+# ------------------------------------------------------------------ #
+#  REPL                                                                #
+# ------------------------------------------------------------------ #
 
-    The Escape key listener is active only during agent execution. Because it
-    shares stdin with prompt_toolkit, ordinary characters captured during the
-    handoff are buffered and replayed by the next prompt instead of discarded.
-    """
-    result = [None]
-    exception_holder = [None]
-
-    def _run():
-        try:
-            result[0] = agent.run(user_input, image_url=image_url)
-        except Exception as e:
-            exception_holder[0] = e
-
-    # Start Escape listener -- only while agent runs
-    cli.start_escape_listener(on_escape=agent.request_stop)
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-
+def _status_text(backend) -> str:
+    """Compact ``model · effort`` for the prompt (empty if unavailable)."""
     try:
-        while t.is_alive():
-            try:
-                t.join(timeout=0.15)
-            except KeyboardInterrupt:
-                # Signal handlers normally route Ctrl+C here, but prompt-toolkit
-                # can raise KeyboardInterrupt directly. Cancellation is
-                # immediate; the join guarantees the next prompt cannot race
-                # the old worker's history/callback cleanup.
-                agent.interrupt()
-                t.join()
-                return "[Interrupted]"
+        info = backend.model_info() or {}
+    except Exception:
+        # An older gateway may not know conversation.configure.
+        return ""
+    return " · ".join(str(part) for part in (info.get("model") or info.get("setup"), info.get("effort")) if part)
 
-        if exception_holder[0]:
-            raise exception_holder[0]
-        return result[0]
+
+def _describe(info: dict) -> str:
+    text = f"{info.get('provider', '?')}/{info.get('model', '?')}"
+    if info.get("setup"):
+        text = f"{info['setup']} ({text})"
+    if info.get("effort"):
+        text += f" · effort {info['effort']}"
+    return text
+
+
+def run_turn(cli: CLI, start) -> None:
+    """Run one agent turn; Esc or Ctrl+C stops it and returns to the prompt."""
+    stop = threading.Event()
+    cli.start_thinking()
+    cli.start_escape_listener(on_escape=stop.set)
+    try:
+        outcome, payload = start(stop)
+    except Exception as exc:
+        outcome, payload = "failed", _error_text(exc)
     finally:
-        # Stop Escape listener before returning to prompt
         cli.stop_escape_listener()
+        cli.stop_thinking()
+    if outcome == "completed":
+        if payload and not cli._skip_print_response:
+            cli.print_response(payload)
+    elif outcome == "failed":
+        cli.print_error(payload or "Request failed.")
+    else:
+        cli.print_info("Interrupted.")
+    cli._skip_print_response = False
 
 
-def main():
-    global _session_mgr, _agent
+def _resume(cli: CLI, backend, args: list[str]) -> None:
+    sessions = backend.list_conversations()
+    if not sessions:
+        cli.print_info("No saved chats for this workspace.")
+        return
+    chosen = cli.pick_session(sessions, initial_choice=args[0] if args else None)
+    if not chosen:
+        return
+    last, needs_continue = backend.resume(chosen)
+    preview = next((s.get("preview", "") for s in sessions if s["id"] == chosen), "")
+    cli.print_info(f"Resumed: {preview}")
+    if last:
+        cli.print_response(last)
+    if needs_continue:
+        run_turn(cli, lambda stop: backend.continue_run(stop, cli.handle_event))
 
-    # Validate config
+
+def _model(cli: CLI, backend, args: list[str]) -> None:
+    usage = "Usage: /model [number|name] or /model <model-id> <openai|anthropic|openrouter>"
+    if len(args) > 2:
+        cli.print_error(usage)
+        return
+    if len(args) == 2:
+        model, provider = args[0], args[1].lower()
+        if provider not in PROVIDERS:
+            cli.print_error(usage)
+            return
+        info = backend.configure(model=model, provider=provider)
+    else:
+        setups, current = backend.models()
+        if args:
+            choice = args[0]
+        else:
+            for index, setup in enumerate(setups, 1):
+                mark = "  (current)" if setup.get("name") == current.get("setup") else ""
+                cli.console.print(Text.assemble(
+                    (f"  {index}. ", "cyan"),
+                    str(setup.get("name")),
+                    (f"  {setup.get('provider')}/{setup.get('model')}{mark}", "dim"),
+                ))
+            cli.print_info(f"Current: {_describe(current)}")
+            choice = cli.ask("Pick a model (number or name), Enter to cancel: ")
+            if not choice:
+                return
+        names = [setup.get("name") for setup in setups]
+        if choice.isdigit() and 1 <= int(choice) <= len(setups):
+            name = names[int(choice) - 1]
+        elif choice in names:
+            name = choice
+        else:
+            cli.print_error(f"No saved setup '{choice}'. {usage}")
+            return
+        info = backend.configure(setup=name)
+    cli.print_info(f"Model: {_describe(info)}")
+
+
+def _effort(cli: CLI, backend, args: list[str]) -> None:
+    if not args:
+        info = backend.model_info()
+        allowed = ", ".join(info.get("reasoning_efforts") or []) or "none"
+        cli.print_info(f"Effort: {info.get('effort') or 'default'} (allowed: {allowed})")
+        return
+    info = backend.configure(effort=args[0].lower())
+    cli.print_info(f"Effort: {info.get('effort')}")
+
+
+def handle_command(cli: CLI, backend, name: str, args: list[str]) -> bool:
+    """Run a slash command (not /quit); return True if model/effort may have changed."""
+    if name == "/clear":
+        cli.clear_screen()
+        return False
+    if name == "/reset":
+        backend.reset()
+        cli.print_info(f"New conversation · {backend.workspace}")
+        return True
+    if name == "/compact":
+        cli.print_info("Compacting...")
+        cli.print_info(backend.compact())
+        return False
+    if name == "/resume":
+        _resume(cli, backend, args)
+        return True
+    if name == "/model":
+        _model(cli, backend, args)
+        return True
+    if name == "/effort":
+        _effort(cli, backend, args)
+        return True
+    cli.print_error(f"Unknown command {name}. Commands: {' '.join(COMMANDS)}")
+    return False
+
+
+def main(argv: list[str] | None = None):
+    global _backend
+
+    args = parse_args(argv)
+    cli = CLI()
     try:
-        Config.validate()
-    except ValueError as e:
-        print(f"Configuration error: {e}")
-        print("Please create a .env file with your OpenAI API key.")
-        print("See .env.example for reference.")
+        if args.offline:
+            from kairos.config import Config
+
+            try:
+                Config.validate()
+            except ValueError as e:
+                cli.print_error(f"Configuration error: {e}")
+                sys.exit(1)
+            backend = OfflineBackend(args.workspace)
+        else:
+            backend = GatewayBackend(args.workspace)
+    except GatewayError as exc:
+        hint = " Start Kairos with kairos.bat, or use kairos_offline.bat." if exc.code == "disconnected" else ""
+        cli.print_error(f"{exc}{hint}")
         sys.exit(1)
 
-    workspace = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+    _backend = backend
+    if args.offline:
+        _start_signal_handlers()
+        _start_auto_save(interval_seconds=60)
 
-    cli = CLI()
-    agent = Agent(workspace)
-    # Persist sessions under the active workspace. The PATH launcher invokes
-    # this source tree while preserving the caller's CWD, so Agent2Gateway
-    # chats are not mixed with Agent2's own legacy chats.
-    session_mgr = SessionManager(workspace)
-
-    # Share globals with signal handlers and auto-save
-    _session_mgr = session_mgr
-    _agent = agent
-
-    # Install signal handlers so closing the window saves the chat
-    _start_signal_handlers()
-
-    # Start periodic auto-save (every 60 seconds)
-    _start_auto_save(agent, interval_seconds=60)
-
-    cli.print_banner()
-    cli.print_info("Type your request, 'exit' to quit, '/resume' to load a chat")
-    cli.print_info("'/compact' to compact conversation, Ctrl+C or Escape to stop immediately")
-    cli.print_info("Stop cuts off the current stream/tool; type the next request as soon as the prompt returns. Paste text directly or Alt+V for images")
-    cli.print_info("Commands: 'clear', 'reset', '/exit', '/quit'")
-    cli.print_info("/resume now also resumes mid-execution chats automatically")
-    cli.console.print()
-
-    # Wire agent callbacks to CLI
-    # Tool call summaries (basic one-liners)
-    agent.on_tool_call = lambda name, args: cli.print_tool_summary(
-        agent._tool_summary(name, args)
-    )
-    # Streaming display
-    agent.on_stream_start = lambda: cli.start_stream()
-    agent.on_stream_token = cli.on_stream_token
-
-    # Wire subagent callbacks so their tool calls & streaming are visible
-    agent.subagent_tool._tool_printer = lambda summary: cli.console.print(
-        f"  [dim]\u2193[/dim] [italic dim]subagent:[/italic dim] {summary}"
-    )
-    agent.subagent_tool._stream_start = lambda: cli.start_stream()
-    agent.subagent_tool._stream_token = cli.on_stream_token
-    # Print child token accounting separately from the parent agent's status.
-    agent.subagent_tool._token_update = lambda subagent_id, tc: cli.print_subagent_token_status(
-        subagent_id, tc
-    )
-    # For subagent stream end, always finish the stream panel (keep as thinking trace)
-    agent.subagent_tool._stream_end = lambda _content, _has_tools: cli.finish_stream()
-
-    def _on_stream_end(content: str, has_tool_calls: bool):
-        if not content:
-            # No text (model went straight to tool calls) -- clean up empty panel
-            cli.finish_stream()
-            return
-        if has_tool_calls:
-            # Tool-call thinking -- grey panel stays on screen as thinking trace
-            cli.finish_stream()
-        else:
-            # Final response -- upgrade streaming panel to green
-            cli.finalize_stream_as_response()
-            cli._skip_print_response = True
-
-    agent.on_stream_end = _on_stream_end
-    # Token status after each turn
-    agent.on_token_update = lambda tc: cli.print_token_status(tc)
-    # Compaction status
-    agent.on_compact = lambda msg: cli.print_info(msg)
-    # Background completions are visible immediately. The completion remains
-    # queued inside the agent so it is also inserted into the next API turn.
-    agent.on_background_notification = cli.print_background_notification
+    cli.print_banner(backend.workspace, backend.mode)
+    status = _status_text(backend)
 
     while True:
+        if backend.mode == "gateway" and backend.client.closed:
+            cli.print_error("Lost connection to the gateway.")
+            break
         try:
-            user_input = cli.get_user_input()
-
+            user_input = cli.get_user_input(status=status)
             if user_input is None:
                 break
 
             # Resolve paste placeholders before dispatching commands. A
             # pasted command is returned as a token (for example,
-            # ``(Pasted Text #1)``), so checking aliases first would send the
-            # pasted command to the agent instead of handling it locally.
+            # ``(Pasted Text #1)``), so checking commands first would send
+            # the pasted command to the agent instead of handling it locally.
             user_input, paste_image_data_url = _resolve_paste_input(user_input)
 
-            if _is_exit_command(user_input):
-                break
-
-            if user_input.strip().casefold() == "clear":
-                cli.clear_screen()
-                cli.print_banner()
+            command = parse_command(user_input)
+            if command:
+                name, command_args = command
+                if name == "/quit":
+                    break
+                try:
+                    if handle_command(cli, backend, name, command_args):
+                        status = _status_text(backend)
+                except Exception as exc:
+                    cli.print_error(_error_text(exc))
                 continue
 
-            if user_input.strip().casefold() == "reset":
-                _save_now()
-                session_mgr.new_session()
-                agent.reset()
-                cli.print_info("Conversation history reset")
-                continue
-
-            command = user_input.strip().casefold()
-
-            if command == "/compact":
-                cli.print_info("Compacting conversation...")
-                result = agent.compact()
-                cli.print_info(result)
-                continue
-
-            if command == "/paste":
-                cli.print_info("Paste text directly — it's detected automatically.")
-                cli.print_info("Alt+V pastes images from your clipboard.")
-                cli.print_info(
-                    "Text shows as (Pasted Text #N), images show as (Pasted Image #N)."
-                )
-                cli.print_info(
-                    "Backspace removes an entire paste token. The actual content is sent to the API."
-                )
-                continue
-
-            if command == "/resume" or command.startswith("/resume "):
-                sessions = session_mgr.list_sessions()
-                if not sessions:
-                    cli.print_info("No saved chats found.")
-                    continue
-                # Accept both the interactive form (/resume, then 1) and the
-                # convenient single-line form (/resume 1).
-                initial_choice = user_input.strip()[len("/resume"):].strip() or None
-                selected_id = cli.pick_session(sessions, initial_choice=initial_choice)
-                if selected_id:
-                    history = session_mgr.load_session(selected_id)
-                    if history:
-                        sanitized, last_msg, mid_exec = sanitize_history_for_resume(history)
-                        if sanitized is None:
-                            cli.print_info(
-                                f"Chat '{selected_id}' has no resumable state."
-                            )
-                            cli.print_info("Skipping this chat.")
-                            continue
-                        _save_now()
-                        agent.reset()
-                        agent.conversation_history = sanitized
-                        session_mgr.set_current_session(selected_id)
-                        cli.print_info(f"Loaded chat: {selected_id}")
-                        if last_msg:
-                            cli.print_response(last_msg)
-                        if mid_exec:
-                            # Mid-execution resume — auto-continue the agent
-                            cli.print_info(
-                                "Resuming mid-execution — agent will continue where it left off..."
-                            )
-                            cli.start_thinking()
-                            try:
-                                response = process_request(
-                                    cli, agent,
-                                    "Continue where you left off. Pick up the next step.",
-                                )
-                            except Exception as e:
-                                cli.stop_thinking()
-                                cli.print_error(str(e))
-                                response = None
-                            finally:
-                                cli.stop_thinking()
-                            if response and not cli._skip_print_response:
-                                cli.print_response(response)
-                            cli._skip_print_response = False
-                            _save_now()
-                continue
-
-            # Empty input: if no image was pasted, just skip
             if not user_input.strip():
                 if not paste_image_data_url:
                     continue
                 user_input = "Describe this image."
 
-            # Show animated "Thinking..." while agent processes
-            cli.start_thinking()
-
-            try:
-                response = process_request(
-                    cli, agent, user_input, image_url=paste_image_data_url
-                )
-            except Exception as e:
-                cli.stop_thinking()
-                # APIRequestError already contains concise diagnostics. Avoid
-                # printing chained tracebacks: gateway failures can otherwise
-                # dump many pages of httpx/httpcore internals into the CLI.
-                error_detail = str(e)
-                if type(e).__name__ != "Exception":
-                    error_detail = f"{type(e).__name__}: {error_detail}"
-                cli.print_error(error_detail)
-                response = None
-            finally:
-                cli.stop_thinking()
-
-            # Print final response in green panel (skip if streaming already handled it)
-            if response and not cli._skip_print_response:
-                cli.print_response(response)
-            cli._skip_print_response = False
-
-            # Auto-save after each successful exchange so nothing is lost
-            _save_now()
+            run_turn(
+                cli,
+                lambda stop: backend.run(user_input, paste_image_data_url, stop, cli.handle_event),
+            )
 
         except KeyboardInterrupt:
             cli.console.print()
-            cli.print_info("Type 'exit' to quit.")
             continue
 
-    # Final save
-    _save_now()
-    # Background shells are owned by the agent and should not survive CLI
-    # shutdown. Close them only after the final conversation save.
-    for terminal_id in list(agent.terminal_manager.terminals):
-        agent.terminal_manager.close_terminal(terminal_id)
-    session_mgr.new_session()
+    backend.close()
     cli.print_exit()
 
 
