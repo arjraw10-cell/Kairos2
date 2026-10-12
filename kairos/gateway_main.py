@@ -23,7 +23,7 @@ def main() -> None:
         Config.validate()
     except ValueError as exc:
         print(f"Configuration error: {exc}")
-        print("Create a .env file with OPENAI_API_KEY before starting the gateway.")
+        print("Create provider.json (see provider.example.json) before starting the gateway.")
         raise SystemExit(1) from exc
 
     workspace = sys.argv[1] if len(sys.argv) > 1 else Config.KAIROS_DEFAULT_WORKSPACE()

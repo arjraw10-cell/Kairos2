@@ -17,6 +17,8 @@ class Command:
     CONTINUE = "conversation.continue"
     INTERRUPT = "run.interrupt"
     CANCEL = "run.cancel"
+    MODEL_LIST = "model.list"
+    CONFIGURE = "conversation.configure"
     PING = "ping"
 
 

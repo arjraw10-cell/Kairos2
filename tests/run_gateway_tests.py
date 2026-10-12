@@ -290,6 +290,137 @@ def api_test() -> None:
             assert unloaded.status_code == 200, unloaded.text
 
 
+MODEL_CONFIG = {
+    "default_setup": "luna",
+    "providers": {
+        "openai": {"format": "responses", "base_url": "https://api.openai.com/v1", "api_keys": ["sk-test"]},
+        "openrouter": {"format": "completions", "base_url": "https://openrouter.ai/api/v1", "api_keys": ["or-test"]},
+    },
+    "setups": {
+        "luna": {"provider": "openai", "model": "gpt-6-luna", "reasoning_efforts": ["low", "high"], "default_effort": "high"},
+        "mimo": {"provider": "openrouter", "model": "xiaomi/mimo", "reasoning_efforts": ["on", "off"], "default_effort": "on"},
+    },
+}
+
+
+class ModelFakeAgent(FakeAgent):
+    """FakeAgent with the Agent model-selection API backed by providers."""
+
+    def __init__(self, workspace: str):
+        super().__init__(workspace)
+        self.set_model()
+
+    def set_model(self, setup=None, model=None, provider=None):
+        from kairos import providers
+
+        self.spec = providers.resolve(setup, model=model, provider=provider)
+        self.effort = self.spec.default_effort
+        return "ok"
+
+    def set_effort(self, effort):
+        from kairos import providers
+
+        self.effort = providers.validate_effort(self.spec, effort)
+        return "ok"
+
+    def model_info(self):
+        return self.spec.info(self.effort)
+
+
+def model_config_test() -> None:
+    import json
+    from unittest import mock
+
+    async def scenario(directory: str):
+        manager = GatewayManager(
+            GatewayRepository(Path(directory) / "data"),
+            max_concurrent_runs=1,
+            agent_factory=ModelFakeAgent,
+        )
+        assert manager.list_models()["default_setup"] == "luna"
+        assert [s["name"] for s in manager.list_models()["setups"]] == ["luna", "mimo"]
+        conversation = manager.create_conversation(directory)
+        info = await manager.configure_conversation(conversation.id)
+        assert (info["setup"], info["effort"]) == ("luna", "high")
+        info = await manager.configure_conversation(conversation.id, setup="mimo", effort="off")
+        assert (info["setup"], info["model"], info["effort"]) == ("mimo", "xiaomi/mimo", "off")
+        try:
+            await manager.configure_conversation(conversation.id, effort="high")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("an unsupported effort must be rejected")
+        # Applied when the runtime loads later...
+        runtime = await manager.load_runtime(conversation.id)
+        assert runtime.agent.model_info()["effort"] == "off"
+        # ...and immediately to a loaded runtime; persisted across reloads.
+        info = await manager.configure_conversation(conversation.id, model="gpt-6-sol", provider="openai")
+        assert (info["setup"], info["model"], info["effort"]) == (None, "gpt-6-sol", None)
+        assert runtime.agent.model_info()["model"] == "gpt-6-sol"
+        await manager.unload_runtime(conversation.id)
+        runtime = await manager.load_runtime(conversation.id)
+        assert runtime.agent.model_info()["model"] == "gpt-6-sol"
+        try:
+            await manager.configure_conversation("conv_missing")
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("unknown conversation must raise KeyError")
+        await manager.shutdown()
+
+    with tempfile.TemporaryDirectory() as directory:
+        config = Path(directory) / "provider.json"
+        config.write_text(json.dumps(MODEL_CONFIG), encoding="utf-8")
+        with mock.patch("kairos.providers.config.config_path", return_value=config):
+            asyncio.run(scenario(directory))
+
+            # WebSocket commands.
+            manager = GatewayManager(
+                GatewayRepository(Path(directory) / "ws-data"),
+                max_concurrent_runs=1,
+                agent_factory=ModelFakeAgent,
+            )
+            with TestClient(create_app(manager)) as client, client.websocket_connect("/api/v1/ws") as ws:
+                def command(name, conversation_id=None, **payload):
+                    ws.send_json({"type": "command", "command": name, "request_id": name,
+                                  "conversation_id": conversation_id, "payload": payload})
+                    return ws.receive_json()
+
+                listed = command("model.list")
+                assert listed["ok"] and listed["data"]["default_setup"] == "luna"
+                created = command("conversation.create", workspace=directory)["data"]["conversation"]
+                reply = command("conversation.configure", created["id"], setup="mimo")
+                assert reply["ok"] and reply["data"]["setup"] == "mimo", reply
+                reply = command("conversation.configure", conversation_id=created["id"])  # id in payload
+                assert reply["data"]["effort"] == "on", reply
+                reply = command("conversation.configure", created["id"], effort="max")
+                assert reply["type"] == "error" and reply["code"] == "invalid_request", reply
+                reply = command("conversation.configure", "conv_missing")
+                assert reply["type"] == "error" and reply["code"] == "not_found", reply
+
+
+def model_settings_migration_test() -> None:
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as directory:
+        # A database created before the model_settings column existed.
+        conn = sqlite3.connect(str(Path(directory) / "kairos.sqlite3"))
+        conn.execute(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, workspace_path TEXT NOT NULL, "
+            "title TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'idle', "
+            "archived INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+            "message_count INTEGER NOT NULL DEFAULT 0, last_event_id INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute("INSERT INTO conversations(id, workspace_id, workspace_path, created_at, updated_at) VALUES ('conv_old', 'ws', ?, 'now', 'now')", (directory,))
+        conn.commit()
+        conn.close()
+        repo = GatewayRepository(directory)
+        assert repo.get_model_settings("conv_old") == {}
+        repo.set_model_settings("conv_old", {"setup": "mimo", "effort": "off"})
+        assert GatewayRepository(directory).get_model_settings("conv_old") == {"setup": "mimo", "effort": "off"}
+        assert repo.get_conversation("conv_old").id == "conv_old"
+
+
 def main() -> None:
     tests = [
         terminal_test,
@@ -302,6 +433,8 @@ def main() -> None:
         config_test,
         auth_test,
         api_test,
+        model_config_test,
+        model_settings_migration_test,
     ]
     for test in tests:
         print(f"running {test.__name__}", flush=True)

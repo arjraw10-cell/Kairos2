@@ -1,0 +1,17 @@
+{
+  "default_setup": "gpt-6-luna",
+  "providers": {
+    "openai": {"format": "responses", "base_url": "https://api.openai.com/v1", "api_keys": ["sk-proj-..."]},
+    "openrouter": {"format": "completions", "base_url": "https://openrouter.ai/api/v1", "api_keys": ["sk-or-v1-...", "sk-or-v1-..."]},
+    "anthropic": {"format": "anthropic", "base_url": "https://api.anthropic.com", "api_keys": []}
+  },
+  "setups": {
+    "gpt-6-luna": {"provider": "openai", "model": "gpt-6-luna", "reasoning_efforts": ["none", "low", "medium", "high", "xhigh", "max"], "default_effort": "high"},
+    "gpt-6-sol": {"provider": "openai", "model": "gpt-6-sol", "reasoning_efforts": ["none", "low", "medium", "high", "xhigh", "max"], "default_effort": "high"},
+    "gpt-6.1-sol": {"provider": "openai", "model": "gpt-6.1-sol", "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"], "default_effort": "high"},
+    "gpt-6-astra": {"provider": "openai", "model": "gpt-6-astra", "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"], "default_effort": "high"},
+    "glm-5.3-flash": {"provider": "openrouter", "model": "z-ai/glm-5.3-flash", "reasoning_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"], "default_effort": "high"},
+    "mimo-v2.5": {"provider": "openrouter", "model": "xiaomi/mimo-v2.5", "reasoning_efforts": ["on", "off"], "default_effort": "on"}
+  },
+  "tavily_api_key": "tvly-..."
+}

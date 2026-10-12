@@ -616,7 +616,7 @@ def main():
         Config.validate()
     except ValueError as e:
         print(f"Configuration error: {e}")
-        print("Please create a .env file with your OpenAI API key.")
+        print("Create provider.json (see provider.example.json).")
         sys.exit(1)
 
     workspace = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()

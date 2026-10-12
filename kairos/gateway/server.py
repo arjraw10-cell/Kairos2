@@ -616,6 +616,17 @@ def create_app(manager: GatewayManager | None = None) -> FastAPI:
                             raise ValueError("Run does not belong to this conversation.")
                         cancelled = await gateway.cancel_run(run_id)
                         await send(ack(request_id, {"cancelled": cancelled}))
+                    elif command == Command.MODEL_LIST:
+                        await send(ack(request_id, gateway.list_models()))
+                    elif command == Command.CONFIGURE:
+                        info = await gateway.configure_conversation(
+                            conversation_id or payload.get("conversation_id"),
+                            setup=payload.get("setup"),
+                            model=payload.get("model"),
+                            provider=payload.get("provider"),
+                            effort=payload.get("effort"),
+                        )
+                        await send(ack(request_id, info))
                     elif command == Command.PING:
                         await send(ack(request_id, {"pong": True}))
                     else:

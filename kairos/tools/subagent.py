@@ -1,13 +1,13 @@
 import uuid
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from .base import ToolResult
 
 
 class SubAgentTool:
     """Manages spawning and tracking of subagents — autonomous copies of the
-    parent agent that share the same LLM client and workspace but run in
+    parent agent that share its current model, effort and workspace but run in
     their own conversation context.
 
     Two tool-style methods are exposed:
@@ -19,12 +19,12 @@ class SubAgentTool:
     def __init__(
         self,
         workspace: str,
-        client: Any,
-        model: str,
+        model_config: Callable[[], Tuple[Any, Optional[str]]],
     ):
         self.workspace = workspace
-        self.client = client
-        self.model = model
+        # Returns the parent's current (ModelSpec, effort), read at spawn time
+        # so a model switch on the parent applies to later sub-agents.
+        self.model_config = model_config
 
         # Registry: subagent_id -> {"status", "result", "thread"}
         self._subagents: Dict[str, Dict[str, Any]] = {}
@@ -107,9 +107,9 @@ class SubAgentTool:
         from kairos.agent import Agent  # local import to avoid circular deps
 
         agent = Agent(self.workspace)
-        # Re-use parent's OpenAI client and model so keys / base-url are shared
-        agent.client = self.client
-        agent.model = self.model
+        # Use the parent's current model setup and reasoning effort
+        spec, effort = self.model_config()
+        agent._use_spec(spec, effort)
         # Subagents cannot spawn further subagents
         agent._is_subagent = True
         agent.subagent_tool = None  # prevent recursive spawning
