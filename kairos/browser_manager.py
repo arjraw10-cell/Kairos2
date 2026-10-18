@@ -118,7 +118,10 @@ class BrowserManager:
 
     DEFAULT_PROFILES_DIR = Path("~/.kairos/profiles").expanduser()
 
-    def __init__(self):
+    def __init__(self, headless: bool = False):
+        # Headed by default (the agent's interactive browser). headless=True is
+        # for batch callers that run many instances and never look at them.
+        self._headless = headless
         self._worker = _Worker()
         self._lock = threading.Lock()
         self._browser = None
@@ -220,10 +223,10 @@ class BrowserManager:
         if self._profile_dir:
             extra.append(f"--fingerprint={self._profile_seed(self._profile_dir)}")
         kwargs: Dict[str, Any] = {
-            "headless": False,
+            "headless": self._headless,
             "executable_path": ensure_binary(),
             "ignore_default_args": list(ignore_args),
-            "args": build_args(stealth_args=True, extra_args=extra, headless=False),
+            "args": build_args(stealth_args=True, extra_args=extra, headless=self._headless),
             "viewport": {"width": 1280, "height": 720},
         }
         if self._proxy:
