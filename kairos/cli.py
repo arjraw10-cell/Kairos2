@@ -4,6 +4,7 @@ import sys
 import os
 import io
 import base64
+import bisect
 from contextlib import contextmanager
 from typing import Optional, Callable, Dict
 
@@ -92,7 +93,10 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.styles import Style
-from prompt_toolkit.formatted_text import ANSI, HTML, FormattedText, to_formatted_text
+from prompt_toolkit.formatted_text import ANSI, HTML, FormattedText, fragment_list_to_text, to_formatted_text
+from prompt_toolkit.layout.processors import Processor, Transformation
+from prompt_toolkit.layout.utils import explode_text_fragments
+from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
 from prompt_toolkit.keys import Keys
 
@@ -208,6 +212,58 @@ class _StreamView:
         for line in lines[-max(3, console.height - 1):]:
             yield from line
             yield Segment.line()
+
+class _WordWrapProcessor(Processor):
+    """Wrap typed input at word boundaries.
+
+    prompt_toolkit wraps input by character, splitting words at the edge.
+    This pads the end of a row with spaces so a word that would cross the
+    edge starts on the next row; a word longer than a row still splits.
+    The prompt (its last line) takes the start of the first row; wrapped
+    rows and later lines have no prefix because the session is not multiline.
+    """
+
+    def __init__(self, prompt_width: Callable[[], int]):
+        self._prompt_width = prompt_width
+
+    def apply_transformation(self, ti):
+        width = ti.width
+        chars = explode_text_fragments(ti.fragments)
+        out = []
+        positions = []  # display index of each input character
+        x = self._prompt_width() if ti.lineno == 0 else 0
+        for i, fragment in enumerate(chars):
+            char = fragment[1]
+            if width > 0 and not char.isspace() and (i == 0 or chars[i - 1][1].isspace()):
+                word = 0
+                for later in chars[i:]:
+                    if later[1].isspace():
+                        break
+                    word += get_cwidth(later[1])
+                if 0 < x < width and x + word > width and word <= width:
+                    out.extend([("", " ")] * (width - x))
+                    x = 0
+            char_width = get_cwidth(char)
+            if x + char_width > width:
+                x = 0  # prompt_toolkit wraps here itself
+            positions.append(len(out))
+            out.append(fragment)
+            x += char_width
+
+        def source_to_display(i: int) -> int:
+            return positions[i] if i < len(positions) else len(out) + i - len(positions)
+
+        def display_to_source(i: int) -> int:
+            # A padding cell maps to the word after it.
+            return bisect.bisect_left(positions, i) + max(0, i - len(out))
+
+        return Transformation(out, source_to_display, display_to_source)
+
+
+def _last_line_width(message) -> int:
+    """Display width of the last line of a prompt message (the part on the input row)."""
+    return get_cwidth(fragment_list_to_text(to_formatted_text(message)).split("\n")[-1])
+
 
 # ---- Paste counters (incrementing numbers for display, reset per prompt) ----
 _image_counter = 0
@@ -543,6 +599,7 @@ class CLI:
             key_bindings=merge_key_bindings([_kb, wake_keys]),
             enable_open_in_editor=False,
             refresh_interval=1.0,  # sub-agent elapsed times in the toolbar
+            input_processors=[_WordWrapProcessor(lambda: _last_line_width(self._prompt_session.message))],
         )
 
         # Escape key listener (active during agent execution). The listener

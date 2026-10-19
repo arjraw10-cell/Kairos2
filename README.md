@@ -21,8 +21,9 @@ A minimal personal coding agent in Python.
 - **`/resume`**: Continue a saved conversation from a numbered picker; an interrupted turn is repaired and continued automatically
 - **Immediate Stop**: Esc and Ctrl+C stop the main agent and return to the prompt at once (stream closed, blocking commands killed, browser call cancelled), also while a message is still being sent or auto-compaction is summarizing (your message is kept); sub-agents keep running until `/stop`. Interrupted turns stay repairable so the next message continues them. Text typed while the agent works is pre-filled into the next prompt, never sent on its own.
 - **Bounded Tool Results**: Tool text is capped at 20,000 characters per result (beginning and end kept); images go to the model as vision input, not text
+- **Loop Guard**: when the same tool call (same name and arguments) fails 3 times in a row, its result carries a warning telling the model to change approach (and the CLI prints a notice); a 5th identical failure stops the run with `[Stopped: <tool> failed 5 times in a row ...]`
 - **Retries and Clean Errors**: Transient API failures (rate limits, overload, connection errors, 5xx) are retried twice with backoff; a final failure shows a short `API Error` summary without a traceback
-- **Clean CLI**: `rich` and `prompt_toolkit`; one-line banner, model and effort at the right of the prompt, sub-agents in the bottom toolbar, and Markdown tables with rounded boxes and alternating rows
+- **Clean CLI**: `rich` and `prompt_toolkit`; one-line banner, typed input and replies wrap at word boundaries, model and effort at the right of the prompt, sub-agents in the bottom toolbar, and Markdown tables with rounded boxes and alternating rows
 
 ## Installation
 
@@ -177,13 +178,13 @@ Tool results are capped before they are stored or sent: 20,000 characters per re
 | Tool | Description |
 |------|-------------|
 | `new_terminal(background)` | Create a terminal — `true` for a persistent shell, `false` for one-shot commands |
-| `execute_command(terminal_id, command, timeout?, is_background?, until?)` | Run a command. Blocking terminals require a timeout (capped at 20 s). Background terminals return at once and notify when the command finishes; `until` (a regex) also notifies once when an output line matches |
+| `execute_command(terminal_id, command, timeout?, is_background?, until?)` | Run a command. Blocking terminals wait up to `timeout` seconds (default and maximum 20). Background terminals return at once and notify when the command finishes; `until` (a regex) also notifies once when an output line matches |
 | `read_logs(terminal_id, tail?, start_line?, end_line?)` | Background output with a `[lines A-B of N]` header; the last 100 lines by default |
 | `stop_command(terminal_id)` | Kill the command running in a background terminal; the shell stays open |
 | `close_terminal(terminal_id)` | Close a terminal and release resources |
 | `get_terminal_info(terminal_id)` | Terminal status (type, closed, line count, pending commands) |
 
-Terminals start in the workspace. Blocking commands kill their whole process tree on timeout; a missing or invalid timeout is rejected before the command starts. Background commands get an empty stdin, so a command that reads input gets end-of-file instead of swallowing the shell's next lines. Background shells keep their state (folder, environment) between commands and keep the full output for `read_logs`; notifications include up to 12,000 characters of output.
+Terminals start in the workspace. Blocking commands kill their whole process tree on timeout; a missing timeout means 20 s, an invalid one is rejected before the command starts. Background commands get an empty stdin, so a command that reads input gets end-of-file instead of swallowing the shell's next lines. Background shells keep their state (folder, environment) between commands and keep the full output for `read_logs`; notifications include up to 12,000 characters of output.
 
 ### Sub-Agent Tools
 
@@ -332,7 +333,7 @@ python -m pytest tests                    # also runs the pytest-style gateway t
 python tests/run_gateway_tests.py         # dependency-light gateway checks
 ```
 
-The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 177 unittest tests, 18 skipped). No test calls a live model.
+The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 181 unittest tests, 18 skipped). No test calls a live model.
 
 ## License
 

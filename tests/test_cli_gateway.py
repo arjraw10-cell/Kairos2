@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 from rich.console import Console
 
 from kairos import main as kmain
-from kairos.cli import CLI, _StreamView
+from kairos.cli import CLI, _StreamView, _WordWrapProcessor
 from kairos.gateway_client import GatewayClient, GatewayError
 
 
@@ -155,6 +155,39 @@ LONG_TEXT = (
 ) * 4
 
 
+def _render_input(text, width, prompt, cursor=None):
+    """Draw a prompt input line with prompt_toolkit's own Window wrapping;
+    returns the non-empty screen rows and the cursor position."""
+    import asyncio
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.application.current import set_app
+    from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.document import Document
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.layout import BufferControl, Layout, Window
+    from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+    from prompt_toolkit.layout.screen import Screen, WritePosition
+    from prompt_toolkit.output import DummyOutput
+
+    async def draw():
+        buffer = Buffer(document=Document(text, len(text) if cursor is None else cursor))
+        window = Window(
+            BufferControl(buffer=buffer, input_processors=[_WordWrapProcessor(lambda: len(prompt))]),
+            wrap_lines=True,
+            get_line_prefix=lambda line, wrap: [("", prompt)] if line == 0 and wrap == 0 else [],
+        )
+        with create_pipe_input() as pipe:
+            app = Application(layout=Layout(window), output=DummyOutput(), input=pipe)
+            with set_app(app):
+                screen = Screen()
+                window.write_to_screen(screen, MouseHandlers(), WritePosition(0, 0, width, 10), "",
+                                       erase_bg=False, z_index=None)
+                rows = ["".join(screen.data_buffer[y][x].char for x in range(width)).rstrip() for y in range(10)]
+                return [row for row in rows if row], screen.get_cursor_position(window)
+
+    return asyncio.run(draw())
+
+
 class RenderingTests(unittest.TestCase):
     def test_events_render_like_the_offline_callbacks(self):
         cli, out = _recording_cli(width=100)
@@ -197,6 +230,19 @@ class RenderingTests(unittest.TestCase):
             rendered_words.update(line.strip("│╭╮╰╯─ ").split())
         for word in LONG_TEXT.split():
             self.assertIn(word, rendered_words, f"word was split: {word}")
+
+    def test_typed_input_wraps_at_word_boundaries(self):
+        text = "please refactor the terminal manager so that background commands wrap nicely"
+        rows, cursor = _render_input(text, width=30, prompt="kairos> ")
+        self.assertEqual(rows, ["kairos> please refactor the", "terminal manager so that",
+                                "background commands wrap", "nicely"])
+        self.assertEqual((cursor.x, cursor.y), (6, 3))  # cursor stays at the end of the text
+        # The cursor before "terminal" maps onto the start of the second row.
+        rows, cursor = _render_input(text, width=30, prompt="kairos> ", cursor=text.index("terminal"))
+        self.assertEqual((cursor.x, cursor.y), (0, 1))
+        # A word longer than a row still wraps by character.
+        rows, _ = _render_input("go " + "x" * 40, width=20, prompt="> ")
+        self.assertEqual(rows, ["> go " + "x" * 15, "x" * 20, "x" * 5])
 
     def test_stream_view_shows_the_latest_lines_while_streaming(self):
         console = Console(file=io.StringIO(), width=40, height=10, color_system=None)

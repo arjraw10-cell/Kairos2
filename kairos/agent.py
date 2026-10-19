@@ -40,6 +40,10 @@ class Agent:
     API_MAX_RETRIES = 2  # Two retries after the initial request.
     API_RETRY_BASE_DELAY = 1.0
     MAX_TOOL_RESULT_CHARS = Config.DEFAULT_MAX_TOOL_RESULT_CHARS
+    # The same tool call (name and arguments) failing this many times in a row
+    # gets a warning in its result, then stops the run.
+    REPEATED_FAILURE_WARN = 3
+    REPEATED_FAILURE_STOP = 5
 
     def __init__(self, workspace: str, setup: Optional[str] = None):
         # Model access: a provider.json setup (default_setup when omitted).
@@ -60,6 +64,10 @@ class Agent:
         self._active_stream_lock = threading.Lock()
         self._active_stream = None
         self._interrupted_pending = False
+        # (call key, consecutive failures) and the message that ends a run
+        # stuck on one failing call; both are reset when a run starts.
+        self._repeated_failure: Tuple[Optional[str], int] = (None, 0)
+        self._failure_stop_message: Optional[str] = None
         # Background events (sub-agents, terminals) owned by the Agent: those
         # that arrive during a run (injected before its next API step) and,
         # without a host callback, those waiting for the next run. Guarded by
@@ -303,7 +311,7 @@ class Agent:
             + ("When you finish your task, your final message (that has no tool calls) is returned as your result to the agent that started you.\n\n" if sub else
                "When you finish a task, the final message (that has no tool calls) will be showm to user as your message to them.\n\n") +
             "## Terminal Tools\n"
-            "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call requires a finite positive timeout; values above 20 seconds are capped at 20 seconds. Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately and the persistent shell stays alive. The full output remains available through read_logs.\n\n"
+            "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call waits up to `timeout` seconds (default and maximum 20). Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately and the persistent shell stays alive. The full output remains available through read_logs.\n\n"
             "## Background Work\n"
             + ("Background terminal commands report back with a `[Background notification]` message when a command finishes (or its `until` pattern matches), delivered before your next step while you are still working. Your final message ends your task; notifications that arrive after it reach you only if you are messaged again, so get the background results you need (read_logs has the output) before finishing.\n\n" if sub else
                "Background terminal commands and sub-agents report back with a `[Background notification]` message: when a command finishes (or its `until` pattern matches) and when a sub-agent finishes or fails. If your turn has already ended, you are woken with the notification. Never poll, sleep or wait for background work: start it, tell the user what is running, and end your turn or keep working on something else.\n\n") +
@@ -484,20 +492,14 @@ class Agent:
                         "properties": {
                             "terminal_id": {"type": "integer", "description": "Terminal ID from new_terminal"},
                             "command": {"type": "string", "description": "Shell command to execute"},
-                            "timeout": {"type": "number", "description": "Required finite positive timeout for blocking terminals; values above 20 seconds are capped at 20. Ignored for background terminals."},
+                            "timeout": {"type": "number", "description": "Blocking terminals: seconds to wait, default and maximum 20. Ignored for background terminals."},
                             "is_background": {"type": "boolean", "description": "Must match terminal type"},
                             "until": {"type": "string", "description": "Background terminals only: a regular expression. The first output line that matches notifies you once (with that line and recent output) while the command keeps running, e.g. 'Listening on' for a dev server."},
                         },
+                        # No oneOf/if-then here: providers that enforce the schema while
+                        # decoding (e.g. GLM on OpenRouter) emitted only the oneOf branch's
+                        # property and repeated that broken call hundreds of times.
                         "required": ["terminal_id", "command", "is_background"],
-                        "oneOf": [
-                            {
-                                "properties": {"is_background": {"const": True}},
-                            },
-                            {
-                                "properties": {"is_background": {"const": False}},
-                                "required": ["timeout"],
-                            },
-                        ],
                     },
                 },
             },
@@ -1751,6 +1753,38 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
         raise APIRequestError(self._format_api_error(last_exc)) from None
 
+    def _track_repeated_failure(self, name: str, args: Any, result: Dict[str, Any]) -> Optional[str]:
+        """Count identical failing calls in a row (any other call resets the
+        count). Returns a warning for the model at REPEATED_FAILURE_WARN; at
+        REPEATED_FAILURE_STOP it sets ``_failure_stop_message`` instead."""
+        if result.get("success", True):
+            self._repeated_failure = (None, 0)
+            return None
+        key = name + json.dumps(args, sort_keys=True, default=str)
+        last_key, count = self._repeated_failure
+        count = count + 1 if key == last_key else 1
+        self._repeated_failure = (key, count)
+        if count >= self.REPEATED_FAILURE_STOP:
+            error = str(result.get("error") or "")[:300]
+            self._failure_stop_message = (
+                f"[Stopped: {name} failed {count} times in a row with the same arguments. "
+                f"Last error: {error}]"
+            )
+            return None
+        if count == self.REPEATED_FAILURE_WARN:
+            message = (
+                f"{name} failed {count} times in a row with the same arguments; "
+                f"the run stops after {self.REPEATED_FAILURE_STOP - count} more identical failures."
+            )
+            if self.on_compact:
+                self.on_compact(message)
+            return (
+                f"This exact call has now failed {count} times in a row. Do not repeat it: "
+                "read the error, then fix the arguments or try a different approach. "
+                f"After {self.REPEATED_FAILURE_STOP - count} more identical failures the run is stopped."
+            )
+        return None
+
     def step(self, user_message: Optional[str] = None, image_url: Optional[str] = None) -> Tuple[Optional[str], List[Dict[str, Any]]]:
         # No stop check before the user message is appended: run() checks
         # just before, and a stop arriving now is caught before the request
@@ -1829,6 +1863,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                     pass  # like on_tool_result: observers must never break tool execution
             result_json = self._execute_tool(func_name, func_args)
             result_dict = json.loads(result_json)
+            warning = self._track_repeated_failure(func_name, func_args, result_dict)
+            if warning:
+                result_dict["warning"] = warning
+                result_json = json.dumps(result_dict, ensure_ascii=False)
             if self.on_tool_result:
                 try:
                     self.on_tool_result(func_name, result_dict, result_json)
@@ -1848,6 +1886,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 "name": func_name,
                 "content": text_content,
             })
+            if self._failure_stop_message:
+                break  # run() repairs the calls left without a result
             self._check_interrupt()
         if tool_image_data_urls:
             image_parts = [{"type": "text", "text": "[Screenshot captured \u2014 the image below shows the current browser page]"}]
@@ -1889,6 +1929,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             self._interrupted_pending = False
         max_empty_retries = 2
         empty_retry_count = 0
+        self._repeated_failure = (None, 0)
+        self._failure_stop_message = None
         try:
             while True:
                 # Check before every API step, not only before the initial
@@ -1913,6 +1955,13 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 response, tool_calls = self.step(current, image_url=_first_image)
                 _first_image = None
                 current = None
+                if self._failure_stop_message:
+                    # Stuck on one failing call: end the run with a reply in
+                    # history, so a resume does not continue the loop.
+                    _repair_trailing_tool_chain(self.conversation_history)
+                    self.conversation_history.append(
+                        {"role": "assistant", "content": self._failure_stop_message})
+                    return self._failure_stop_message
                 word_count = len(response.split()) if response else 0
                 if not tool_calls and word_count == 0:
                     # Empty response with no tool calls — retry

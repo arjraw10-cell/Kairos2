@@ -358,7 +358,9 @@ class TerminalManager:
         timeout: Optional[float],
     ) -> Tuple[Optional[float], Optional[str]]:
         if timeout is None:
-            return None, "A timeout is required for blocking terminals."
+            # A missing timeout gets the cap rather than an error: models that
+            # omit it otherwise retry the same failing call.
+            return TerminalManager.MAX_BLOCKING_TIMEOUT, None
         if isinstance(timeout, bool):
             return None, "Timeout must be a positive number of seconds."
         try:
@@ -484,7 +486,7 @@ class TerminalManager:
                 + "; end your turn or keep working instead of polling."
             )
 
-        # Blocking execution: timeout is required and capped at 20 seconds.
+        # Blocking execution: timeout defaults to, and is capped at, 20 seconds.
         effective_timeout, timeout_error = self._normalize_blocking_timeout(timeout)
         if timeout_error:
             # This is defensive; invalid blocking values are rejected above

@@ -24,12 +24,13 @@ def finished(events):
     return [e for e in events if e["kind"] == "terminal_finished"]
 
 
-def test_blocking_terminal_requires_timeout_and_caps_duration():
+def test_blocking_terminal_defaults_timeout_and_caps_duration():
     manager = TerminalManager()
     terminal_id = manager.create_terminal(background=False)
+    # A missing timeout defaults to the 20 s cap instead of failing the call.
     success, message = manager.execute_command(terminal_id, "echo ok")
-    assert success is False
-    assert "timeout is required" in message.lower()
+    assert success is True
+    assert "ok" in message
 
     success, message = manager.execute_command(terminal_id, "echo ok", timeout=21)
     assert success is True

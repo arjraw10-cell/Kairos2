@@ -259,6 +259,51 @@ class ToolErrorTests(ProviderConfigMixin, unittest.TestCase):
         missing = json.loads(agent._execute_tool("desktop_window_action", {"action": "activate_window"}))
         self.assertIn("Missing required argument 'pid' for tool desktop_window_action", missing["error"])
 
+    def test_repeated_identical_failures_warn_then_stop_the_run(self):
+        # Reproduction: glm-5.3-flash sent execute_command {"is_background": false}
+        # 301 times in one run.
+        bad = {"is_background": False}
+        agent = Agent(self.workspace)
+        notices = []
+        agent.on_compact = notices.append
+        agent.adapter = ScriptAdapter(*[
+            (lambda m, i=i: [tool_call(f"call_{i}", "execute_command", bad)]) for i in range(10)
+        ])
+        reply = agent.run("run the tests")
+        self.assertEqual(len(agent.adapter.requests), 5)
+        self.assertTrue(reply.startswith("[Stopped: execute_command failed 5 times in a row"), reply)
+        self.assertIn("terminal_id", reply)
+        results = [json.loads(m["content"]) for m in agent.conversation_history if m.get("role") == "tool"]
+        self.assertEqual(["warning" in r for r in results], [False, False, True, False, False])
+        self.assertIn("2 more identical failures", results[2]["warning"])
+        self.assertEqual(len(notices), 1)
+        # The stop is the run's reply, so a resume does not continue the loop.
+        self.assertEqual(agent.conversation_history[-1], {"role": "assistant", "content": reply})
+
+    def test_a_different_call_resets_the_failure_count(self):
+        bad = {"is_background": False}
+        steps = [bad, bad, {"terminal_id": 99, "command": "x", "is_background": False}, bad, bad, bad]
+        agent = Agent(self.workspace)
+        agent.adapter = ScriptAdapter(
+            *[(lambda m, i=i, a=a: [tool_call(f"call_{i}", "execute_command", a)]) for i, a in enumerate(steps)],
+            lambda m: [("text", "Gave up.")],
+        )
+        self.assertEqual(agent.run("go"), "Gave up.")
+        results = [json.loads(m["content"]) for m in agent.conversation_history if m.get("role") == "tool"]
+        # Calls 0-1 and 3-5 are separate streaks; only the 3rd of the second one warns.
+        self.assertEqual(["warning" in r for r in results], [False, False, False, False, False, True])
+
+    def test_stop_mid_batch_answers_every_call(self):
+        bad = {"is_background": False}
+        agent = Agent(self.workspace)
+        agent.adapter = ScriptAdapter(
+            *[(lambda m, i=i: [tool_call(f"call_{i}", "execute_command", bad)]) for i in range(4)],
+            lambda m: [("tool_call", 0, "call_a", "execute_command", json.dumps(bad)),
+                       ("tool_call", 1, "call_b", "list_skills", "{}")],
+        )
+        self.assertTrue(agent.run("go").startswith("[Stopped:"))
+        assert_valid_chains(self, agent.conversation_history)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -83,8 +83,8 @@ def terminal_test() -> None:
 
     manager = TerminalManager()
     terminal_id = manager.create_terminal(background=False)
-    success, message = manager.execute_command(terminal_id, "echo ok")
-    assert not success and "timeout is required" in message.lower()
+    success, message = manager.execute_command(terminal_id, "echo ok")  # no timeout: defaults to the 20 s cap
+    assert success and "ok" in message
     success, message = manager.execute_command(terminal_id, "echo ok", timeout=21)
     assert success and "ok" in message
     success, output = manager.execute_command(terminal_id, "echo ok", timeout=1)
