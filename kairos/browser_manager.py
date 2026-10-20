@@ -20,12 +20,15 @@ Design:
     at the element's box instead.
   - The browser launches lazily on the first browser tool call and relaunches
     if a human closes the window.
-  - Named profiles persist logins and pin a fingerprint seed per profile.
+  - Named profiles persist logins and pin a fingerprint seed per profile. They
+    are shared with Claude Code's cloakbrowser MCP (cloak-mcp): same root, same
+    seed file.
 """
 
 import asyncio
 import base64
 import json
+import os
 import random
 import re
 import threading
@@ -44,6 +47,23 @@ _BUFFER_LIMIT = 500
 # directory twice, so a second gateway conversation gets a clear error.
 _open_profiles: set = set()
 _open_profiles_lock = threading.Lock()
+
+
+def profiles_root() -> Path:
+    """cloak-mcp's profiles root, so Kairos and Claude Code share logins."""
+    return Path(os.environ.get("CLOAKBROWSER_PROFILES_DIR") or "~/.cloak-browser-mcp/profiles").expanduser()
+
+
+def _profile_in_use(profile_dir: Path) -> bool:
+    """A running Chromium holds <profile>/lockfile open exclusively (Windows). Launching
+    anyway hands off to that browser, which opens a stray window, then fails."""
+    try:
+        os.close(os.open(profile_dir / "lockfile", os.O_WRONLY))
+    except PermissionError:
+        return True
+    except OSError:
+        pass
+    return False
 
 
 class StaleRefError(Exception):
@@ -116,8 +136,6 @@ class _Worker:
 class BrowserManager:
     """One headed, humanized CloakBrowser session per agent."""
 
-    DEFAULT_PROFILES_DIR = Path("~/.kairos/profiles").expanduser()
-
     def __init__(self, headless: bool = False):
         # Headed by default (the agent's interactive browser). headless=True is
         # for batch callers that run many instances and never look at them.
@@ -176,7 +194,7 @@ class BrowserManager:
 
     def _profile_seed(self, profile_dir: Path) -> int:
         """Each profile keeps one fingerprint seed so a logged-in identity is always the same device."""
-        meta = profile_dir / ".kairos-browser.json"
+        meta = profile_dir / ".cloak-mcp.json"  # cloak-mcp's file, so both tools present the same device
         try:
             seed = json.loads(meta.read_text(encoding="utf-8"))["seed"]
             if isinstance(seed, int):
@@ -185,7 +203,7 @@ class BrowserManager:
             pass
         seed = random.randint(1, 2**31 - 1)
         profile_dir.mkdir(parents=True, exist_ok=True)
-        meta.write_text(json.dumps({"seed": seed}), encoding="utf-8")
+        meta.write_text(json.dumps({"seed": seed}, indent=2), encoding="utf-8")
         return seed
 
     def _close_later(self, opened) -> None:
@@ -244,9 +262,15 @@ class BrowserManager:
         browser = ctx = None
         try:
             if key:
+                in_use = (f"Profile '{self._profile_dir.name}' is in use by another browser (such as Claude Code's "
+                          "cloakbrowser MCP). Close it there, or use a different profile.")
+                if _profile_in_use(self._profile_dir):
+                    raise RuntimeError(in_use)
                 try:
                     ctx = await self._launch(pw.chromium.launch_persistent_context(str(self._profile_dir), **kwargs))
                 except Exception as e:
+                    if "existing browser session" in str(e):
+                        raise RuntimeError(in_use)
                     raise RuntimeError(
                         f"Could not open profile '{self._profile_dir.name}' (it may be open in another "
                         f"browser window): {str(e).splitlines()[0]}"
@@ -388,7 +412,7 @@ class BrowserManager:
     def profile(self, action: str, name: Optional[str] = None, proxy: Optional[str] = None) -> str:
         """list | use <name> | ephemeral. use/ephemeral relaunch the browser."""
         if action == "list":
-            root = self.DEFAULT_PROFILES_DIR
+            root = profiles_root()
             names = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
             active = self.profile_name or "(ephemeral)"
             listing = "\n".join(f"  {n}" for n in names) or "  (none)"
@@ -398,7 +422,7 @@ class BrowserManager:
         if action == "use":
             if not name or not re.fullmatch(r"[\w-]+", name):
                 raise ValueError("use needs a profile name of letters, digits, _ or -")
-            target = self.DEFAULT_PROFILES_DIR / name
+            target = profiles_root() / name
         else:
             target = None
 

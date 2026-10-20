@@ -294,7 +294,7 @@ class Agent:
         "4. If an action opens an alert/confirm/prompt, the result says so; answer it with `browser_handle_dialog` before anything else.\n"
         "5. `browser_search_page` finds text when a snapshot is truncated; `browser_evaluate` reads anything else.\n"
         "6. `browser_screenshot` is for visual checks only; prefer snapshots for reading and acting.\n"
-        "7. Use `browser_profile use <name>` only when a task needs a login (profiles keep cookies and a fixed fingerprint); return with `browser_profile ephemeral`.\n\n"
+        "7. Use `browser_profile use <name>` only when a task needs a login (profiles keep cookies and a fixed fingerprint, and are shared with the user's Claude Code browser, so a profile open there cannot be opened here); return with `browser_profile ephemeral`.\n\n"
     )
 
     def _setup_system_prompt(self):
@@ -493,13 +493,15 @@ class Agent:
                             "terminal_id": {"type": "integer", "description": "Terminal ID from new_terminal"},
                             "command": {"type": "string", "description": "Shell command to execute"},
                             "timeout": {"type": "number", "description": "Blocking terminals: seconds to wait, default and maximum 20. Ignored for background terminals."},
-                            "is_background": {"type": "boolean", "description": "Must match terminal type"},
                             "until": {"type": "string", "description": "Background terminals only: a regular expression. The first output line that matches notifies you once (with that line and recent output) while the command keeps running, e.g. 'Listening on' for a dev server."},
                         },
-                        # No oneOf/if-then here: providers that enforce the schema while
-                        # decoding (e.g. GLM on OpenRouter) emitted only the oneOf branch's
-                        # property and repeated that broken call hundreds of times.
-                        "required": ["terminal_id", "command", "is_background"],
+                        # No oneOf/if-then here: with it, GLM-5.3-flash on OpenRouter's
+                        # Wafer host (schema-constrained decoding) produced only
+                        # {"is_background": false, "is_background": false, ...} for 110k
+                        # characters, in every call. The terminal ID already says whether it
+                        # is a background terminal, so is_background is not asked for either
+                        # (an is_background argument from older histories is still checked).
+                        "required": ["terminal_id", "command"],
                     },
                 },
             },
@@ -766,7 +768,7 @@ class Agent:
             }},
             {"type": "function", "function": {
                 "name": "browser_profile",
-                "description": "Persistent profiles keep logins, cookies and a fixed fingerprint. list shows them; use relaunches the browser in a profile (created if new); ephemeral relaunches with a throwaway session. proxy applies to the relaunch.",
+                "description": "Persistent profiles keep logins, cookies and a fixed fingerprint, shared with Claude Code's cloakbrowser MCP (one browser per profile at a time). list shows them; use relaunches the browser in a profile (created if new); ephemeral relaunches with a throwaway session. proxy applies to the relaunch.",
                 "parameters": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["list", "use", "ephemeral"]},
                     "name": {"type": "string"}, "proxy": {"type": "string"},

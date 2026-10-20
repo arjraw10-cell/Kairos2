@@ -1,6 +1,7 @@
 """Provider layer: config resolution, wire-format translation, streaming
 normalization, key rotation and Agent model selection. No network."""
 import json
+from dataclasses import replace
 import tempfile
 import threading
 import unittest
@@ -146,8 +147,9 @@ class KeyPoolTests(unittest.TestCase):
             provider_base.KeyPool([]).call(lambda key: key)
 
 
-def chunk(content=None, tool_calls=None, usage=None, choices=True):
-    delta = NS(content=content, tool_calls=tool_calls)
+def chunk(content=None, tool_calls=None, usage=None, choices=True, reasoning_details=None):
+    delta = NS(content=content, tool_calls=tool_calls,
+               model_extra={"reasoning_details": reasoning_details} if reasoning_details else {})
     return NS(choices=[NS(delta=delta)] if choices else [], usage=usage)
 
 
@@ -188,6 +190,32 @@ class CompletionsTests(unittest.TestCase):
             ("tool_call", 0, "call_1", "read", '{"pa'), ("tool_call", 0, "", "", 'th": "a"}'),
             ("usage", 10, 5, 0),
         ])
+
+    def test_reasoning_details_are_joined_and_sent_back_to_the_same_model(self):
+        # Shape seen live from z-ai/glm-5.3-flash on OpenRouter: one piece per token.
+        piece = lambda text, **extra: {"type": "reasoning.text", "text": text, "format": "unknown", "index": 0, **extra}
+        chunks = [
+            chunk(reasoning_details=[piece("Let")]), chunk(reasoning_details=[piece("'s plan")]),
+            chunk(reasoning_details=[piece(".", signature="sig")]),
+            chunk(reasoning_details=[{"type": "reasoning.encrypted", "data": "xyz", "index": 1}]),
+            chunk(tool_calls=[tc(0, "call_1", "read", "{}")]),
+        ]
+        events = list(CompletionsAdapter.events(chunks, "z-ai/glm-5.3-flash"))
+        saved = {"model": "z-ai/glm-5.3-flash", "details": [
+            {"type": "reasoning.text", "text": "Let's plan.", "format": "unknown", "index": 0, "signature": "sig"},
+            {"type": "reasoning.encrypted", "data": "xyz", "index": 1},
+        ]}
+        self.assertEqual(events[-1], ("message_extra", "_reasoning_details", saved))
+        history = [{"role": "user", "content": "go"},
+                   {"role": "assistant", "content": None, "_reasoning_details": saved, "tool_calls": []}]
+        same = CompletionsAdapter(providers.resolve("glm"))
+        same.spec = replace(same.spec, model="z-ai/glm-5.3-flash")
+        self.assertEqual(same.request_kwargs(history, None, None)["messages"][1]["reasoning_details"], saved["details"])
+        # Another model never receives it, and the private key is never sent.
+        other = CompletionsAdapter(providers.resolve("glm")).request_kwargs(history, None, None)["messages"][1]
+        self.assertNotIn("reasoning_details", other)
+        self.assertNotIn("_reasoning_details", other)
+        self.assertFalse(any(e[0] == "message_extra" for e in CompletionsAdapter.events([chunk(content="hi")])))
 
     def test_rate_limited_key_rotates(self):
         adapter = CompletionsAdapter(providers.resolve("glm"))

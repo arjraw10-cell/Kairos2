@@ -5,7 +5,7 @@ A minimal personal coding agent in Python.
 ## Features
 
 - **52 Tools**: File operations, terminals, search, web search, git, background sub-agents, skills, a browser automation suite (including console/network inspection), and optional native desktop automation through Cua Driver
-- **Direct Model Access**: Talks to OpenAI (Responses API), OpenRouter or any Chat Completions server, and Anthropic (Messages API) directly; providers, named model setups and API keys live in `provider.json`. Several keys per provider rotate on 401/402/429 with a 60-second cooldown. Model and reasoning effort are chosen per conversation with `/model` and `/effort`.
+- **Direct Model Access**: Talks to OpenAI (Responses API), OpenRouter or any Chat Completions server, and Anthropic (Messages API) directly; providers, named model setups and API keys live in `provider.json`. Several keys per provider rotate on 401/402/429 with a 60-second cooldown. Model and reasoning effort are chosen per conversation with `/model` and `/effort`. A model's own reasoning (Anthropic thinking blocks, OpenRouter `reasoning_details`) is sent back to it on the next request, so it keeps its train of thought across tool calls.
 - **Gateway**: One gateway process owns conversations (SQLite), Agents, terminals and the browser. The CLI is a client of it; `--offline` runs the agent inside the CLI instead. It refuses cross-site browser requests, and only one gateway can use a data folder at a time.
 - **Background Work, No Polling**: Sub-agents always run in the background, and background terminal commands notify when they finish or when their output matches a pattern. Results arrive as notifications; if the agent is idle, it is woken to handle them, and the wake turn prints above your prompt without disturbing what you are typing.
 - **Web Search**: Tavily search with a short answer and compact results; when it is unavailable the agent is told to use the browser
@@ -178,7 +178,7 @@ Tool results are capped before they are stored or sent: 20,000 characters per re
 | Tool | Description |
 |------|-------------|
 | `new_terminal(background)` | Create a terminal — `true` for a persistent shell, `false` for one-shot commands |
-| `execute_command(terminal_id, command, timeout?, is_background?, until?)` | Run a command. Blocking terminals wait up to `timeout` seconds (default and maximum 20). Background terminals return at once and notify when the command finishes; `until` (a regex) also notifies once when an output line matches |
+| `execute_command(terminal_id, command, timeout?, until?)` | Run a command. Blocking terminals wait up to `timeout` seconds (default and maximum 20). Background terminals return at once and notify when the command finishes; `until` (a regex) also notifies once when an output line matches |
 | `read_logs(terminal_id, tail?, start_line?, end_line?)` | Background output with a `[lines A-B of N]` header; the last 100 lines by default |
 | `stop_command(terminal_id)` | Kill the command running in a background terminal; the shell stays open |
 | `close_terminal(terminal_id)` | Close a terminal and release resources |
@@ -241,7 +241,7 @@ Browser features:
 - **Dialogs**: actions race against `dialog` events. An alert/confirm/prompt is reported to the agent and answered with `browser_handle_dialog`, instead of hanging the call or being silently dismissed.
 - **Stale refs**: a ref that no longer exists fails immediately with a fresh snapshot.
 - **Lazy launch and recovery**: the browser starts on the first call, a failed or cancelled launch (Esc, timeout) releases its profile and can be retried, and closing the window by hand makes the next call relaunch.
-- **Persistent profiles**: `browser_profile use <name>` keeps cookies and logins under `~/.kairos/profiles/<name>` and pins a fingerprint seed in `.kairos-browser.json`, so a logged-in identity always presents the same device. A profile can be open in only one browser at a time; a second conversation gets a clear error.
+- **Persistent profiles**: `browser_profile use <name>` keeps cookies and logins under `~/.cloak-browser-mcp/profiles/<name>` (or `CLOAKBROWSER_PROFILES_DIR`), the profiles of Claude Code's cloakbrowser MCP, and pins a fingerprint seed in that MCP's `.cloak-mcp.json`, so a logged-in identity always presents the same device in both tools. A profile can be open in only one browser at a time; a second conversation, or a profile already open in the MCP, gets a clear error.
 - **New tabs**: when an action opens a tab, Kairos switches to it and says so.
 - **Console and network**: network requests are captured from tab creation with status, timing and headers. CloakBrowser suppresses the live console stream (enabling the CDP Runtime domain is a bot signal), so `browser_console` briefly enables it on demand, which makes Chrome replay the current page's console messages and uncaught exceptions.
 
@@ -333,7 +333,7 @@ python -m pytest tests                    # also runs the pytest-style gateway t
 python tests/run_gateway_tests.py         # dependency-light gateway checks
 ```
 
-The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 181 unittest tests, 18 skipped). No test calls a live model.
+The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 184 unittest tests, 18 skipped). No test calls a live model.
 
 ## License
 

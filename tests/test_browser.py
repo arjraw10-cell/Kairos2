@@ -36,12 +36,20 @@ class BrowserManagerTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        import tempfile
+        from unittest import mock
+
         from kairos.browser_manager import BrowserManager
+        cls.root = tempfile.TemporaryDirectory()  # never the real (shared with Claude Code) profiles
+        cls.env = mock.patch.dict(os.environ, {"CLOAKBROWSER_PROFILES_DIR": cls.root.name})
+        cls.env.start()
         cls.bm = BrowserManager()
 
     @classmethod
     def tearDownClass(cls):
         cls.bm.close()
+        cls.env.stop()
+        cls.root.cleanup()
 
     def fresh_page(self) -> str:
         return self.bm.navigate(PAGE)
@@ -174,16 +182,15 @@ class BrowserManagerTests(unittest.TestCase):
     def test_18_profiles_pin_seed_and_refuse_double_open(self):
         import json
         import tempfile
+        from unittest import mock
 
         from kairos.browser_manager import BrowserManager
 
-        with tempfile.TemporaryDirectory() as root:
-            self.bm.DEFAULT_PROFILES_DIR = Path(root)
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {"CLOAKBROWSER_PROFILES_DIR": root}):
             other = BrowserManager()
-            other.DEFAULT_PROFILES_DIR = Path(root)
             try:
                 self.assertIn("Relaunched in profile 'demo'", self.bm.profile("use", "demo"))
-                seed = json.loads((Path(root) / "demo" / ".kairos-browser.json").read_text())["seed"]
+                seed = json.loads((Path(root) / "demo" / ".cloak-mcp.json").read_text())["seed"]
                 self.assertIsInstance(seed, int)
                 with self.assertRaises(RuntimeError) as cm:
                     other.profile("use", "demo")
@@ -191,7 +198,6 @@ class BrowserManagerTests(unittest.TestCase):
                 self.assertIn("ephemeral", self.bm.profile("ephemeral"))
             finally:
                 other.close()
-                del self.bm.DEFAULT_PROFILES_DIR
 
 
 class _FakeContext:
@@ -228,18 +234,26 @@ class _FakeChromium:
 class BrowserManagerUnitTests(unittest.TestCase):
     """BrowserManager logic that needs no real browser."""
 
+    def setUp(self):
+        import tempfile
+        from unittest import mock
+
+        # Never touch the real (shared with Claude Code) profiles.
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        self.root = Path(root.name)
+        env = mock.patch.dict(os.environ, {"CLOAKBROWSER_PROFILES_DIR": root.name})
+        env.start()
+        self.addCleanup(env.stop)
+
     def manager(self, delay=0.0):
         import asyncio
-        import tempfile
         import threading
         import types
 
         from kairos.browser_manager import BrowserManager
 
         bm = BrowserManager()
-        root = tempfile.TemporaryDirectory()
-        self.addCleanup(root.cleanup)
-        bm.DEFAULT_PROFILES_DIR = Path(root.name)
         fake_pw = types.SimpleNamespace(chromium=_FakeChromium(delay))
         # build_args, ensure_binary, IGNORE_DEFAULT_ARGS, patch_context_async, resolve_config
         bm._cloak = lambda: (lambda **k: [], lambda: "chrome.exe", [], lambda *a: None, lambda *a: None)
@@ -277,7 +291,6 @@ class BrowserManagerUnitTests(unittest.TestCase):
         self.assertTrue(chromium.launched[0].closed, "a browser that finished launching after Esc is closed")
 
         other, _ = self.manager()  # another conversation in the same process
-        other.DEFAULT_PROFILES_DIR = bm.DEFAULT_PROFILES_DIR
         self.assertIn("Relaunched in profile 'work'", other.profile("use", "work"))
         other._reset()
 
@@ -298,6 +311,39 @@ class BrowserManagerUnitTests(unittest.TestCase):
         while not chromium.launched[0].closed and time.time() < deadline:
             time.sleep(0.02)
         self.assertTrue(chromium.launched[0].closed)
+
+    def test_profiles_are_shared_with_cloak_mcp(self):
+        import json
+        from unittest import mock
+
+        from kairos.browser_manager import BrowserManager, profiles_root
+
+        self.assertEqual(profiles_root(), self.root)
+        with mock.patch.dict(os.environ, {"CLOAKBROWSER_PROFILES_DIR": ""}):
+            self.assertEqual(profiles_root(), Path.home() / ".cloak-browser-mcp" / "profiles")
+        bm = BrowserManager()
+        existing = self.root / "work"
+        existing.mkdir()
+        (existing / ".cloak-mcp.json").write_text(json.dumps({"seed": 424242}, indent=2))
+        self.assertEqual(bm._profile_seed(existing), 424242)  # a profile cloak-mcp made keeps its device
+        seed = bm._profile_seed(self.root / "new")
+        self.assertEqual(json.loads((self.root / "new" / ".cloak-mcp.json").read_text()), {"seed": seed})
+
+    def test_profile_in_use_by_another_browser_fails_clearly_without_launching(self):
+        from unittest import mock
+
+        from kairos import browser_manager as bmod
+
+        self.assertFalse(bmod._profile_in_use(self.root))  # no lockfile: free, and none is created
+        self.assertFalse((self.root / "lockfile").exists())
+        bm, chromium = self.manager()
+        with mock.patch.object(bmod, "_profile_in_use", return_value=True):
+            with self.assertRaises(RuntimeError) as cm:
+                bm.profile("use", "work")
+        self.assertIn("in use by another browser", str(cm.exception))
+        self.assertEqual(chromium.launched, [])
+        self.assertEqual(bmod._open_profiles, set())
+        self.assertFalse(bm.is_open)
 
     def test_screenshots_in_the_same_second_get_different_files(self):
         import tempfile
