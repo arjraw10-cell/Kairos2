@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+from ..resume import strip_date_note
+
 
 class SessionManager:
     """Manage chat sessions isolated by their absolute workspace path.
@@ -202,9 +204,9 @@ class SessionManager:
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text":
                             parts.append(block.get("text", ""))
-                    return " ".join(parts)[:20]
+                    return strip_date_note(" ".join(parts))[:20]
                 elif isinstance(content, str):
-                    return content[:20]
+                    return strip_date_note(content)[:20]
         return ""
 
     def save_chat(self, conversation_history: List[Dict[str, Any]]):

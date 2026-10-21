@@ -6,11 +6,13 @@ import threading
 import time
 import types
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
 from kairos import providers
 from kairos.agent import SUBAGENT_TOOL_NAMES, Agent
+from kairos.resume import date_note
 from kairos.terminal_manager import TerminalManager
 from kairos.tools.subagent import SubAgentTool, _SubAgent
 from kairos.wake import NOTIFICATION_PREFIX
@@ -210,8 +212,8 @@ def bg_event(i):
 
 class AgentBackgroundTests(ProviderConfigMixin, unittest.TestCase):
     def test_subagent_tools_excluded_from_child_schema(self):
-        parent = {t["function"]["name"] for t in Agent._get_tool_schema(types.SimpleNamespace(_is_subagent=False))}
-        child = {t["function"]["name"] for t in Agent._get_tool_schema(types.SimpleNamespace(_is_subagent=True))}
+        parent = {t["function"]["name"] for t in Agent._get_tool_schema(types.SimpleNamespace(_is_subagent=False), all_groups=True)}
+        child = {t["function"]["name"] for t in Agent._get_tool_schema(types.SimpleNamespace(_is_subagent=True), all_groups=True)}
         self.assertTrue(SUBAGENT_TOOL_NAMES <= parent)
         self.assertFalse(SUBAGENT_TOOL_NAMES & child)
         self.assertNotIn("get_subagent_result", parent)
@@ -222,9 +224,9 @@ class AgentBackgroundTests(ProviderConfigMixin, unittest.TestCase):
         child = tool._create_sub_agent(_SubAgent(id="x", prompt="p"))
         for absent in ("## Browser Tools", "browser_", "browse the web", "when a sub-agent finishes"):
             self.assertNotIn(absent, child.system_prompt)
-        self.assertIn("## Native Desktop Tools", child.system_prompt)
+        self.assertIn('`enable_tools` with group "desktop"', child.system_prompt)
         self.assertEqual(child.conversation_history, [{"role": "system", "content": child.system_prompt}])
-        self.assertIn("## Browser Tools", Agent(self.workspace).system_prompt)
+        self.assertIn('"browser" (a stealth', Agent(self.workspace).system_prompt)
 
     def test_child_cannot_call_subagent_tools_directly(self):
         agent = Agent(self.workspace)
@@ -267,7 +269,7 @@ class AgentBackgroundTests(ProviderConfigMixin, unittest.TestCase):
         agent.adapter = ScriptAdapter(lambda m: [("text", "Noted both results.")])
         agent.run("hello")
         messages = agent.adapter.requests[0]
-        self.assertEqual(messages[-2], {"role": "user", "content": "hello"})
+        self.assertEqual(messages[-2], {"role": "user", "content": "hello" + date_note(date.today())})
         self.assertIn("done 1", messages[-1]["content"])
         self.assertIn("done 2", messages[-1]["content"])
 

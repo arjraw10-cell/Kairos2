@@ -98,7 +98,7 @@ class WebSearchWiringTests(unittest.TestCase):
         agent.web_search_tool = WebSearchTool()
         for is_subagent in (False, True):
             agent._is_subagent = is_subagent
-            names = [tool["function"]["name"] for tool in agent._get_tool_schema()]
+            names = [tool["function"]["name"] for tool in agent._get_tool_schema(all_groups=True)]
             self.assertIn("web_search", names)
         self.assertEqual(Agent._tool_summary("web_search", {"query": "news"}), "web search: 'news'")
 

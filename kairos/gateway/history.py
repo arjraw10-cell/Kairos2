@@ -5,6 +5,8 @@ import copy
 import json
 from typing import Any
 
+from ..resume import strip_date_note
+
 
 def is_screenshot_injection(message: dict[str, Any]) -> bool:
     content = message.get("content", "")
@@ -169,5 +171,8 @@ def visible_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if is_screenshot_injection(message) or message.get("tool_calls"):
             continue
-        result.append({"role": role, "content": message.get("content") or ""})
+        content = message.get("content") or ""
+        if role == "user" and isinstance(content, str):
+            content = strip_date_note(content)
+        result.append({"role": role, "content": content})
     return result

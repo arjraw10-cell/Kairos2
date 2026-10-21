@@ -380,7 +380,7 @@ class ToolSchemaTests(unittest.TestCase):
         from kairos.agent import Agent
         from kairos.browser_manager import BrowserManager
 
-        tools = Agent._get_tool_schema(types.SimpleNamespace(_is_subagent=False))
+        tools = Agent._get_tool_schema(types.SimpleNamespace(_is_subagent=False), all_groups=True)
         browser = {t["function"]["name"]: t["function"]["parameters"] for t in tools
                    if t["function"]["name"].startswith("browser_")}
         self.assertEqual(len(browser), 20)
@@ -394,7 +394,7 @@ class ToolSchemaTests(unittest.TestCase):
 
         from kairos.agent import Agent
 
-        tools = Agent._get_tool_schema(types.SimpleNamespace(_is_subagent=True))
+        tools = Agent._get_tool_schema(types.SimpleNamespace(_is_subagent=True), all_groups=True)
         self.assertFalse([t for t in tools if t["function"]["name"].startswith("browser_")])
 
 

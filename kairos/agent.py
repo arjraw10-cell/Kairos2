@@ -1,9 +1,13 @@
 import json
 import random
+import platform
+import re
+import sys
 import threading
 import time
 import uuid
 from collections import deque
+from datetime import date
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import httpx
@@ -24,8 +28,11 @@ from .tools import (
     DesktopLaunchAppTool, DesktopClickTool, DesktopTypeTool, DesktopPressKeyTool,
     DesktopHotkeyTool, DesktopScrollTool, DesktopMoveTool, DesktopDragTool, DesktopWindowActionTool,
 )
+from .tools.base import ToolResult
 from .tools.skills import SkillManager
-from .resume import _repair_trailing_tool_chain, repair_tool_chains
+from .resume import (
+    DATE_NOTE, _is_synthetic_user_message, _repair_trailing_tool_chain, date_note, repair_tool_chains,
+)
 from .wake import format_notifications
 
 # Sub-agents never get these (schema and dispatch both refuse them).
@@ -40,6 +47,10 @@ TRUNCATED_CALL_ERROR = (
 )
 # Schema types whose values a model may send as strings ("20", "false", '["a"]').
 _JSON_TYPES = {"integer": int, "number": (int, float), "boolean": bool, "array": list, "object": dict}
+# Optional tool groups (name prefix of their tools). They are off until
+# enable_tools (or a direct call to one of their tools) turns them on, so a
+# request does not carry ~33 browser/desktop definitions it rarely needs.
+TOOL_GROUPS = {"browser": "browser_", "desktop": "desktop_"}
 
 
 class APIRequestError(Exception):
@@ -172,6 +183,9 @@ class Agent:
 
         # Skills
         self.skill_manager = SkillManager(str(self.cwd / "skills"))
+
+        # TOOL_GROUPS turned on in this conversation (see _enabled_tool_groups).
+        self.enabled_tool_groups: set = set()
 
         # Callbacks wired from CLI
         self.on_tool_call: Optional[Callable[[str, dict], None]] = None
@@ -311,10 +325,24 @@ class Agent:
         "7. Use `browser_profile use <name>` only when a task needs a login (profiles keep cookies and a fixed fingerprint, and are shared with the user's Claude Code browser, so a profile open there cannot be opened here); return with `browser_profile ephemeral`.\n\n"
     )
 
+    DESKTOP_PROMPT = (
+        "## Native Desktop Tools\n"
+        "Native desktop tools use Cua Driver. Start with `desktop_doctor`, then `desktop_list_windows`, and use `desktop_window_state(pid, window_id)` before every interaction. Prefer `element_index` values from the latest accessibility snapshot for click/type/key/scroll actions. Use x/y coordinates only as a fallback when the accessibility tree is missing, degraded, stale, or the action did not land; never infer coordinates from the tree without checking the matching screenshot. Re-snapshot after every state-changing action to verify the result. Desktop state is session-scoped and available to sub-agents.\n\n"
+    )
+
     def _setup_system_prompt(self):
         # A sub-agent has no browser and no sub-agent tools, and its final
         # message goes to the parent: its prompt describes only what it has.
         sub = self._is_subagent
+        # Terminals use cmd.exe on Windows (blocking: shell=True; background:
+        # cmd /Q /k); flash models otherwise write bash there.
+        if sys.platform == "win32":
+            shell = (
+                "terminals run cmd.exe, not bash. Use cmd syntax (`dir`, `type`, `copy`, `del`, `set NAME=value`, `%NAME%`, `cd /d`), "
+                "not `ls`, `cat`, `rm`, `export` or `$NAME`; for PowerShell, run `powershell -NoProfile -Command \"...\"`."
+            )
+        else:
+            shell = "background terminals run bash; blocking terminals run /bin/sh."
         base = (
             "You are Kairos, a coding agent. You operate in a filesystem and can read, write, and edit files, execute terminal commands, search codebases, "
             + ("and inspect version control.\n\n" if sub else "inspect version control, and browse the web.\n\n") +
@@ -332,10 +360,15 @@ class Agent:
             f"## Tool Result Limits\nText returned by tools is capped before it is added to conversation history: up to {self.max_tool_result_chars:,} characters per tool result. Oversized results keep the beginning and end around a truncation marker, and the full output is saved to a file named in the marker: read it with offset/limit or search it instead of re-running the command. Use narrower commands or queries; for complete background-terminal output, use read_logs.\n\n"
             "## Web Search\n"
             + ("Use `web_search` for quick facts and current events. You have no browser: if web_search is unavailable, say so in your result.\n\n" if sub else
-               "Use `web_search` for quick facts and current events. Use the browser for pages that need interaction, or when web_search is unavailable.\n\n"
-               + self.BROWSER_PROMPT) +
-            "## Native Desktop Tools\n"
-            "Native desktop tools use Cua Driver. Start with `desktop_doctor`, then `desktop_list_windows`, and use `desktop_window_state(pid, window_id)` before every interaction. Prefer `element_index` values from the latest accessibility snapshot for click/type/key/scroll actions. Use x/y coordinates only as a fallback when the accessibility tree is missing, degraded, stale, or the action did not land; never infer coordinates from the tree without checking the matching screenshot. Re-snapshot after every state-changing action to verify the result. Desktop state is session-scoped and available to sub-agents.\n\n"
+               "Use `web_search` for quick facts and current events. Use the browser for pages that need interaction, or when web_search is unavailable.\n\n") +
+            "## Optional Tools\n"
+            + ("Desktop tools (control native desktop apps through their accessibility tree and screenshots) are off until you call `enable_tools` with group \"desktop\"; its result explains how to use them.\n\n" if sub else
+               "Two tool groups are off until you call `enable_tools`, whose result explains how to use them: \"browser\" (a stealth, headed web browser for pages that need interaction or logins, and sites that block scripts) and \"desktop\" (control native desktop apps through their accessibility tree and screenshots).\n\n") +
+            "## Environment\n"
+            f"- OS: {platform.system()} {platform.release()}\n"
+            f"- Shell: {shell}\n"
+            "- Terminals start in your workspace (below).\n"
+            "- A user message ends with [Current date: YYYY-MM-DD (weekday)] when the date has changed since you last saw it.\n\n"
             f"## Workspace\nYour current workspace is: {self.cwd}"
         )
 
@@ -376,7 +409,9 @@ class Agent:
         self.system_prompt = base
         self.conversation_history = [{"role": "system", "content": self.system_prompt}]
 
-    def _get_tool_schema(self) -> List[Dict[str, Any]]:
+    def _get_tool_schema(self, all_groups: bool = False) -> List[Dict[str, Any]]:
+        """Function tools for the next request: TOOL_GROUPS that are off are
+        left out unless ``all_groups``."""
         tools = [
             {
                 "type": "function",
@@ -957,11 +992,67 @@ class Agent:
                 },
             },
         ]
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "enable_tools",
+                "description": (
+                    "Turn on an optional tool group for the rest of the session; returns how to use it. "
+                    + ("desktop: native desktop apps." if self._is_subagent else
+                       "browser: a headed web browser for pages that need interaction or logins. desktop: native desktop apps.")
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "group": {"type": "string", "enum": ["desktop"] if self._is_subagent else list(TOOL_GROUPS),
+                                  "description": "Tool group to turn on"},
+                    },
+                    "required": ["group"],
+                },
+            },
+        })
 
         if self._is_subagent:
             tools = [t for t in tools if t["function"]["name"] not in SUBAGENT_TOOL_NAMES
                      and not t["function"]["name"].startswith("browser_")]
+        if not all_groups:
+            enabled = self._enabled_tool_groups()
+            tools = [t for t in tools if _tool_group(t["function"]["name"]) in (None, *enabled)]
         return tools
+
+    def _available_tool_groups(self) -> List[str]:
+        return ["desktop"] if self._is_subagent else list(TOOL_GROUPS)
+
+    def _enabled_tool_groups(self) -> set:
+        """Enabled TOOL_GROUPS: those in ``enabled_tool_groups`` plus any whose
+        tools or enable_tools calls appear in history (a resumed or reloaded
+        conversation) or that a compaction summary lists. Groups only turn on."""
+        for message in self.conversation_history:
+            role = message.get("role")
+            if role == "assistant":
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function") or {}
+                    group = _tool_group(function.get("name") or "")
+                    if function.get("name") == "enable_tools":
+                        try:
+                            group = json.loads(function.get("arguments") or "{}").get("group")
+                        except (ValueError, AttributeError):
+                            group = None
+                    if group in TOOL_GROUPS:
+                        self.enabled_tool_groups.add(group)
+            elif role == "user" and self._is_compaction_summary(message):
+                match = re.search(r"^\[Enabled tool groups: (.*)\]$", self._get_text_content(message.get("content")), re.M)
+                if match:
+                    self.enabled_tool_groups.update(g for g in match.group(1).split(", ") if g in TOOL_GROUPS)
+        return self.enabled_tool_groups & set(self._available_tool_groups())
+
+    def _enable_tools(self, group: str) -> ToolResult:
+        available = self._available_tool_groups()
+        if group not in available:
+            return ToolResult(False, "", f"Unknown tool group: {group!r}. Available: {', '.join(available)}.")
+        self.enabled_tool_groups.add(group)
+        guide = self.BROWSER_PROMPT if group == "browser" else self.DESKTOP_PROMPT
+        return ToolResult(True, f"The {group} tools are enabled for the rest of this session.\n\n{guide.strip()}")
 
     TOOL_ERROR_RESERVE_CHARS = 4_000
 
@@ -1097,6 +1188,7 @@ class Agent:
             "list_skills": lambda a: self.skill_manager.list_skills().to_dict(),
             "load_skill": lambda a: self.skill_manager.load_skill(a["skill_name"]).to_dict(),
             "write_skill": lambda a: self.skill_manager.write_skill(a["skill_name"], a["content"], overwrite=a.get("overwrite", False)).to_dict(),
+            "enable_tools": lambda a: self._enable_tools(a["group"]).to_dict(),
         }
 
         if name not in dispatch:
@@ -1114,6 +1206,10 @@ class Agent:
                 "output": "",
                 "error": "Sub-agents cannot spawn, message, terminate or list sub-agents.",
             })
+        # A call to a tool of a group that is off turns the group on and runs.
+        group = _tool_group(name)
+        if group in self._available_tool_groups():
+            self.enabled_tool_groups.add(group)
 
         try:
             result = dispatch[name](args)
@@ -1145,7 +1241,9 @@ class Agent:
         """Fix common slips of weaker models against the tool's schema: a tool
         name in the wrong case, integer/number/boolean/array/object values
         sent as strings, and null for optional parameters."""
-        schemas = {t["function"]["name"]: t["function"].get("parameters") or {} for t in self._get_tool_schema()}
+        # All groups: a call to a tool of a group that is off still runs (it turns the group on).
+        schemas = {t["function"]["name"]: t["function"].get("parameters") or {}
+                   for t in self._get_tool_schema(all_groups=True)}
         if name not in schemas:
             name = next((n for n in schemas if n.lower() == str(name).lower()), name)
         schema = schemas.get(name)
@@ -1172,7 +1270,7 @@ class Agent:
 
     def _tool_parameters(self, name: str) -> set:
         """Parameter names the tool's schema declares."""
-        for tool in self._get_tool_schema():
+        for tool in self._get_tool_schema(all_groups=True):
             if tool["function"]["name"] == name:
                 return set(tool["function"].get("parameters", {}).get("properties", {}))
         return set()
@@ -1284,16 +1382,9 @@ class Agent:
         "ONLY output the structured summary."
     )
 
-    COMPACT_SUMMARY_PROMPT = """The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+    COMPACT_SUMMARY_PROMPT = """The messages above are a conversation to summarize. Write a handoff summary that another LLM will use to continue the work. The user's messages are kept verbatim next to your summary, so do not repeat them: record what the work produced.
 
 Use this EXACT format:
-
-## Goal
-[What is the user trying to accomplish?]
-
-## Constraints & Preferences
-- [Any constraints or preferences]
-- [Or "(none)" if none]
 
 ## Progress
 ### Done
@@ -1305,45 +1396,30 @@ Use this EXACT format:
 ## Key Decisions
 - **[Decision]**: [Brief rationale]
 
+## Constraints & Preferences
+- [Constraints and preferences stated or discovered, or "(none)"]
+
+## Current State
+- [Where things stand: what works, what fails, open errors]
+
 ## Next Steps
 1. [Ordered list of what should happen next]
 
-## Critical Context
-- [Data, file paths, function names, error messages needed to continue]
-- [Or "(none)" if not applicable]
+## Key Files & Context
+- [File paths, function names, commands, error messages and data needed to continue, or "(none)"]
 
-## User Messages & Agent-to-User Messages
-### User Messages
-- [Chronological, concise summary of every user message in the conversation being summarized]
-- [Preserve each request, correction, constraint, preference, and explicit question; do not omit messages]
-- [Or "(none)" if not applicable]
+Keep each section concise. Preserve exact file paths, function names, and error messages."""
 
-### Agent-to-User Messages
-- [Chronological, concise summary of every substantive assistant response intended for the user]
-- [Preserve answers, explanations, status updates, decisions, and commitments; do not omit messages]
-- [Do not treat tool-call-only messages or tool results as agent-to-user messages]
-- [Or "(none)" if not applicable]
+    COMPACT_UPDATE_PROMPT = """The messages above are NEW conversation messages to incorporate into the existing handoff summary. The user's messages are kept verbatim next to the summary, so do not repeat them.
 
-Keep each section concise. Preserve exact file paths, function names, and error messages. The User Messages and Agent-to-User Messages subsections must cover every applicable message, in chronological order."""
-
-    COMPACT_UPDATE_PROMPT = """The messages above are NEW conversation messages to incorporate into the existing summary.
-
-Update the existing structured summary with new information. RULES:
+Update the existing summary with new information. RULES:
 - PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context
+- ADD new progress, decisions, constraints and context
 - UPDATE Progress: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
+- UPDATE "Current State" and "Next Steps" based on what was accomplished
 - PRESERVE exact file paths, function names, and error messages
-- PRESERVE the complete chronological User Messages and Agent-to-User Messages record
-- APPEND or update that record for every applicable new user message and substantive assistant response; do not silently omit any
 
 Use this EXACT format:
-
-## Goal
-[Preserve existing goals, add new ones]
-
-## Constraints & Preferences
-- [Preserve existing, add new]
 
 ## Progress
 ### Done
@@ -1355,25 +1431,29 @@ Use this EXACT format:
 ## Key Decisions
 - **[Decision]**: [Rationale]
 
+## Constraints & Preferences
+- [Preserve existing, add new]
+
+## Current State
+- [Where things stand now]
+
 ## Next Steps
 1. [Updated next steps]
 
-## Critical Context
+## Key Files & Context
 - [Preserve and add important context]
 
-## User Messages & Agent-to-User Messages
-### User Messages
-- [Chronological, concise summary of every user message represented by the existing summary or new messages]
-- [Preserve each request, correction, constraint, preference, and explicit question]
-- [Or "(none)" if not applicable]
+Keep each section concise. Preserve exact file paths, function names, and error messages."""
 
-### Agent-to-User Messages
-- [Chronological, concise summary of every substantive assistant response represented by the existing summary or new messages]
-- [Preserve answers, explanations, status updates, decisions, and commitments]
-- [Do not treat tool-call-only messages or tool results as agent-to-user messages]
-- [Or "(none)" if not applicable]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages. The User Messages and Agent-to-User Messages subsections must cover every applicable message, in chronological order."""
+    # Compacted history (as in Codex): the real user messages of the
+    # summarized part, verbatim and newest first within this budget, then
+    # the summary. The budget is capped at a fifth of the context window.
+    COMPACT_USER_MESSAGES_TOKENS = 20_000
+    COMPACT_TOOL_RESULT_CHARS = 2_000  # per tool result sent to the summarizer
+    COMPACT_SUMMARY_HEADER = (
+        "[Conversation compacted — handoff summary]\n"
+        "Another model began this task; below is its handoff summary. Build on this work; don't restart."
+    )
 
     def _make_user_message(
         self, user_message: Optional[str], image_url: Optional[str] = None
@@ -1511,8 +1591,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 continue
             if role == "tool":
                 tool_name = msg.get("name", "tool")
-                if len(content) > 500:
-                    content = content[:500] + "... [truncated]"
+                if len(content) > self.COMPACT_TOOL_RESULT_CHARS:
+                    content = content[:self.COMPACT_TOOL_RESULT_CHARS] + "... [truncated]"
                 parts.append(f"[Tool result from {tool_name}]: {content}")
             elif role == "assistant":
                 tool_calls = msg.get("tool_calls")
@@ -1588,6 +1668,42 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         summary = self._with_retries(attempt)
         return summary or "(compaction produced no summary)"
 
+    @classmethod
+    def _is_compaction_summary(cls, message: Dict[str, Any]) -> bool:
+        """A compaction summary message (also the older "summary of prior
+        history" form); the omitted-messages note is not one."""
+        return message.get("role") == "user" and cls._get_text_content(
+            message.get("content")).startswith("[Conversation compacted —")
+
+    def _compacted_user_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """The real user messages among ``messages``, verbatim (text only),
+        newest first within the budget; the oldest that do not fit become one
+        "[Conversation compacted: N earlier user messages omitted]" note."""
+        omitted = 0
+        real = []
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            text = self._get_text_content(message.get("content"))
+            note = re.match(r"\[Conversation compacted: (\d+) earlier user message", text)
+            if note:
+                omitted += int(note.group(1))  # dropped by an earlier compaction
+            elif text.strip() and not _is_synthetic_user_message(message):
+                real.append({"role": "user", "content": text})
+        budget = min(self.COMPACT_USER_MESSAGES_TOKENS, self.tokens.context_window // 5)
+        kept = []
+        for message in reversed(real):
+            budget -= self.tokens.count_message(message)
+            if budget < 0:
+                break
+            kept.append(message)
+        omitted += len(real) - len(kept)
+        kept.reverse()
+        if omitted:
+            plural = "s" if omitted != 1 else ""
+            kept.insert(0, {"role": "user", "content": f"[Conversation compacted: {omitted} earlier user message{plural} omitted]"})
+        return kept
+
     def compact(self) -> str:
         history = self.conversation_history
         if len(history) <= 2:
@@ -1596,25 +1712,27 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         if not self._is_safe_compact_boundary(boundary):
             return "Nothing to compact \u2014 couldn't find a safe message boundary."
         system_msg = history[0]
-        existing_summary = None
-        if (
-            len(history) > 1
-            and history[1].get("role") == "user"
-            and isinstance(history[1].get("content"), str)
-            and history[1]["content"].startswith("[Conversation compacted")
-        ):
-            existing_summary = history[1].get("content")
-        # The previous summary is sent once, as <previous-summary>.
-        to_summarize = history[2 if existing_summary else 1:boundary]
+        to_summarize = history[1:boundary]
         if not to_summarize:
             return "Nothing to compact \u2014 all messages are recent."
-        summary = self._generate_summary(to_summarize, existing_summary)
-        compaction_msg = {
-            "role": "user",
-            "content": f"[Conversation compacted — summary of prior history]\n\n{summary}",
-        }
+        # The previous summary is sent once, as <previous-summary>; the user
+        # messages kept by the previous compaction are collected again.
+        summaries = [m for m in to_summarize if self._is_compaction_summary(m)]
+        existing_summary = self._get_text_content(summaries[-1]["content"]) if summaries else None
+        summary = self._generate_summary(
+            [m for m in to_summarize if not self._is_compaction_summary(m)], existing_summary
+        )
+        content = f"{self.COMPACT_SUMMARY_HEADER}\n\n{summary}"
+        # A reloaded history must still turn on the groups whose calls are
+        # summarized away (see _enabled_tool_groups).
+        groups = sorted(self._enabled_tool_groups())
+        if groups:
+            content += f"\n\n[Enabled tool groups: {', '.join(groups)}]"
+        compaction_msg = {"role": "user", "content": content}
         recent = history[boundary:]
-        self.conversation_history = [system_msg, compaction_msg] + recent
+        self.conversation_history = (
+            [system_msg] + self._compacted_user_messages(to_summarize) + [compaction_msg] + recent
+        )
         self._api_context = None  # the last request's usage no longer applies
         # Recount the compacted request for display/trigger decisions, but do
         # not add it to cumulative session input: those messages were already
@@ -2051,6 +2169,20 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             self.on_token_update(self.tokens)
         return None, assembled_tool_calls
 
+    def _with_date_note(self, text: str) -> str:
+        """Append today's date when it differs from the last date note in
+        history (or there is none). The date lives in history, not in the
+        system prompt, so the prompt stays cacheable for long sessions."""
+        today = date.today()
+        for message in reversed(self.conversation_history):
+            if message.get("role") == "user":
+                match = DATE_NOTE.search(self._get_text_content(message.get("content")))
+                if match:
+                    if match.group(1) == today.isoformat():
+                        return text
+                    break
+        return text + date_note(today)
+
     def run(self, user_message: str, image_url: Optional[str] = None) -> Optional[str]:
         self._set_processing(True)
         # A request may start after background commands completed while idle.
@@ -2079,6 +2211,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                 f"{user_message}"
             )
             self._interrupted_pending = False
+        current = self._with_date_note(current)
         max_empty_retries = 2
         empty_retry_count = 0
         self._repeated_failure = (None, 0)
@@ -2163,6 +2296,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         self.session_id = uuid.uuid4().hex
         # Notifications of the old conversation must not reach the new one.
         self.drain_background_events()
+        self.enabled_tool_groups.clear()
         self._setup_system_prompt()
         self.tokens = TokenCounter(self.model, self.spec.context_window, self.spec.pricing)
         # Unconditionally: the browser worker can be alive without an open
@@ -2209,8 +2343,14 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         return self.spec.info(self.effort)
 
 
+def _tool_group(name: str) -> Optional[str]:
+    """The TOOL_GROUPS group a tool belongs to (None for core tools)."""
+    return next((group for group, prefix in TOOL_GROUPS.items() if name.startswith(prefix)), None)
+
+
 def _summarize_tool_call(name: str, args: Dict[str, Any]) -> str:
     if name == "read": return f"read file: {args.get('path', '?')}"
+    if name == "enable_tools": return f"enable {args.get('group', '?')} tools"
     if name == "write": return f"wrote file: {args.get('path', '?')}"
     if name == "edit": return f"edited file: {args.get('path', '?')}"
     if name == "search":

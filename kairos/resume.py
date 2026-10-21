@@ -7,6 +7,7 @@ history and tells the caller whether it should continue the unfinished turn.
 """
 
 import json
+import re
 from typing import Any
 
 
@@ -14,6 +15,18 @@ _SCREENSHOT_PREFIX = "[Screenshot captured"
 _COMPACTION_PREFIX = "[Conversation compacted"
 _BACKGROUND_PREFIX = "Background terminal notifications arrived"  # older saved chats
 _NOTIFICATION_PREFIX = "[Background notification]"  # kairos.wake.NOTIFICATION_PREFIX
+
+# Agent.run appends a date note to a user message when the date changed since
+# the last note the model saw; displays (previews, visible history) strip it.
+DATE_NOTE = re.compile(r"\n\n\[Current date: (\d{4}-\d{2}-\d{2}) \(\w+\)\]$")
+
+
+def date_note(day) -> str:
+    return f"\n\n[Current date: {day.isoformat()} ({day.strftime('%A')})]"
+
+
+def strip_date_note(text: str) -> str:
+    return DATE_NOTE.sub("", text)
 
 
 def _text_content(content: Any) -> str:
