@@ -134,5 +134,91 @@ class CompactionAccountingTests(unittest.TestCase):
         self.assertIn("legacy image omitted", normalized["output"])
 
 
+    def make_compacting_shell(self, history, context_window=5_000):
+        """A shell whose compact() records the summarizer's input."""
+        agent = self.make_agent_shell(context_window=context_window)
+        agent._is_subagent = False
+        agent.enabled_tool_groups = set()
+        agent.conversation_history = history
+        agent._get_tool_schema = lambda: []
+        agent.summarized = []
+
+        def generate(messages, previous_summary=None):
+            agent.summarized.append((messages, previous_summary))
+            return "NEW SUMMARY"
+
+        agent._generate_summary = generate
+        return agent
+
+    def test_compaction_keeps_user_messages_verbatim_before_the_summary(self):
+        call = {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]}
+        dated = "second: keep THIS exact text\n\n[Current date: 2026-10-20 (Tuesday)]"
+        history = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "first request"},
+            call,
+            {"role": "tool", "name": "read", "tool_call_id": "c1", "content": "file text"},
+            {"role": "user", "content": "[Background notification]\nSub-agent finished"},
+            {"role": "user", "content": [{"type": "text", "text": "[Screenshot captured]"},
+                                         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]},
+            {"role": "user", "content": dated},
+            {"role": "assistant", "content": "done"},
+            {"role": "assistant", "content": "word " * 1500},  # over the 1,000-token keep
+        ]
+        agent = self.make_compacting_shell(history)
+        self.assertTrue(agent.compact().startswith("Compacted"))
+        compacted = agent.conversation_history
+        self.assertEqual(compacted[1:3], [{"role": "user", "content": "first request"},
+                                          {"role": "user", "content": dated}])
+        self.assertTrue(compacted[3]["content"].startswith(Agent.COMPACT_SUMMARY_HEADER))
+        self.assertIn("NEW SUMMARY", compacted[3]["content"])
+        self.assertEqual(compacted[4:], history[8:])  # the recent tail is untouched
+        messages, previous = agent.summarized[0]
+        self.assertIsNone(previous)
+        self.assertEqual(messages, history[1:8])  # the summarizer still sees everything
+
+    def test_oldest_user_messages_are_dropped_beyond_the_budget(self):
+        agent = self.make_agent_shell()
+        users = [{"role": "user", "content": f"request {i} " + "x " * 50} for i in range(4)]
+        agent.COMPACT_USER_MESSAGES_TOKENS = agent.tokens.count_message(users[0]) * 2 + 1
+        kept = agent._compacted_user_messages(users)
+        self.assertEqual(kept, [{"role": "user", "content": "[Conversation compacted: 2 earlier user messages omitted]"},
+                                users[2], users[3]])
+        # A later compaction adds to the count of an earlier note.
+        kept = agent._compacted_user_messages(kept + [users[0]])
+        self.assertEqual(kept[0]["content"], "[Conversation compacted: 3 earlier user messages omitted]")
+        self.assertEqual(kept[1:], [users[3], users[0]])
+
+    def test_user_message_budget_is_capped_by_the_context_window(self):
+        agent = self.make_agent_shell(context_window=1_000)  # a fifth: 200 tokens
+        users = [{"role": "user", "content": "x " * 150} for _ in range(2)]
+        self.assertEqual(len(agent._compacted_user_messages(users)), 2)  # note + newest
+
+    def test_recompaction_keeps_earlier_user_messages_and_sends_the_summary_once(self):
+        previous = f"{Agent.COMPACT_SUMMARY_HEADER}\n\nOLD SUMMARY"
+        history = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "u1"},
+            {"role": "user", "content": previous},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "assistant", "content": "word " * 1500},  # over the 1,000-token keep
+        ]
+        agent = self.make_compacting_shell(history)
+        agent.compact()
+        messages, previous_summary = agent.summarized[0]
+        self.assertEqual(previous_summary, previous)
+        self.assertNotIn(history[2], messages)
+        contents = [m["content"] for m in agent.conversation_history]
+        self.assertEqual(contents[1:3], ["u1", "u2"])
+        self.assertEqual(sum(c.startswith("[Conversation compacted") for c in contents), 1)
+
+    def test_summary_prompt_no_longer_asks_for_user_messages(self):
+        for prompt in (Agent.COMPACT_SUMMARY_PROMPT, Agent.COMPACT_UPDATE_PROMPT):
+            self.assertNotIn("User Messages", prompt)
+            self.assertIn("## Next Steps", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

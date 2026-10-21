@@ -9,6 +9,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from ..resume import strip_date_note
 from .models import Conversation, Run, StoredMessage, new_id, utc_now
 
 
@@ -378,7 +379,7 @@ class GatewayRepository:
     def _preview(cls, history: list[dict[str, Any]]) -> str:
         for message in history:
             if message.get("role") == "user" and not cls._is_screenshot_injection(message):
-                return cls._text_content(message.get("content", "")).strip()[:120]
+                return strip_date_note(cls._text_content(message.get("content", ""))).strip()[:120]
         return ""
 
     @classmethod

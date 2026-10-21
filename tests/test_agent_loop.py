@@ -2,13 +2,16 @@
 stops during compaction, provider-reported context, compaction prompt and
 tool error messages. No network: adapters are scripted."""
 import json
+import sys
 import threading
 import unittest
+from datetime import date
+from unittest import mock
 
 from kairos import providers
 from kairos.agent import Agent, APIRequestError
 from kairos.providers.base import EventStream
-from kairos.resume import repair_tool_chains
+from kairos.resume import date_note, repair_tool_chains
 from kairos.tokens import TokenCounter
 from kairos.wake import WakeScheduler
 
@@ -44,7 +47,7 @@ def assert_valid_chains(test, messages):
 
 class ToolChainTests(ProviderConfigMixin, unittest.TestCase):
     def test_tool_summary_never_raises(self):
-        names = [t["function"]["name"] for t in Agent(self.workspace)._get_tool_schema()]
+        names = [t["function"]["name"] for t in Agent(self.workspace)._get_tool_schema(all_groups=True)]
         for name in names:
             for args in ({}, None, [], "text", {"message": None, "prompt": None, "text": None, "expression": None,
                                                 "command": "commit", "fields": 5, "ref": None}):
@@ -187,7 +190,7 @@ class CompactionTests(ProviderConfigMixin, unittest.TestCase):
         worker.join(2)
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, ["[Interrupted]"])
-        self.assertEqual(agent.conversation_history[-1], {"role": "user", "content": "new request"})
+        self.assertEqual(agent.conversation_history[-1], {"role": "user", "content": "new request" + date_note(date.today())})
         self.assertEqual(agent.conversation_history[1:3], [{"role": "user", "content": "old"},
                                                            {"role": "assistant", "content": "old reply"}])
         self.assertTrue(agent._interrupted_pending)
@@ -202,7 +205,8 @@ class CompactionTests(ProviderConfigMixin, unittest.TestCase):
 
         agent.adapter = ScriptAdapter(overloaded, lambda m: [("text", "SUMMARY")])
         self.assertTrue(agent.compact().startswith("Compacted"))
-        self.assertIn("SUMMARY", agent.conversation_history[1]["content"])
+        self.assertEqual(agent.conversation_history[1], {"role": "user", "content": "q1"})
+        self.assertIn("SUMMARY", agent.conversation_history[2]["content"])
 
     def test_previous_summary_is_sent_once(self):
         agent = Agent(self.workspace)
@@ -327,3 +331,149 @@ class HostStopAndResetTests(ProviderConfigMixin, unittest.TestCase):
         self.assertFalse(agent.browser_manager.is_open)
         agent.reset()
         self.assertEqual(closed, [True])
+
+
+def schema_names(agent, **kwargs):
+    return {t["function"]["name"] for t in agent._get_tool_schema(**kwargs)}
+
+
+class ToolGroupTests(ProviderConfigMixin, unittest.TestCase):
+    def test_browser_and_desktop_tools_are_off_by_default(self):
+        agent = Agent(self.workspace)
+        names = schema_names(agent)
+        self.assertFalse([n for n in names if n.startswith(("browser_", "desktop_"))])
+        self.assertLessEqual({"read", "edit", "execute_command", "spawn_subagent", "load_skill", "enable_tools"}, names)
+        # The guides moved to the enable_tools result; one line remains.
+        self.assertNotIn("## Browser Tools", agent.system_prompt)
+        self.assertNotIn("## Native Desktop Tools", agent.system_prompt)
+        self.assertIn("`enable_tools`", agent.system_prompt)
+
+    def test_enable_tools_turns_a_group_on_and_returns_its_guide(self):
+        agent = Agent(self.workspace)
+        result = json.loads(agent._execute_tool("enable_tools", {"group": "browser"}))
+        self.assertTrue(result["success"])
+        self.assertIn("browser_navigate", result["output"])
+        names = schema_names(agent)
+        self.assertEqual(len([n for n in names if n.startswith("browser_")]), 20)
+        self.assertFalse([n for n in names if n.startswith("desktop_")])
+        bad = json.loads(agent._execute_tool("enable_tools", {"group": "printer"}))
+        self.assertFalse(bad["success"])
+        self.assertIn("browser, desktop", bad["error"])
+
+    def test_calling_a_tool_of_a_disabled_group_enables_it_and_runs(self):
+        agent = Agent(self.workspace)
+        result = json.loads(agent._execute_tool("desktop_window_action", {"action": "activate_window"}))
+        self.assertIn("Missing required argument 'pid'", result["error"])  # it ran
+        self.assertIn("desktop_window_action", schema_names(agent))
+
+    def test_groups_are_restored_from_history(self):
+        agent = Agent(self.workspace)
+
+        def call(name, args):
+            return {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]}
+
+        agent.conversation_history += [{"role": "user", "content": "go"}, call("browser_snapshot", {}), tool_result("c")]
+        self.assertIn("browser_snapshot", schema_names(agent))
+        agent.conversation_history += [call("enable_tools", {"group": "desktop"}), tool_result("c")]
+        self.assertIn("desktop_click", schema_names(agent))
+
+    def test_groups_survive_compaction_and_reload(self):
+        agent = Agent(self.workspace)
+        agent._execute_tool("enable_tools", {"group": "desktop"})
+        agent.conversation_history += [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+        agent.adapter = ScriptAdapter(lambda m: [("text", "SUMMARY")])
+        self.assertTrue(agent.compact().startswith("Compacted"))
+        reloaded = Agent(self.workspace)
+        reloaded.conversation_history = list(agent.conversation_history)
+        self.assertIn("desktop_click", schema_names(reloaded))
+        self.assertNotIn("browser_snapshot", schema_names(reloaded))
+
+    def test_subagents_can_enable_desktop_but_not_browser(self):
+        agent = Agent(self.workspace)
+        agent._is_subagent = True
+        enable = next(t for t in agent._get_tool_schema() if t["function"]["name"] == "enable_tools")
+        self.assertEqual(enable["function"]["parameters"]["properties"]["group"]["enum"], ["desktop"])
+        self.assertFalse(json.loads(agent._execute_tool("enable_tools", {"group": "browser"}))["success"])
+        self.assertTrue(json.loads(agent._execute_tool("enable_tools", {"group": "desktop"}))["success"])
+        names = schema_names(agent)
+        self.assertIn("desktop_click", names)
+        self.assertFalse([n for n in names if n.startswith("browser_")])
+
+    def test_reset_turns_groups_off(self):
+        agent = Agent(self.workspace)
+        agent.browser_manager.close = lambda: None
+        agent._execute_tool("enable_tools", {"group": "browser"})
+        agent.reset()
+        self.assertNotIn("browser_snapshot", schema_names(agent))
+
+
+class DateNoteTests(ProviderConfigMixin, unittest.TestCase):
+    def test_date_is_added_only_when_it_changed(self):
+        agent = Agent(self.workspace)
+        agent.adapter = ScriptAdapter(lambda m: [("text", "one")], lambda m: [("text", "two")],
+                                      lambda m: [("text", "three")])
+        with mock.patch("kairos.agent.date") as fake:
+            fake.today.return_value = date(2026, 10, 20)
+            agent.run("first")
+            agent.run("second")
+            fake.today.return_value = date(2026, 10, 21)
+            agent.run("third")
+        users = [m["content"] for m in agent.conversation_history if m["role"] == "user"]
+        self.assertEqual(users, ["first\n\n[Current date: 2026-10-20 (Tuesday)]", "second",
+                                 "third\n\n[Current date: 2026-10-21 (Wednesday)]"])
+        # The system prompt does not change with the date.
+        self.assertNotIn("2026-10", agent.system_prompt)
+
+    def test_environment_is_in_the_system_prompt(self):
+        agent = Agent(self.workspace)
+        self.assertIn("## Environment\n- OS: ", agent.system_prompt)
+        self.assertIn("cmd.exe" if sys.platform == "win32" else "bash", agent.system_prompt)
+        self.assertIn(f"Your current workspace is: {agent.cwd}", agent.system_prompt)
+
+    def test_displays_strip_the_date_note(self):
+        from kairos.gateway.history import visible_history
+        from kairos.gateway.repository import GatewayRepository
+
+        history = [{"role": "system", "content": "s"},
+                   {"role": "user", "content": "hi" + date_note(date(2026, 10, 20))},
+                   {"role": "assistant", "content": "hello"}]
+        self.assertEqual(visible_history(history)[0], {"role": "user", "content": "hi"})
+        self.assertEqual(GatewayRepository._preview(history), "hi")
+
+
+class ToolSchemaGuardTests(ProviderConfigMixin, unittest.TestCase):
+    # OpenRouter's Wafer host (schema-constrained decoding) broke on a oneOf in
+    # execute_command: GLM-5.3-flash produced only {"is_background": false, ...}
+    # for 110k characters, in every call. Hosts that compile the schema into a
+    # grammar handle combinators and conditionals badly, so none may come back.
+    BANNED = {"oneOf", "anyOf", "allOf", "$ref", "if", "then", "else", "not", "const"}
+
+    def find_banned(self, schema, path):
+        found = []
+        if isinstance(schema, dict):
+            for key, value in schema.items():
+                if key in self.BANNED:
+                    found.append(f"{path}.{key}")
+                if key == "properties" and isinstance(value, dict):
+                    # Property names are not keywords: check only their schemas.
+                    for name, sub in value.items():
+                        found += self.find_banned(sub, f"{path}.properties.{name}")
+                else:
+                    found += self.find_banned(value, f"{path}.{key}")
+        elif isinstance(schema, list):
+            for i, item in enumerate(schema):
+                found += self.find_banned(item, f"{path}[{i}]")
+        return found
+
+    def test_no_tool_schema_uses_combinators_or_conditionals(self):
+        tools = Agent(self.workspace)._get_tool_schema(all_groups=True)
+        self.assertGreater(len(tools), 50)  # every group is checked
+        found = []
+        for tool in tools:
+            found += self.find_banned(tool["function"].get("parameters", {}), tool["function"]["name"])
+        self.assertEqual(found, [])
+
+    def test_guard_detects_nested_keywords(self):
+        schema = {"type": "object", "properties": {"not": {"type": "array", "items": {"anyOf": []}}}}
+        self.assertEqual(self.find_banned(schema, "t"), ["t.properties.not.items.anyOf"])

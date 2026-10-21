@@ -90,6 +90,11 @@ class SessionStorageTests(unittest.TestCase):
 
             self.assertEqual(legacy_file.read_text(encoding="utf-8"), corrupt)
 
+    def test_preview_leaves_out_the_date_note(self):
+        history = [{"role": "system", "content": "s"},
+                   {"role": "user", "content": "hi\n\n[Current date: 2026-10-20 (Tuesday)]"}]
+        self.assertEqual(SessionManager._extract_preview(history), "hi")
+
 
 if __name__ == "__main__":
     unittest.main()
