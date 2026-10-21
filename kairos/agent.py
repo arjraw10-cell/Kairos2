@@ -329,7 +329,7 @@ class Agent:
             "## Background Work\n"
             + ("Background terminal commands report back with a `[Background notification]` message when a command finishes (or its `until` pattern matches), delivered before your next step while you are still working. Your final message ends your task; notifications that arrive after it reach you only if you are messaged again, so get the background results you need (read_logs has the output) before finishing.\n\n" if sub else
                "Background terminal commands and sub-agents report back with a `[Background notification]` message: when a command finishes (or its `until` pattern matches) and when a sub-agent finishes or fails. If your turn has already ended, you are woken with the notification. Never poll, sleep or wait for background work: start it, tell the user what is running, and end your turn or keep working on something else.\n\n") +
-            f"## Tool Result Limits\nText returned by tools is capped before it is added to conversation history: up to {self.max_tool_result_chars:,} characters per tool result. Oversized results contain a truncation marker and preserve both the beginning and end. Use narrower commands or queries; for complete background-terminal output, use read_logs.\n\n"
+            f"## Tool Result Limits\nText returned by tools is capped before it is added to conversation history: up to {self.max_tool_result_chars:,} characters per tool result. Oversized results keep the beginning and end around a truncation marker, and the full output is saved to a file named in the marker: read it with offset/limit or search it instead of re-running the command. Use narrower commands or queries; for complete background-terminal output, use read_logs.\n\n"
             "## Web Search\n"
             + ("Use `web_search` for quick facts and current events. You have no browser: if web_search is unavailable, say so in your result.\n\n" if sub else
                "Use `web_search` for quick facts and current events. Use the browser for pages that need interaction, or when web_search is unavailable.\n\n"
@@ -385,12 +385,17 @@ class Agent:
                     "description": (
                         "Read a file (absolute, or relative to the workspace). Supports UTF-8 text files "
                         "(SVG is read as text) and PNG, JPEG, GIF and WebP images up to about 3.9 MB, "
-                        "which are returned as vision data for visual analysis."
+                        "which are returned as vision data for visual analysis. Text comes back one page at "
+                        "a time (up to 2000 lines, fewer when lines are long); for big files, use offset and limit to read "
+                        "the part you need, and follow the footer to continue. Each line starts with its line "
+                        "number and a tab: that prefix is not part of the file content, so never include it in edit's oldText."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "File path (absolute, or relative to the workspace)"}
+                            "path": {"type": "string", "description": "File path (absolute, or relative to the workspace)"},
+                            "offset": {"type": "integer", "description": "1-based line number to start reading from (default 1)"},
+                            "limit": {"type": "integer", "description": "Maximum number of lines to return (default and maximum 2000)"},
                         },
                         "required": ["path"],
                     },
@@ -415,13 +420,19 @@ class Agent:
                 "type": "function",
                 "function": {
                     "name": "edit",
-                    "description": "Strict find-and-replace on a file. oldText must appear exactly ONCE.",
+                    "description": (
+                        "Find-and-replace in a file. oldText must match the file exactly, including indentation, "
+                        "and appear exactly once unless replace_all is true. Copy it from read output without the "
+                        "line-number prefixes. Typographic quotes, dashes and spaces and trailing whitespace "
+                        "are tolerated when there is no exact match."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "File path (absolute, or relative to the workspace)"},
-                            "oldText": {"type": "string", "description": "Exact text to find (must appear exactly once)"},
+                            "oldText": {"type": "string", "description": "Exact text to find (must appear exactly once unless replace_all is true)"},
                             "newText": {"type": "string", "description": "Replacement text"},
+                            "replace_all": {"type": "boolean", "description": "Replace every occurrence of oldText (default false)"},
                         },
                         "required": ["path", "oldText", "newText"],
                     },
@@ -952,14 +963,22 @@ class Agent:
 
     TOOL_ERROR_RESERVE_CHARS = 4_000
 
+    # Full text of truncated tool output; files older than this are deleted.
+    TOOL_OUTPUT_DIR = Path.home() / ".kairos" / "tool-output"
+    TOOL_OUTPUT_MAX_AGE_SECONDS = 7 * 24 * 3600
+
     @staticmethod
-    def _truncate_text(text: str, max_chars: int) -> str:
+    def _truncate_text(text: str, max_chars: int, saved_path: Optional[str] = None) -> str:
         """Keep both ends of oversized text while preserving Unicode safely."""
         if len(text) <= max_chars:
             return text
+        saved = (
+            f"; full output saved to {saved_path} \u2014 read it with offset/limit or search it"
+            if saved_path else ""
+        )
         marker = (
             f"\n... [tool output truncated: original length {len(text):,} characters; "
-            f"showing the first and last portions] ...\n"
+            f"showing the first and last portions{saved}] ...\n"
         )
         if max_chars <= len(marker):
             return marker[:max_chars]
@@ -994,8 +1013,9 @@ class Agent:
 
         if isinstance(output, str):
             output_limit = max(0, limit - error_length)
+            saved_path = self._save_tool_output(output) if 0 < output_limit < len(output) else None
             capped["output"] = (
-                self._truncate_text(output, output_limit)
+                self._truncate_text(output, output_limit, saved_path)
                 if output_limit
                 else ""
             )
@@ -1005,13 +1025,36 @@ class Agent:
         # textual budget. Non-text metadata remains untouched.
         return capped
 
+    def _save_tool_output(self, text: str) -> Optional[str]:
+        """Write the full text of a truncated tool output to a file and return
+        its path (None when it cannot be written). Deletes week-old files."""
+        try:
+            folder = self.TOOL_OUTPUT_DIR
+            folder.mkdir(parents=True, exist_ok=True)
+            cutoff = time.time() - self.TOOL_OUTPUT_MAX_AGE_SECONDS
+            for old in folder.iterdir():
+                try:
+                    if old.stat().st_mtime < cutoff:
+                        old.unlink()
+                except OSError:
+                    pass
+            path = folder / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.txt"
+            path.write_bytes(text.encode("utf-8", errors="replace"))
+            return str(path)
+        except OSError:
+            return None
+
     def _execute_tool(self, name: str, args: Dict[str, Any], max_chars: Optional[int] = None) -> str:
         """Execute a tool and return a capped JSON result for the model."""
         name, args = self._repair_tool_call(name, args)
         dispatch = {
-            "read": lambda a: self.read_tool(a["path"]).to_dict(),
+            "read": lambda a: self.read_tool(
+                a["path"], a.get("offset"), a.get("limit"),
+                # A page fits in one tool result, so read never truncates itself.
+                max_chars=max_chars or self.max_tool_result_chars,
+            ).to_dict(),
             "write": lambda a: self.write_tool(a["path"], a["content"]).to_dict(),
-            "edit": lambda a: self.edit_tool(a["path"], a["oldText"], a["newText"]).to_dict(),
+            "edit": lambda a: self.edit_tool(a["path"], a["oldText"], a["newText"], a.get("replace_all", False)).to_dict(),
             "search": lambda a: self.search_tool(
                 a["pattern"],
                 a.get("path"),
