@@ -288,6 +288,17 @@ class ToolErrorTests(ProviderConfigMixin, unittest.TestCase):
         # The stop is the run's reply, so a resume does not continue the loop.
         self.assertEqual(agent.conversation_history[-1], {"role": "assistant", "content": reply})
 
+    def test_stop_after_a_failing_command_quotes_its_exit_code_and_output(self):
+        # A command that ran and failed has no "error", only its output.
+        agent = Agent(self.workspace)
+        agent.execute_command_tool = mock.Mock(return_value=mock.Mock(to_dict=lambda: {
+            "success": False, "output": "Exit code: 2\nWall time: 0.1s\nOutput:\nboom", "error": None}))
+        agent.adapter = ScriptAdapter(*[
+            (lambda m, i=i: [tool_call(f"call_{i}", "execute_command", {"command": "make"})]) for i in range(5)])
+        reply = agent.run("build")
+        self.assertTrue(reply.startswith("[Stopped: execute_command failed 5 times in a row"), reply)
+        self.assertIn("Last error: Exit code: 2\nWall time: 0.1s\nOutput:\nboom]", reply)
+
     def test_a_different_call_resets_the_failure_count(self):
         bad = {"is_background": False}
         steps = [bad, bad, {"terminal_id": 99, "command": "x", "is_background": False}, bad, bad, bad]
@@ -455,6 +466,27 @@ class ExecuteCommandResultTests(ProviderConfigMixin, unittest.TestCase):
         self.assertEqual(json.loads(agent._execute_tool("list_skills", {}))["success"], True)
         self.assertEqual(Agent._tool_summary("execute_command", {"command": "dir"}), "run: dir")
 
+    def test_warned_plain_text_result_keeps_its_saved_output_marker(self):
+        # A capped plain-text result plus the repeated-failure warning is a
+        # little over the cap; history normalization must not truncate it
+        # again (that cut out the saved-output path).
+        agent = Agent(self.workspace)
+        agent.max_tool_result_chars = 2000
+        notices = []
+        agent.on_compact = notices.append
+        failing = mock.Mock(return_value=mock.Mock(to_dict=lambda: {
+            "success": False, "output": "Exit code: 1\nWall time: 0.1s\nOutput:\n" + "x" * 5000, "error": None}))
+        agent.execute_command_tool = failing
+        agent.adapter = ScriptAdapter(
+            *[(lambda m, i=i: [tool_call(f"c{i}", "execute_command", {"command": "fail"})]) for i in range(3)],
+            lambda m: [("text", "done")])
+        with mock.patch.object(Agent, "TOOL_OUTPUT_DIR", Path(self.workspace) / "tool-output"):
+            self.assertEqual(agent.run("go"), "done")
+        sent = [m for m in agent.adapter.requests[3] if m.get("role") == "tool"][-1]["content"]
+        self.assertIn("Warning: This exact call has now failed 3 times", sent)
+        self.assertIn("full output saved to", sent)
+        self.assertFalse([n for n in notices if "normalized" in n], notices)
+
 
 def schema_names(agent, **kwargs):
     return {t["function"]["name"] for t in agent._get_tool_schema(**kwargs)}
@@ -563,6 +595,11 @@ class DateNoteTests(ProviderConfigMixin, unittest.TestCase):
                    {"role": "assistant", "content": "hello"}]
         self.assertEqual(visible_history(history)[0], {"role": "user", "content": "hi"})
         self.assertEqual(GatewayRepository._preview(history), "hi")
+        # A message with an image has the note in its text part.
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+        with_image = [{"role": "user", "content": [
+            {"type": "text", "text": "look" + date_note(date(2026, 10, 20))}, image]}]
+        self.assertEqual(visible_history(with_image)[0]["content"], [{"type": "text", "text": "look"}, image])
 
 
 class ToolSchemaGuardTests(ProviderConfigMixin, unittest.TestCase):

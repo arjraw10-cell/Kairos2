@@ -1348,7 +1348,10 @@ class Agent:
                 parsed = self._cap_tool_result(parsed)
                 normalized = json.dumps(parsed, ensure_ascii=False)
 
-            elif len(content) > self.max_tool_result_chars:
+            # A plain-text result (execute_command) was capped before it was
+            # stored; its "Error:"/"Warning:" lines may add a little to that.
+            # Truncating it again would cut out its saved-output marker.
+            elif len(content) > self.max_tool_result_chars + self.TOOL_ERROR_RESERVE_CHARS:
                 normalized = self._truncate_text(content, self.max_tool_result_chars)
             if normalized != content:
                 message["content"] = normalized
@@ -1713,7 +1716,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             return "Nothing to compact \u2014 couldn't find a safe message boundary."
         system_msg = history[0]
         to_summarize = history[1:boundary]
-        if not to_summarize:
+        # A previous compaction left [kept user messages, summary] at the
+        # start: a boundary within them has nothing new to summarize.
+        last_summary = max((i for i, m in enumerate(history) if self._is_compaction_summary(m)), default=0)
+        if not to_summarize or boundary <= last_summary + 1:
             return "Nothing to compact \u2014 all messages are recent."
         # The previous summary is sent once, as <previous-summary>; the user
         # messages kept by the previous compaction are collected again.
@@ -2032,7 +2038,8 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         count = count + 1 if key == last_key else 1
         self._repeated_failure = (key, count)
         if count >= self.REPEATED_FAILURE_STOP:
-            error = str(result.get("error") or "")[:300]
+            # A failed shell command has no error: its exit code and output say why.
+            error = str(result.get("error") or result.get("output") or "")[:300]
             self._failure_stop_message = (
                 f"[Stopped: {name} failed {count} times in a row with the same arguments. "
                 f"Last error: {error}]"

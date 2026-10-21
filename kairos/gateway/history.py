@@ -174,5 +174,12 @@ def visible_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         content = message.get("content") or ""
         if role == "user" and isinstance(content, str):
             content = strip_date_note(content)
+        elif role == "user" and isinstance(content, list):
+            # A message with an image carries the note in its text part.
+            content = [
+                {**block, "text": strip_date_note(block["text"])}
+                if isinstance(block, dict) and isinstance(block.get("text"), str) else block
+                for block in content
+            ]
         result.append({"role": role, "content": content})
     return result

@@ -214,6 +214,23 @@ class CompactionAccountingTests(unittest.TestCase):
         self.assertEqual(contents[1:3], ["u1", "u2"])
         self.assertEqual(sum(c.startswith("[Conversation compacted") for c in contents), 1)
 
+    def test_compacting_again_with_only_recent_messages_does_nothing(self):
+        # The boundary fell among the kept user messages: summarizing them
+        # alone added one more summary message per /compact.
+        history = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "u1"},
+            {"role": "user", "content": "u2"},
+            {"role": "user", "content": f"{Agent.COMPACT_SUMMARY_HEADER}\n\nOLD SUMMARY"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u3"},
+            {"role": "assistant", "content": "a3"},
+        ]
+        agent = self.make_compacting_shell(list(history))
+        self.assertEqual(agent.compact(), "Nothing to compact — all messages are recent.")
+        self.assertEqual(agent.summarized, [])
+        self.assertEqual(agent.conversation_history, history)
+
     def test_summary_prompt_no_longer_asks_for_user_messages(self):
         for prompt in (Agent.COMPACT_SUMMARY_PROMPT, Agent.COMPACT_UPDATE_PROMPT):
             self.assertNotIn("User Messages", prompt)
