@@ -18,6 +18,32 @@ MAX_PAGE_CHARS = 50_000
 MAX_LINE_CHARS = 2000
 # Room kept for the footer inside the character budget.
 FOOTER_RESERVE = 200
+# Lines are read in chunks of this many bytes, so a huge line (minified code,
+# a binary file) is never held in memory whole.
+LINE_CHUNK = 64 * 1024
+_UTF8_CONTINUATION = bytes(range(0x80, 0xC0))
+
+
+def _lines(f):
+    """Yield (head, chars) per line: its first LINE_CHUNK bytes and its length
+    in characters without the line ending (UTF-8: bytes that are not
+    continuation bytes)."""
+    while True:
+        chunk = f.readline(LINE_CHUNK)
+        if not chunk:
+            return
+        head, chars = chunk, 0
+        while True:
+            chars += len(chunk.translate(None, _UTF8_CONTINUATION))
+            if chunk.endswith(b"\n"):
+                chars -= 2 if chunk.endswith(b"\r\n") else 1
+                break
+            if len(chunk) < LINE_CHUNK:
+                break
+            chunk = f.readline(LINE_CHUNK)
+            if not chunk:
+                break
+        yield head, chars
 
 
 def _image_mime(header: bytes) -> Optional[str]:
@@ -102,12 +128,12 @@ class ReadTool:
         total = 0
         next_line = None  # first line not shown, when the page stops early
         with open(resolved, "rb") as f:
-            for total, raw in enumerate(f, 1):
+            for total, (raw, chars) in enumerate(_lines(f), 1):
                 if total < start or next_line is not None:
                     continue
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if len(line) > MAX_LINE_CHARS:
-                    line = line[:MAX_LINE_CHARS] + f" ... [line truncated: {len(line):,} chars]"
+                    line = line[:MAX_LINE_CHARS] + f" ... [line truncated: {max(chars, len(line)):,} chars]"
                 numbered = f"{total:>6}\t{line}\n"
                 if len(out) == count or (out and used + len(numbered) > budget):
                     next_line = total

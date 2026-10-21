@@ -4,7 +4,7 @@ A minimal personal coding agent in Python.
 
 ## Features
 
-- **52 Tools**: File operations, terminals, search, web search, git, background sub-agents, skills, a browser automation suite (including console/network inspection), and optional native desktop automation through Cua Driver
+- **53 Tools**: File operations, terminals, search, web search, git, background sub-agents, skills, a browser automation suite (including console/network inspection), and optional native desktop automation through Cua Driver. The 20 browser and 13 desktop tools are loaded on demand (`enable_tools`), so a request carries 20 tools until the agent needs them
 - **Direct Model Access**: Talks to OpenAI (Responses API), OpenRouter or any Chat Completions server, and Anthropic (Messages API) directly; providers, named model setups and API keys live in `provider.json`. Several keys per provider rotate on 401/402/429 with a 60-second cooldown. Model and reasoning effort are chosen per conversation with `/model` and `/effort`. A model's own reasoning (Anthropic thinking blocks, OpenRouter `reasoning_details`) is sent back to it on the next request, so it keeps its train of thought across tool calls.
 - **Gateway**: One gateway process owns conversations (SQLite), Agents, terminals and the browser. The CLI is a client of it; `--offline` runs the agent inside the CLI instead. It refuses cross-site browser requests, and only one gateway can use a data folder at a time.
 - **Background Work, No Polling**: Sub-agents always run in the background, and background terminal commands notify when they finish or when their output matches a pattern. Results arrive as notifications; if the agent is idle, it is woken to handle them, and the wake turn prints above your prompt without disturbing what you are typing.
@@ -13,16 +13,18 @@ A minimal personal coding agent in Python.
 - **Workspace-relative Paths**: Relative paths in file tools resolve against the conversation's workspace, and terminals start there; absolute paths reach anywhere — no workspace restrictions
 - **Streaming First**: Tokens print as they arrive; no waiting for full responses
 - **Token Aware**: after every model call: context used (% and tokens / window), that call's output tokens, session input/output tokens and session cost, using provider-reported usage when available and tiktoken estimates otherwise
-- **Auto-Compaction**: History is summarized when the context passes 80% of the budget; estimates include tool schemas and tool-call metadata, and the compaction request itself is bounded
+- **Auto-Compaction**: History is summarized when the context passes 80% of the budget; your messages are kept word for word next to a handoff summary. Estimates include tool schemas and tool-call metadata, and the compaction request itself is bounded
 - **Browser Automation**: CloakBrowser stealth Chromium, headed (visible) in the agent and always humanized, launched lazily on first use. `BrowserManager(headless=True)` exists for batch callers outside the agent. Accessibility snapshots with element refs, diff snapshots after actions, dialog handling, iframes, tabs, persistent profiles with pinned fingerprints, and console/network inspection.
 - **Native Desktop Automation**: Optional Cua Driver integration exposes native window discovery, accessibility-tree snapshots, screenshots, app launching, clicking, typing, keyboard, scrolling, dragging, and window actions. Accessibility element indices are the primary addressing mode; pixel coordinates are available as a fallback. Desktop tools are available to sub-agents and are loaded lazily when Cua Driver is installed.
 - **Skills**: Self-extensible skill system — the agent can create/load skills stored as `SKILL.md` files in the workspace's `skills/` directory
 - **Paste System**: Bracketed paste and Ctrl+V insert text as a `(Pasted Text #1)` token; Alt+V pastes a clipboard image as `(Pasted Image #1)`. Backspace removes a whole token. Copying never counts as pasting.
 - **`/resume`**: Continue a saved conversation from a numbered picker; an interrupted turn is repaired and continued automatically
 - **Immediate Stop**: Esc and Ctrl+C stop the main agent and return to the prompt at once (stream closed, blocking commands killed, browser call cancelled), also while a message is still being sent or auto-compaction is summarizing (your message is kept); sub-agents keep running until `/stop`. Interrupted turns stay repairable so the next message continues them. Text typed while the agent works is pre-filled into the next prompt, never sent on its own.
-- **Bounded Tool Results**: Tool text is capped at 20,000 characters per result (beginning and end kept); images go to the model as vision input, not text
+- **Bounded Tool Results**: Tool text is capped at 20,000 characters per result (beginning and end kept, the full text saved to a file the agent can read); images go to the model as vision input, not text
 - **Loop Guard**: when the same tool call (same name and arguments) fails 3 times in a row, its result carries a warning telling the model to change approach (and the CLI prints a notice); a 5th identical failure stops the run with `[Stopped: <tool> failed 5 times in a row ...]`
-- **Retries and Clean Errors**: Transient API failures (rate limits, overload, connection errors, 5xx) are retried twice with backoff; a final failure shows a short `API Error` summary without a traceback
+- **Honest Tool-Call Errors**: tool-call arguments that are not valid JSON or not an object, and every call of a reply cut off at the output-token limit, are not run; the model is told exactly what went wrong. Small slips (a tool name in the wrong case, `"20"` for a number, a JSON string for an array, `null` for an optional argument) are repaired against the tool's schema
+- **Environment Aware**: the system prompt names the OS and the terminal shell (cmd.exe on Windows), and the current date is added to your message whenever it changes
+- **Retries, Caching and Clean Errors**: Transient API failures (rate limits, overload, connection errors, 408/409/429/5xx) are retried up to 5 times with backoff, honouring the server's `retry-after`; a final failure shows a short `API Error` summary without a traceback. Anthropic requests mark the system prompt, tools and newest turn for prompt caching; OpenRouter requests carry a per-conversation `session_id` so the conversation stays on one host and its prompt cache
 - **Clean CLI**: `rich` and `prompt_toolkit`; one-line banner, typed input and replies wrap at word boundaries, model and effort at the right of the prompt, sub-agents in the bottom toolbar, and Markdown tables with rounded boxes and alternating rows
 
 ## Installation
@@ -157,9 +159,9 @@ Unknown commands are reported instead of being sent to the agent; a path such as
 
 | Tool | Description |
 |------|-------------|
-| `read(path)` | Read UTF-8 text (up to 100 KB; SVG is read as text) or a PNG, JPEG, GIF or WebP image (detected from its content, up to 3,932,160 bytes so the encoded image stays under 5 MB), returned as vision data; other image formats are refused |
+| `read(path, offset?, limit?)` | Read UTF-8 text (SVG is read as text) one page at a time: up to 2000 numbered lines and no more than the tool-result cap, ending with `[Showing lines A-B of N. Use offset=B+1 to continue.]` or `[End of file — N lines]`; lines over 2000 characters are cut. Or a PNG, JPEG, GIF or WebP image (detected from its content, up to 3,932,160 bytes so the encoded image stays under 5 MB), returned as vision data; other image formats are refused |
 | `write(path, content)` | Write or create a file as UTF-8, byte for byte (parent directories created automatically) |
-| `edit(path, oldText, newText)` | Strict find-and-replace — must match exactly once; keeps the file's line endings (CRLF files stay CRLF) and refuses files that are not UTF-8 |
+| `edit(path, oldText, newText, replace_all?)` | Find-and-replace that must match exactly once (or every match with `replace_all`). An exact match wins; only when there is none does it retry with typographic quotes, dashes and spaces normalized, then ignoring trailing whitespace, then with `read`'s line-number prefixes removed. A fuzzy match replaces only the original span. Keeps the file's line endings and BOM and refuses files that are not UTF-8 |
 
 Relative paths resolve against the conversation's workspace.
 
@@ -171,20 +173,20 @@ Relative paths resolve against the conversation's workspace.
 | `web_search(query, max_results?)` | Tavily web search: a short answer plus title, URL and snippet per result (1-10 results, default 5). A rate limit is retried once; when Tavily is out of credits, search is disabled until Kairos restarts and the agent is told to use the browser |
 | `git(command, **kwargs)` | Git operations: `status`, `diff`, `log`, `commit`, `branch` |
 
-Tool results are capped before they are stored or sent: 20,000 characters per result by default, keeping the beginning and end with the original length noted. Inline image data is sent as a separate vision message. Older saved chats are normalized the same way before their next request.
+Tool results are capped before they are stored or sent: 20,000 characters per result by default, keeping the beginning and end with the original length noted. The full text is saved to `~/.kairos/tool-output/` (files older than 7 days are deleted) and the marker names the file, so the agent can `read` or `search` it. Inline image data is sent as a separate vision message. Older saved chats are normalized the same way before their next request.
 
 ### Terminal Tools
 
 | Tool | Description |
 |------|-------------|
 | `new_terminal(background)` | Create a terminal — `true` for a persistent shell, `false` for one-shot commands |
-| `execute_command(terminal_id, command, timeout?, until?)` | Run a command. Blocking terminals wait up to `timeout` seconds (default and maximum 20). Background terminals return at once and notify when the command finishes; `until` (a regex) also notifies once when an output line matches |
+| `execute_command(command, terminal_id?, timeout?, until?)` | Run a command; without `terminal_id` it runs in a default blocking terminal. Blocking commands wait up to `timeout` seconds (default and maximum 20) and return plain text: `Exit code`, `Wall time` and the output. Background terminals return at once and notify when the command finishes; `until` (a regex) also notifies once when an output line matches |
 | `read_logs(terminal_id, tail?, start_line?, end_line?)` | Background output with a `[lines A-B of N]` header; the last 100 lines by default |
 | `stop_command(terminal_id)` | Kill the command running in a background terminal; the shell stays open |
 | `close_terminal(terminal_id)` | Close a terminal and release resources |
 | `get_terminal_info(terminal_id)` | Terminal status (type, closed, line count, pending commands) |
 
-Terminals start in the workspace. Blocking commands kill their whole process tree on timeout; a missing timeout means 20 s, an invalid one is rejected before the command starts. Background commands get an empty stdin, so a command that reads input gets end-of-file instead of swallowing the shell's next lines. Background shells keep their state (folder, environment) between commands and keep the full output for `read_logs`; notifications include up to 12,000 characters of output.
+Terminals start in the workspace, with `NO_COLOR=1`, `TERM=dumb` and `PAGER`/`GIT_PAGER`/`GH_PAGER=cat`. A blocking command still running at its timeout is not killed: it moves to a new background terminal (`read_logs`, `stop_command` and `close_terminal` work on it) and notifies when it finishes; a missing timeout means 20 s, an invalid one is rejected before the command starts. Background commands get an empty stdin, so a command that reads input gets end-of-file instead of swallowing the shell's next lines. Background shells keep their state (folder, environment) between commands and keep the full output for `read_logs`; notifications include up to 12,000 characters of output.
 
 ### Sub-Agent Tools
 
@@ -195,7 +197,7 @@ Terminals start in the workspace. Blocking commands kill their whole process tre
 | `terminate_subagent(subagent_id)` | Stop a running sub-agent (its context is kept) |
 | `list_subagents()` | ID, state, current tool, elapsed time, task and last 3 tool calls of each sub-agent |
 
-Sub-agents use the parent's current model and effort and share its workspace. They have every tool except the browser and the sub-agent tools, and their own system prompt that describes only those tools.
+Sub-agents use the parent's current model and effort and share its workspace. They have every tool except the browser and the sub-agent tools (desktop tools through `enable_tools`), and their own system prompt that describes only those tools.
 
 ### Skill Tools
 
@@ -206,6 +208,10 @@ Sub-agents use the parent's current model and effort and share its workspace. Th
 | `write_skill(skill_name, content, overwrite?)` | Create or update a skill's `SKILL.md` (default: refuses if exists; `overwrite=true` to replace) |
 
 Skills are stored in `skills/<skill-name>/SKILL.md`; the `skills/` folder is created when the first skill is written. Only skill names are injected into the system prompt — full content is loaded on demand via `load_skill`.
+
+### Optional tool groups
+
+Browser and desktop tools are off until needed: `enable_tools(group)` (`browser` or `desktop`) turns a group on for the rest of the conversation and returns its usage guide. A direct call to a tool of a group that is off turns the group on and runs. Enabled groups survive compaction and `/resume`.
 
 ### Browser Tools
 
@@ -304,7 +310,7 @@ Replies stream into a grey panel that shows the latest lines; the final reply be
 
 ### Compaction
 
-When the conversation context exceeds 80% of the context window (min(300k, the model's `max_context`)), older messages are summarized into a structured checkpoint (Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context, and chronological User Messages and Agent-to-User Messages) and replaced, keeping the most recent 20% of the budget. The check runs before every API step, including inside long tool-call loops. `/compact` triggers it manually.
+When the conversation context exceeds 80% of the context window (min(300k, the model's `max_context`)), older messages are replaced by your messages from that part, word for word (newest first, up to 20,000 tokens or a fifth of the window; older ones are counted as omitted), and a handoff summary (Progress, Key Decisions, Constraints & Preferences, Current State, Next Steps, Key Files & Context) that tells the model to build on the work rather than restart. The most recent 20% of the budget is kept as is. The check runs before every API step, including inside long tool-call loops. `/compact` triggers it manually.
 
 ### Skills
 
@@ -333,7 +339,7 @@ python -m pytest tests                    # also runs the pytest-style gateway t
 python tests/run_gateway_tests.py         # dependency-light gateway checks
 ```
 
-The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 184 unittest tests, 18 skipped). No test calls a live model.
+The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 240 unittest tests, 18 skipped). No test calls a live model.
 
 ## License
 

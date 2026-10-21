@@ -368,6 +368,18 @@ class BrokenToolCallTests(ProviderConfigMixin, unittest.TestCase):
         self.assertEqual(call["arguments"], "{}")
         assert_valid_chains(self, agent.adapter.requests[1])
 
+    def test_arguments_that_are_not_an_object_are_reported_and_not_run(self):
+        agent = Agent(self.workspace)
+        agent.adapter = ScriptAdapter(lambda m: [("tool_call", 0, "call_1", "write", "null")],
+                                      lambda m: [("tool_call", 0, "call_2", "write", '["out.txt", "x"]')],
+                                      lambda m: [("text", "Fixed.")])
+        self.assertEqual(agent.run("write it"), "Fixed.")
+        for result in self.results(agent):
+            self.assertTrue(result["error"].startswith("The arguments for write must be a JSON object."), result)
+        calls = [m["tool_calls"][0]["function"]["arguments"] for m in agent.conversation_history if m.get("tool_calls")]
+        self.assertEqual(calls, ["{}", "{}"])
+        self.assertFalse((Path(self.workspace) / "out.txt").exists())
+
     def test_repeated_unparseable_arguments_stop_the_run(self):
         agent = Agent(self.workspace)
         agent.adapter = ScriptAdapter(*[

@@ -311,6 +311,14 @@ class ReadPagingTests(TempWorkspace):
         self.assertNotIn("x" * 2001, result.output)
         self.assertIn("     2\tshort\n", result.output)
 
+    def test_huge_line_is_read_in_chunks_and_counted_in_characters(self):
+        f = self.ws / "huge.txt"
+        f.write_bytes(b"y" * 3_000_000 + b"\r\n" + "é".encode() * 3000 + b"\nend")
+        result = ReadTool()(str(f))
+        self.assertIn("y" * 2000 + " ... [line truncated: 3,000,000 chars]\n", result.output)
+        self.assertIn("é" * 2000 + " ... [line truncated: 3,000 chars]\n", result.output)
+        self.assertTrue(result.output.endswith("     3\tend\n[End of file — 3 lines]"), result.output[-80:])
+
     def test_offset_past_the_end_is_an_error(self):
         f = self.write_lines("s.txt", 3)
         result = ReadTool()(str(f), offset=10)

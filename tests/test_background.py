@@ -240,6 +240,15 @@ class AgentBackgroundTests(ProviderConfigMixin, unittest.TestCase):
         agent._is_subagent = False
         self.assertIn("Sub-agents cannot", json.loads(agent._execute_tool("list_subagents", {}))["error"])
 
+    def test_child_cannot_call_browser_tools_directly(self):
+        agent = Agent(self.workspace)
+        agent._is_subagent = True
+        agent.browser_tools["browser_navigate"] = lambda **kw: self.fail("the browser must not run")
+        result = json.loads(agent._execute_tool("browser_navigate", {"url": "https://example.com"}))
+        self.assertFalse(result["success"])
+        self.assertIn("Sub-agents have no browser", result["error"])
+        self.assertNotIn("browser", agent.enabled_tool_groups)
+
     def test_event_during_final_step_is_injected_into_the_same_run(self):
         agent = Agent(self.workspace)
         seen = []

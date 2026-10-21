@@ -1206,6 +1206,13 @@ class Agent:
                 "output": "",
                 "error": "Sub-agents cannot spawn, message, terminate or list sub-agents.",
             })
+        # The schema hides them, but a direct call would still dispatch.
+        if self._is_subagent and _tool_group(name) == "browser":
+            return json.dumps({
+                "success": False,
+                "output": "",
+                "error": "Sub-agents have no browser. Say in your result that this needs the browser.",
+            })
         # A call to a tool of a group that is off turns the group on and runs.
         group = _tool_group(name)
         if group in self._available_tool_groups():
@@ -1956,6 +1963,13 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                         error = (
                             f"Could not parse the arguments for {tc['name']} as JSON ({e}). "
                             f"Reissue the call with valid JSON arguments. Received: {raw[:300]}"
+                        )
+                    # null or a list would be stored and resent as the call's
+                    # input, which Anthropic rejects on every later request.
+                    if error is None and not isinstance(args, dict):
+                        args, error = {}, (
+                            f"The arguments for {tc['name']} must be a JSON object. "
+                            f"Reissue the call with an object of named arguments. Received: {raw[:300]}"
                         )
                 call = {"id": tc["id"], "name": tc["name"], "arguments": args}
                 if truncated or error:
