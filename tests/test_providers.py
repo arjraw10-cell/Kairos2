@@ -13,7 +13,7 @@ from unittest import mock
 import httpx
 
 from kairos import providers
-from kairos.agent import Agent
+from kairos.agent import Agent, TRUNCATED_CALL_ERROR
 from kairos.providers import base as provider_base
 from kairos.providers.anthropic import AnthropicAdapter
 from kairos.providers.completions import CompletionsAdapter
@@ -178,6 +178,19 @@ class CompletionsTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", plain)
         self.assertNotIn("extra_body", plain)
 
+    def test_openrouter_session_id_and_claude_cache_control(self):
+        adapter = CompletionsAdapter(providers.resolve("glm"))
+        adapter.session_id = "conv-1"
+        self.assertEqual(adapter.request_kwargs(HISTORY, None, "off")["extra_body"],
+                         {"reasoning": {"enabled": False}, "session_id": "conv-1"})
+        adapter.spec = replace(adapter.spec, model="anthropic/claude-x")
+        self.assertEqual(adapter.request_kwargs(HISTORY, None, None)["extra_body"],
+                         {"session_id": "conv-1", "cache_control": {"type": "ephemeral"}})
+        # Other OpenAI-compatible servers may reject unknown body fields.
+        other = CompletionsAdapter(providers.resolve("luna-chat"))
+        other.session_id = "conv-1"
+        self.assertNotIn("extra_body", other.request_kwargs(HISTORY, None, None))
+
     def test_stream_events(self):
         chunks = [
             chunk(content="Hel"), chunk(content="lo"),
@@ -317,10 +330,12 @@ class AnthropicTests(unittest.TestCase):
 
     def test_request_translation(self):
         body = AnthropicAdapter(self.spec).request_body(HISTORY, TOOLS, "high")
-        self.assertEqual(body["system"], "You are Kairos.")
+        cache = {"type": "ephemeral"}
+        # Cache breakpoints: system prompt, last tool, newest user turn.
+        self.assertEqual(body["system"], [{"type": "text", "text": "You are Kairos.", "cache_control": cache}])
         self.assertEqual((body["thinking"], body["output_config"]), ({"type": "adaptive"}, {"effort": "high"}))
         self.assertEqual(body["tools"], [{"name": "read", "description": "Read a file",
-                                          "input_schema": TOOLS[0]["function"]["parameters"]}])
+                                          "input_schema": TOOLS[0]["function"]["parameters"], "cache_control": cache}])
         messages = body["messages"]
         self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user"])
         self.assertEqual(messages[0]["content"][1], {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}})
@@ -331,7 +346,10 @@ class AnthropicTests(unittest.TestCase):
         ])
         # The tool result and the following screenshot merge into one user turn.
         self.assertEqual(messages[2]["content"][0], {"type": "tool_result", "tool_use_id": "call_1", "content": "{\"success\": true}"})
-        self.assertEqual(messages[2]["content"][2], {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}})
+        self.assertEqual(messages[2]["content"][2], {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"},
+                                                     "cache_control": cache})
+        self.assertEqual(json.dumps(body).count('"cache_control"'), 3)
+        self.assertNotIn("cache_control", json.dumps(messages[:2]))
         self.assertNotIn("thinking", AnthropicAdapter(self.spec).request_body(HISTORY, None, None))
 
     def test_recorded_stream(self):
@@ -358,10 +376,12 @@ class AnthropicTests(unittest.TestCase):
 
     def test_http_error_and_stream_error(self):
         adapter = AnthropicAdapter(self.spec, transport=httpx.MockTransport(
-            lambda request: httpx.Response(429, json={"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}})))
+            lambda request: httpx.Response(429, json={"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}},
+                                           headers={"retry-after": "7"})))
         with self.assertRaises(providers.ProviderError) as caught:
             adapter.stream(HISTORY, None, None)
         self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(Agent._retry_after(caught.exception), 7.0)
         self.assertIn("slow down", str(caught.exception))
         with self.assertRaises(providers.ProviderError) as caught:
             list(AnthropicAdapter.events([{"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}]))
@@ -389,6 +409,7 @@ def bare_agent(spec, events):
     agent = object.__new__(Agent)
     agent.spec, agent.model, agent.effort = spec, spec.model, spec.default_effort
     agent.adapter = FakeAdapter(events)
+    agent.session_id = "session-1"
     agent.conversation_history = [{"role": "user", "content": "hi"}]
     agent._interrupt_event = threading.Event()
     agent._active_stream_lock = threading.Lock()
@@ -423,6 +444,24 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(usage, {"prompt_tokens": 11, "completion_tokens": 3, "cached_tokens": 0})
         self.assertEqual(agent._stream_extras, {"_thinking": ["block"]})
         self.assertEqual(agent.adapter.calls[0][1:], (TOOLS, "high"))
+
+    def test_unparseable_and_cut_off_tool_calls_carry_an_error(self):
+        broken = '{"path": "x", "content": "unterminated'
+        agent = bare_agent(providers.resolve(), [
+            ("tool_call", 0, "call_a", "list_skills", ""),  # no arguments at all is fine
+            ("tool_call", 1, "call_b", "write", broken),
+        ])
+        _, calls, _ = agent._stream_response()
+        self.assertEqual(calls[0], {"id": "call_a", "name": "list_skills", "arguments": {}})
+        self.assertEqual(calls[1]["arguments"], {})
+        self.assertTrue(calls[1]["error"].startswith("Could not parse the arguments for write as JSON (Unterminated string"),
+                        calls[1]["error"])
+        self.assertTrue(calls[1]["error"].endswith("Reissue the call with valid JSON arguments. Received: " + broken))
+        self.assertEqual(agent.adapter.session_id, "session-1")
+        # A cut-off reply fails every call, also one whose JSON is complete.
+        agent = bare_agent(providers.resolve(), [("tool_call", 0, "call_a", "read", '{"path": "a"}'), ("truncated",)])
+        _, calls, _ = agent._stream_response()
+        self.assertEqual(calls, [{"id": "call_a", "name": "read", "arguments": {"path": "a"}, "error": TRUNCATED_CALL_ERROR}])
 
     def test_error_hints_for_keys_and_rate_limits(self):
         # AuthenticationError/RateLimitError are APIStatusErrors; the status
@@ -492,3 +531,21 @@ class ContextAndCostTests(unittest.TestCase):
         responses = list(ResponsesAdapter.events([NS(type="response.completed", response=NS(usage=NS(
             input_tokens=20, output_tokens=7, input_tokens_details=NS(cached_tokens=12))))]))
         self.assertEqual(responses, [("usage", 20, 7, 12)])
+
+
+class StopReasonTests(unittest.TestCase):
+    def test_cut_off_replies_are_reported_by_each_format(self):
+        def finished(reason):
+            delta = NS(content=None, tool_calls=[tc(0, "call_1", "write", '{"pa')], model_extra={})
+            return NS(choices=[NS(delta=delta, finish_reason=reason)], usage=None)
+
+        self.assertEqual(list(CompletionsAdapter.events([finished("length")])),
+                         [("truncated",), ("tool_call", 0, "call_1", "write", '{"pa')])
+        self.assertNotIn(("truncated",), list(CompletionsAdapter.events([finished("tool_calls")])))
+        incomplete = NS(type="response.incomplete", response=NS(incomplete_details=NS(reason="max_output_tokens"), usage=None))
+        self.assertEqual(list(ResponsesAdapter.events([incomplete])), [("truncated",)])
+        filtered = NS(type="response.incomplete", response=NS(incomplete_details=NS(reason="content_filter"), usage=None))
+        self.assertEqual(list(ResponsesAdapter.events([filtered])), [])
+        delta = lambda reason: {"type": "message_delta", "delta": {"stop_reason": reason}, "usage": {"output_tokens": 5}}
+        self.assertEqual(list(AnthropicAdapter.events([delta("max_tokens")])), [("truncated",)])
+        self.assertEqual(list(AnthropicAdapter.events([delta("tool_use")])), [])

@@ -1,6 +1,8 @@
 import json
+import random
 import threading
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable, Tuple
@@ -31,14 +33,23 @@ SUBAGENT_TOOL_NAMES = frozenset(
     ("spawn_subagent", "message_subagent", "terminate_subagent", "list_subagents")
 )
 
+# Tool calls of a reply cut off at the output-token limit are not run.
+TRUNCATED_CALL_ERROR = (
+    "Your response hit the output token limit, so this call's arguments may be truncated. "
+    "It was not run. Re-issue it with complete arguments, splitting large content into smaller calls."
+)
+# Schema types whose values a model may send as strings ("20", "false", '["a"]').
+_JSON_TYPES = {"integer": int, "number": (int, float), "boolean": bool, "array": list, "object": dict}
+
 
 class APIRequestError(Exception):
     """A concise, user-facing error raised after an API request is exhausted."""
 
 
 class Agent:
-    API_MAX_RETRIES = 2  # Two retries after the initial request.
-    API_RETRY_BASE_DELAY = 1.0
+    API_MAX_RETRIES = 5  # Retries after the initial request.
+    API_RETRY_BASE_DELAY = 2.0  # Doubles per retry, capped at API_RETRY_MAX_DELAY.
+    API_RETRY_MAX_DELAY = 30.0
     MAX_TOOL_RESULT_CHARS = Config.DEFAULT_MAX_TOOL_RESULT_CHARS
     # The same tool call (name and arguments) failing this many times in a row
     # gets a warning in its result, then stops the run.
@@ -52,6 +63,9 @@ class Agent:
         self.adapter = providers.create_adapter(self.spec)
         self.model = self.spec.model
         self.effort = self.spec.default_effort
+        # Identifies the conversation to the provider (OpenRouter sticky
+        # routing keeps its prompt cache warm); a reset starts a new one.
+        self.session_id = uuid.uuid4().hex
         self.max_tool_result_chars = Config.MAX_TOOL_RESULT_CHARS()
         # Terminals start in the workspace (not the gateway's CWD).
         self.terminal_manager = TerminalManager(cwd=str(Path(workspace).resolve()))
@@ -993,6 +1007,7 @@ class Agent:
 
     def _execute_tool(self, name: str, args: Dict[str, Any], max_chars: Optional[int] = None) -> str:
         """Execute a tool and return a capped JSON result for the model."""
+        name, args = self._repair_tool_call(name, args)
         dispatch = {
             "read": lambda a: self.read_tool(a["path"]).to_dict(),
             "write": lambda a: self.write_tool(a["path"], a["content"]).to_dict(),
@@ -1080,6 +1095,35 @@ class Agent:
                 ),
                 ensure_ascii=False,
             )
+
+    def _repair_tool_call(self, name: str, args: Any) -> Tuple[str, Any]:
+        """Fix common slips of weaker models against the tool's schema: a tool
+        name in the wrong case, integer/number/boolean/array/object values
+        sent as strings, and null for optional parameters."""
+        schemas = {t["function"]["name"]: t["function"].get("parameters") or {} for t in self._get_tool_schema()}
+        if name not in schemas:
+            name = next((n for n in schemas if n.lower() == str(name).lower()), name)
+        schema = schemas.get(name)
+        if not schema or not isinstance(args, dict):
+            return name, args
+        properties = schema.get("properties") or {}
+        required = set(schema.get("required") or ())
+        repaired = {}
+        for key, value in args.items():
+            if value is None and key not in required:
+                continue
+            expected = (properties.get(key) or {}).get("type")
+            json_type = _JSON_TYPES.get(expected) if isinstance(expected, str) else None
+            if json_type and isinstance(value, str):
+                try:
+                    parsed = json.loads(value.strip().lower() if expected == "boolean" else value)
+                except json.JSONDecodeError:
+                    parsed = None
+                # bool is an int subclass: "true" is no integer.
+                if isinstance(parsed, json_type) and (expected == "boolean" or not isinstance(parsed, bool)):
+                    value = parsed
+            repaired[key] = value
+        return name, repaired
 
     def _tool_parameters(self, name: str) -> set:
         """Parameter names the tool's schema declares."""
@@ -1615,20 +1659,48 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
     @staticmethod
     def _is_retryable_error(e: Exception) -> bool:
+        err = str(e).lower()
+        # OpenAI reports an exhausted quota (billing) as a 429 too, but waiting
+        # does not fix it. (OpenRouter credits: 402; Anthropic billing: 400.)
+        if "insufficient_quota" in err:
+            return False
         if isinstance(e, (RateLimitError, APIConnectionError, httpx.TransportError)):
             return True
         if isinstance(e, APIStatusError) or (isinstance(e, providers.ProviderError) and e.status_code):
-            return e.status_code in (429, 500, 502, 503, 504, 529)
-        err = str(e).lower()
+            # Like the OpenAI SDK: timeout, conflict, rate limit, server errors.
+            return e.status_code in (408, 409, 429) or e.status_code >= 500
         return any(c in err for c in ["timeout", "connection", "network", "remoteprotocolerror", "incomplete chunked read"])
 
-    def _retry_delay(self, attempt: int, base_delay: Optional[float] = None) -> float:
-        """Return a short exponential backoff with small deterministic jitter."""
+    def _retry_delay(self, attempt: int, base_delay: Optional[float] = None,
+                     error: Optional[Exception] = None) -> float:
+        """The server's retry-after (up to 60 s) when ``error`` carries one,
+        else exponential backoff capped at API_RETRY_MAX_DELAY with 20% jitter."""
+        retry_after = self._retry_after(error)
+        if retry_after is not None and retry_after <= 60:
+            return retry_after
         delay = self.API_RETRY_BASE_DELAY if base_delay is None else base_delay
-        return delay * (2 ** attempt) + 0.5 * attempt
+        return min(delay * (2 ** attempt), self.API_RETRY_MAX_DELAY) * random.uniform(0.8, 1.2)
+
+    @staticmethod
+    def _retry_after(error: Optional[Exception]) -> Optional[float]:
+        """Seconds from the retry-after-ms / retry-after response headers of
+        an OpenAI SDK error or a ProviderError (an HTTP date is ignored)."""
+        headers = getattr(error, "headers", None)
+        if headers is None:
+            headers = getattr(getattr(error, "response", None), "headers", None)
+        if not headers:
+            return None
+        for name, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+            try:
+                seconds = float(headers.get(name)) * scale
+            except (TypeError, ValueError):
+                continue
+            if seconds >= 0:
+                return seconds
+        return None
 
     def _stream_response(self) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, int]]]:
-        """Stream a response, retrying transient connection failures twice.
+        """Stream a response, retrying transient failures (API_MAX_RETRIES).
 
         Retries cover both request creation and iteration: a gateway can close
         a chunked response after streaming has already started.  Partial data
@@ -1658,6 +1730,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             tool_calls: Dict[int, Dict[str, str]] = {}
             api_usage = None
             extras: Dict[str, Any] = {}
+            truncated = False
             # Adapters normalize every wire format into the same events
             # (see kairos/providers/base.py).
             for event in stream:
@@ -1681,16 +1754,30 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                                  "cached_tokens": event[3] if len(event) > 3 else 0}
                 elif kind == "message_extra":
                     extras[event[1]] = event[2]
+                elif kind == "truncated":
+                    truncated = True
             self._check_interrupt()  # a stream closed by interrupt() may just end
 
+            # A call with an "error" is not run: step() returns the error as
+            # its result. Its arguments are stored as {}: raw invalid JSON
+            # would make the next request fail.
             assembled = []
             for idx in sorted(tool_calls.keys()):
                 tc = tool_calls[idx]
-                try:
-                    args = json.loads(tc["arguments"])
-                except json.JSONDecodeError:
-                    args = {}
-                assembled.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+                raw = tc["arguments"]
+                args, error = {}, None
+                if raw.strip():  # a call without arguments may send nothing
+                    try:
+                        args = json.loads(raw)
+                    except json.JSONDecodeError as e:
+                        error = (
+                            f"Could not parse the arguments for {tc['name']} as JSON ({e}). "
+                            f"Reissue the call with valid JSON arguments. Received: {raw[:300]}"
+                        )
+                call = {"id": tc["id"], "name": tc["name"], "arguments": args}
+                if truncated or error:
+                    call["error"] = TRUNCATED_CALL_ERROR if truncated else error
+                assembled.append(call)
             # Provider state for the assistant message (step() attaches it).
             self._stream_extras = extras
             return content, assembled, api_usage
@@ -1699,6 +1786,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
     def _open_stream(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]):
         """Open a provider stream that interrupt() can close."""
+        self.adapter.session_id = self.session_id
         stream = self.adapter.stream(messages, tools, self.effort)
         with self._active_stream_lock:
             self._active_stream = stream
@@ -1750,7 +1838,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                     break
                 if on_retry:
                     on_retry()
-                if self._interrupt_event.wait(self._retry_delay(n)):
+                if self._interrupt_event.wait(self._retry_delay(n, error=e)):
                     raise InterruptedError("Interrupted by user")
 
         raise APIRequestError(self._format_api_error(last_exc)) from None
@@ -1863,7 +1951,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
                     self.on_tool_call(func_name, func_args)
                 except Exception:
                     pass  # like on_tool_result: observers must never break tool execution
-            result_json = self._execute_tool(func_name, func_args)
+            if tc.get("error"):  # unparseable or truncated arguments: not run
+                result_json = json.dumps({"success": False, "output": "", "error": tc["error"]}, ensure_ascii=False)
+            else:
+                result_json = self._execute_tool(func_name, func_args)
             result_dict = json.loads(result_json)
             warning = self._track_repeated_failure(func_name, func_args, result_dict)
             if warning:
@@ -2010,6 +2101,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
         self._interrupt_event.clear()
         self._interrupted_pending = False
         self._api_context = None
+        self.session_id = uuid.uuid4().hex
         # Notifications of the old conversation must not reach the new one.
         self.drain_background_events()
         self._setup_system_prompt()

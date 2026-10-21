@@ -27,6 +27,8 @@ class CompletionsAdapter:
         self.spec = spec
         self._pool = key_pool(spec.api_keys)
         self._clients: dict[str, OpenAI] = {}
+        # Set by the Agent: stable for one conversation, new after a reset.
+        self.session_id: Optional[str] = None
 
     def request_kwargs(self, messages: list, tools: Optional[list], effort: Optional[str]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -38,11 +40,23 @@ class CompletionsAdapter:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        extra: dict[str, Any] = {}
         if effort in ("on", "off"):
             # Models that only toggle reasoning (e.g. MiMo on OpenRouter).
-            kwargs["extra_body"] = {"reasoning": {"enabled": effort == "on"}}
+            extra["reasoning"] = {"enabled": effort == "on"}
         elif effort:
             kwargs["reasoning_effort"] = effort
+        if "openrouter.ai" in self.spec.base_url:
+            # session_id keeps routing the conversation to the same provider
+            # endpoint, whose prompt cache is warm (OpenRouter sticky routing).
+            if self.session_id:
+                extra["session_id"] = self.session_id
+            # Claude models cache only at breakpoints; a top-level
+            # cache_control puts one on the last cacheable block of each request.
+            if self.spec.model.startswith("anthropic/"):
+                extra["cache_control"] = {"type": "ephemeral"}
+        if extra:
+            kwargs["extra_body"] = extra
         return kwargs
 
     def _wire_message(self, message: dict) -> dict:
@@ -71,6 +85,8 @@ class CompletionsAdapter:
                 yield ("usage", chunk.usage.prompt_tokens or 0, chunk.usage.completion_tokens or 0, cached)
             if not chunk.choices:
                 continue
+            if getattr(chunk.choices[0], "finish_reason", None) == "length":
+                yield ("truncated",)
             delta = chunk.choices[0].delta
             if not delta:
                 continue

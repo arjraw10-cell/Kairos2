@@ -4,9 +4,12 @@ tool error messages. No network: adapters are scripted."""
 import json
 import threading
 import unittest
+from pathlib import Path
+
+import httpx
 
 from kairos import providers
-from kairos.agent import Agent, APIRequestError
+from kairos.agent import Agent, APIRequestError, TRUNCATED_CALL_ERROR
 from kairos.providers.base import EventStream
 from kairos.resume import repair_tool_chains
 from kairos.tokens import TokenCounter
@@ -327,3 +330,103 @@ class HostStopAndResetTests(ProviderConfigMixin, unittest.TestCase):
         self.assertFalse(agent.browser_manager.is_open)
         agent.reset()
         self.assertEqual(closed, [True])
+
+
+class BrokenToolCallTests(ProviderConfigMixin, unittest.TestCase):
+    BROKEN = '{"path": "out.txt", "content": "line one\nline two'  # raw newline, no closing quote
+
+    def results(self, agent):
+        return [json.loads(m["content"]) for m in agent.conversation_history if m.get("role") == "tool"]
+
+    def test_unparseable_arguments_are_reported_and_not_run(self):
+        agent = Agent(self.workspace)
+        agent.adapter = ScriptAdapter(lambda m: [("tool_call", 0, "call_1", "write", self.BROKEN)],
+                                      lambda m: [("text", "Fixed.")])
+        self.assertEqual(agent.run("write it"), "Fixed.")
+        error = self.results(agent)[0]["error"]
+        self.assertTrue(error.startswith("Could not parse the arguments for write as JSON ("), error)
+        self.assertNotIn("Missing required argument", error)
+        self.assertFalse((Path(self.workspace) / "out.txt").exists())
+        # The stored call has valid (empty) arguments, so the history stays sendable.
+        call = agent.conversation_history[2]["tool_calls"][0]["function"]
+        self.assertEqual(call["arguments"], "{}")
+        assert_valid_chains(self, agent.adapter.requests[1])
+
+    def test_repeated_unparseable_arguments_stop_the_run(self):
+        agent = Agent(self.workspace)
+        agent.adapter = ScriptAdapter(*[
+            (lambda m, i=i: [("tool_call", 0, f"call_{i}", "write", self.BROKEN)]) for i in range(10)])
+        reply = agent.run("write it")
+        self.assertTrue(reply.startswith("[Stopped: write failed 5 times in a row"), reply)
+        self.assertEqual(len(agent.adapter.requests), 5)
+
+    def test_calls_of_a_cut_off_reply_are_not_run(self):
+        agent = Agent(self.workspace)
+        agent.adapter = ScriptAdapter(
+            lambda m: [tool_call("call_1", "write", {"path": "out.txt", "content": "x"}), ("truncated",)],
+            lambda m: [("text", "Split it.")])
+        self.assertEqual(agent.run("write it"), "Split it.")
+        self.assertEqual(self.results(agent)[0]["error"], TRUNCATED_CALL_ERROR)
+        self.assertFalse((Path(self.workspace) / "out.txt").exists())
+
+    def test_light_repair_against_the_schema(self):
+        agent = Agent(self.workspace)
+        repair = agent._repair_tool_call
+        self.assertEqual(repair("Read_Logs", {"terminal_id": "2", "tail": " 20 ", "start_line": None}),
+                         ("read_logs", {"terminal_id": 2, "tail": 20}))
+        self.assertEqual(repair("new_terminal", {"background": "False"}), ("new_terminal", {"background": False}))
+        self.assertEqual(repair("desktop_hotkey", {"pid": 1, "keys": '["ctrl", "c"]', "x": "1.5"}),
+                         ("desktop_hotkey", {"pid": 1, "keys": ["ctrl", "c"], "x": 1.5}))
+        # Values that are not the schema's type stay as sent; a required null stays.
+        self.assertEqual(repair("read_logs", {"terminal_id": None, "tail": "true", "end_line": "ten"}),
+                         ("read_logs", {"terminal_id": None, "tail": "true", "end_line": "ten"}))
+        self.assertEqual(repair("search", {"pattern": "20"}), ("search", {"pattern": "20"}))
+        self.assertEqual(repair("no_such_tool", "x"), ("no_such_tool", "x"))
+        # Through dispatch: the repaired call runs.
+        result = json.loads(agent._execute_tool("New_Terminal", {"background": "false"}))
+        self.assertTrue(result["success"], result)
+
+
+class RetryPolicyTests(ProviderConfigMixin, unittest.TestCase):
+    def test_only_transient_errors_are_retried(self):
+        from openai import RateLimitError
+
+        error = providers.ProviderError
+        for status in (408, 429, 500, 520, 529):
+            self.assertTrue(Agent._is_retryable_error(error("HTTP error", status)), status)
+        for status in (400, 401, 402, 403, 404):
+            self.assertFalse(Agent._is_retryable_error(error("HTTP error", status)), status)
+        self.assertFalse(Agent._is_retryable_error(error("HTTP 400: prompt is too long", 400)))
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        quota = RateLimitError("Error code: 429 - You exceeded your current quota (insufficient_quota)",
+                               response=httpx.Response(429, request=request), body=None)
+        self.assertFalse(Agent._is_retryable_error(quota))
+        limited = RateLimitError("Rate limit reached", response=httpx.Response(429, request=request), body=None)
+        self.assertTrue(Agent._is_retryable_error(limited))
+
+    def test_backoff_and_retry_after(self):
+        from openai import RateLimitError
+
+        agent = Agent(self.workspace)
+        self.assertEqual(agent.API_MAX_RETRIES, 5)
+        delays = [agent._retry_delay(n) for n in range(6)]
+        self.assertTrue(1.6 <= delays[0] <= 2.4, delays)
+        self.assertTrue(all(24 <= d <= 36 for d in delays[4:]), delays)  # capped near 30 s
+        error = providers.ProviderError
+        self.assertEqual(agent._retry_delay(0, error=error("slow", 429, {"retry-after": "3"})), 3.0)
+        self.assertEqual(agent._retry_delay(0, error=error("slow", 429, {"retry-after-ms": "1500"})), 1.5)
+        self.assertLess(agent._retry_delay(0, error=error("slow", 429, {"retry-after": "3600"})), 3)  # too long: backoff
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        sdk = RateLimitError("slow", response=httpx.Response(429, request=request, headers={"retry-after": "4"}), body=None)
+        self.assertEqual(agent._retry_delay(0, error=sdk), 4.0)
+
+    def test_session_id_is_sent_and_changes_on_reset(self):
+        agent = Agent(self.workspace)
+        agent.adapter = ScriptAdapter(lambda m: [("text", "One.")], lambda m: [("text", "Two.")])
+        agent.run("first")
+        first = agent.adapter.session_id
+        self.assertEqual(first, agent.session_id)
+        agent.run("second")
+        self.assertEqual(agent.adapter.session_id, first)
+        agent.reset()
+        self.assertNotEqual(agent.session_id, first)

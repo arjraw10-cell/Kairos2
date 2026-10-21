@@ -10,6 +10,8 @@ and normalize the streamed reply into these events:
   is the part of prompt_tokens served from the provider's prompt cache
 * ``("message_extra", key, value)`` - provider state to keep on the assistant
   message (private ``_`` keys, e.g. Anthropic thinking blocks)
+* ``("truncated",)`` - the reply stopped at the output-token limit, so its
+  tool-call arguments may be incomplete
 """
 from __future__ import annotations
 
@@ -21,9 +23,10 @@ from typing import Any, Callable, Iterable
 class ProviderError(Exception):
     """A provider failure that did not come from the OpenAI SDK."""
 
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(self, message: str, status_code: int | None = None, headers: Any = None):
         super().__init__(message)
         self.status_code = status_code
+        self.headers = headers  # response headers (retry-after), when there was a response
 
 
 class EventStream:

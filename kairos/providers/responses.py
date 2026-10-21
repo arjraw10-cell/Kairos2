@@ -131,6 +131,9 @@ class ResponsesAdapter:
                 if getattr(item, "type", "") == "function_call" and event.output_index not in streamed_args:
                     yield ("tool_call", event.output_index, "", "", item.arguments or "")
             elif etype in ("response.completed", "response.incomplete"):
+                incomplete = getattr(event.response, "incomplete_details", None)
+                if getattr(incomplete, "reason", None) == "max_output_tokens":
+                    yield ("truncated",)
                 usage = getattr(event.response, "usage", None)
                 if usage:
                     details = getattr(usage, "input_tokens_details", None)

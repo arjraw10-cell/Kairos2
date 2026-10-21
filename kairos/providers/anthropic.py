@@ -18,6 +18,7 @@ _TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 ANTHROPIC_VERSION = "2023-06-01"
 MAX_TOKENS = 32000  # required by the API; streaming avoids HTTP timeouts
 THINKING_KEY = "_thinking"  # assistant-message key holding thinking blocks to echo back
+CACHE = {"type": "ephemeral"}  # prompt-cache breakpoint (5-minute TTL)
 
 
 def _image_block(part: dict) -> dict:
@@ -139,10 +140,17 @@ class AnthropicAdapter:
             "messages": translated,
             "stream": True,
         }
+        # Prompt-cache breakpoints (at most 4 allowed): the system prompt, the
+        # last tool definition and the newest user turn, so each request reads
+        # the previous request's prefix from the cache.
         if system:
-            body["system"] = system
+            body["system"] = [{"type": "text", "text": system, "cache_control": CACHE}]
         if tools:
             body["tools"] = translate_tools(tools)
+            if body["tools"]:
+                body["tools"][-1]["cache_control"] = CACHE
+        if translated and translated[-1]["role"] == "user":
+            translated[-1]["content"][-1]["cache_control"] = CACHE
         if effort:
             body["thinking"] = {"type": "adaptive"}
             body["output_config"] = {"effort": effort}
@@ -159,7 +167,8 @@ class AnthropicAdapter:
                 detail = ""
             finally:
                 response.close()
-            raise ProviderError(f"HTTP {response.status_code}: {detail or response.reason_phrase}", response.status_code)
+            raise ProviderError(f"HTTP {response.status_code}: {detail or response.reason_phrase}",
+                                response.status_code, response.headers)
         return response
 
     def stream(self, messages: list, tools: Optional[list], effort: Optional[str]) -> EventStream:
@@ -206,6 +215,8 @@ class AnthropicAdapter:
                     thinking[index]["signature"] = thinking[index].get("signature", "") + delta.get("signature", "")
             elif etype == "message_delta":
                 completion_tokens = (event.get("usage") or {}).get("output_tokens", completion_tokens)
+                if (event.get("delta") or {}).get("stop_reason") == "max_tokens":
+                    yield ("truncated",)
             elif etype == "message_stop":
                 yield ("usage", prompt_tokens, completion_tokens, cached_tokens)
                 if thinking:
