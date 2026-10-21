@@ -25,7 +25,7 @@ class ExecuteCommandTool:
 
     def __call__(
         self,
-        terminal_id: int,
+        terminal_id: Optional[int],
         command: str,
         timeout: Optional[float] = None,
         is_background: Optional[bool] = None,
@@ -35,7 +35,10 @@ class ExecuteCommandTool:
             success, output = self.terminal_manager.execute_command(
                 terminal_id, command, timeout, is_background, until
             )
-            return ToolResult(success, output)
+            if success or output.startswith(self.terminal_manager.EXIT_CODE_HEADER):
+                return ToolResult(success, output)
+            # Nothing ran (unknown terminal, bad timeout, ...): an error.
+            return ToolResult(False, "", output)
         except Exception as e:
             return ToolResult(False, "", f"Command execution error: {str(e)}")
 

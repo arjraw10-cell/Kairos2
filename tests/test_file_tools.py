@@ -87,7 +87,7 @@ class WorkspacePathTests(TempWorkspace):
             tid, "cd" if os.name == "nt" else "pwd", timeout=10
         )
         self.assertTrue(ok, out)
-        self.assertEqual(Path(out.strip()).resolve(), self.ws)
+        self.assertEqual(Path(out.strip().splitlines()[-1]).resolve(), self.ws)
         # SkillManager no longer creates <workspace>/skills for every Agent.
         self.assertFalse((self.ws / "skills").exists())
 
