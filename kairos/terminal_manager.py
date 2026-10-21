@@ -39,12 +39,22 @@ class Terminal:
 class TerminalManager:
     """Own blocking and persistent background terminal sessions.
 
-    Blocking commands are deliberately short-lived and have a hard maximum
-    timeout. Background commands are submitted to a persistent shell and are
+    Blocking commands are waited for at most 20 seconds; one still running
+    then moves to a new background terminal. Background commands are submitted to a persistent shell and are
     completed asynchronously by the shell-output reader.
     """
 
     MAX_BLOCKING_TIMEOUT = 20.0
+    # Every blocking result that ran a command starts with this header.
+    EXIT_CODE_HEADER = "Exit code:"
+    # Plain output for the model: no ANSI colors, and nothing waits on a pager.
+    COMMAND_ENV = {
+        "NO_COLOR": "1",
+        "TERM": "dumb",
+        "PAGER": "cat",
+        "GIT_PAGER": "cat",
+        "GH_PAGER": "cat",
+    }
     # Notifications are deliberately capped before they enter the model
     # context or the visible CLI. The complete terminal output remains in the
     # terminal's read_logs buffer.
@@ -65,9 +75,11 @@ class TerminalManager:
         self._lock = threading.Lock()
         self._completed_background_commands: Deque[dict] = deque()
         self._completion_callback = None
-        # Blocking commands are registered while communicate() is waiting so
+        # Blocking commands are registered while execute_command waits so
         # an external hard interrupt can kill them immediately.
         self._active_blocking: Dict[int, subprocess.Popen] = {}
+        # Blocking terminal used by execute_command without a terminal_id.
+        self._default_terminal_id: Optional[int] = None
 
     def set_completion_callback(self, callback) -> None:
         """Set the consumer of background-command events.
@@ -110,6 +122,7 @@ class TerminalManager:
                 "errors": "replace",
                 "bufsize": 1,
                 "cwd": self.cwd,
+                "env": {**os.environ, **self.COMMAND_ENV},
             }
             if sys.platform == "win32":
                 # Helps close/timeout cleanup target the shell process. The
@@ -131,15 +144,6 @@ class TerminalManager:
             self.terminals[terminal_id] = term
 
         return terminal_id
-
-    @staticmethod
-    def _coerce_output(value) -> str:
-        """Normalize subprocess output, including partial timeout output."""
-        if value is None:
-            return ""
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
-        return str(value)
 
     @staticmethod
     def _parse_completion_marker(line: str, marker: str) -> Tuple[bool, Optional[int]]:
@@ -195,15 +199,6 @@ class TerminalManager:
                 process.kill()
             except Exception:
                 pass
-
-    @staticmethod
-    def _close_process_streams(process: subprocess.Popen) -> None:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
 
     @staticmethod
     def _reap_process(process: subprocess.Popen) -> None:
@@ -353,6 +348,28 @@ class TerminalManager:
             for delivery in deliveries:
                 self._emit_completion(delivery)
 
+    def _read_blocking_output(self, term: Terminal, command: _BackgroundCommand) -> None:
+        """Collect a blocking command's output until its pipe closes.
+
+        ``term`` is registered only if the command outlived its timeout and
+        was moved to the background (its command is then pending); the
+        finish is then reported like any background command's.
+        """
+        for line in iter(term.process.stdout.readline, ""):
+            with self._lock:
+                command.output += line
+                term.output_buffer += line
+        term.process.stdout.close()
+        exit_code = term.process.wait()
+        delivery = None
+        with self._lock:
+            term.reader_finished = True
+            if term.pending_commands and term.pending_commands[0] is command:
+                term.pending_commands.popleft()
+                delivery = self._queue_background_completion_locked(term, command, exit_code)
+        if delivery is not None:
+            self._emit_completion(delivery)
+
     @staticmethod
     def _normalize_blocking_timeout(
         timeout: Optional[float],
@@ -373,16 +390,18 @@ class TerminalManager:
 
     def execute_command(
         self,
-        terminal_id: int,
+        terminal_id: Optional[int],
         command: str,
         timeout: Optional[float] = None,
         is_background: Optional[bool] = None,
         until: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
-        Execute a command in a terminal.
+        Execute a command in a terminal (``None``: the default blocking one).
 
-        Blocking terminals require a timeout and clamp it to 20 seconds.
+        Blocking terminals clamp the timeout to 20 seconds and return the
+        exit code, wall time and output. A command still running then keeps
+        running in a new background terminal, which reports its finish.
         Background terminals submit commands immediately; their timeout is
         intentionally ignored because the persistent shell may run commands
         for an arbitrary length of time. Completion is returned later through
@@ -390,6 +409,11 @@ class TerminalManager:
         ``until`` (background only) is a regex: the first output line that
         matches produces a one-time ``terminal_matched`` event.
         """
+        if terminal_id is None:
+            if self._default_terminal_id not in self.terminals:
+                self._default_terminal_id = self.create_terminal(background=False)
+            terminal_id = self._default_terminal_id
+
         with self._lock:
             term = self.terminals.get(terminal_id)
 
@@ -429,7 +453,11 @@ class TerminalManager:
             # particular command has finished, while the shell itself stays
             # alive for subsequent commands.
             if not term.process or not term.process.stdin:
-                return False, "Background terminal process not available"
+                # A command moved here from a blocking terminal has no shell.
+                return False, (
+                    f"Terminal {terminal_id} only holds a command moved from a blocking "
+                    "terminal and accepts no new commands; use another terminal."
+                )
             if term.process.poll() is not None or term.reader_finished:
                 return False, "Background terminal process has exited"
 
@@ -496,7 +524,8 @@ class TerminalManager:
         process_kwargs = {
             "shell": True,
             "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
+            # One stream, interleaved as in a terminal.
+            "stderr": subprocess.STDOUT,
             "text": True,
             "encoding": "utf-8",
             "errors": "replace",
@@ -504,6 +533,7 @@ class TerminalManager:
             # gateway or pytest capture it is invalid ([WinError 6]).
             "stdin": subprocess.DEVNULL,
             "cwd": self.cwd,
+            "env": {**os.environ, **self.COMMAND_ENV},
         }
         if sys.platform == "win32":
             process_kwargs["creationflags"] = getattr(
@@ -514,37 +544,41 @@ class TerminalManager:
 
         process = None
         try:
+            started = time.monotonic()
             process = subprocess.Popen(command, **process_kwargs)
             with self._lock:
                 # Retain the process by terminal ID for hard cancellation.
                 self._active_blocking[terminal_id] = process
-            try:
-                stdout, stderr = process.communicate(timeout=effective_timeout)
-            except subprocess.TimeoutExpired as exc:
-                # Kill descendants as well as the shell wrapper, otherwise a
-                # child retaining the output pipe can make communicate() wait
-                # long after the advertised timeout.
-                self._terminate_process_tree(process)
-                partial_output = self._coerce_output(exc.output)
-                partial_error = self._coerce_output(exc.stderr)
-                try:
-                    process.wait(timeout=0.25)
-                except subprocess.TimeoutExpired:
-                    threading.Thread(
-                        target=self._reap_process, args=(process,), daemon=True
-                    ).start()
-                partial = partial_output + partial_error
-                self._close_process_streams(process)
-                message = f"Command timed out after {effective_timeout:g} seconds"
-                if partial:
-                    message += f"\nPartial output:\n{partial}"
-                return False, message
+            # The output is read by a thread so that, on timeout, the command
+            # can keep running as a background terminal instead of being killed.
+            pending = _BackgroundCommand(marker="", command=command, started_at=started)
+            moved = Terminal(id=0, background=True, process=process)
+            reader = threading.Thread(
+                target=self._read_blocking_output, args=(moved, pending), daemon=True
+            )
+            reader.start()
+            reader.join(effective_timeout)
+            with self._lock:
+                # The reader marks the end of output (and process exit) under
+                # this lock, so the command is either complete or moved, never both.
+                if not moved.reader_finished:
+                    moved.id = self.next_id
+                    self.next_id += 1
+                    moved.pending_commands.append(pending)
+                    self.terminals[moved.id] = moved
+                    return True, (
+                        f"Still running after {effective_timeout:g}s; moved to background as "
+                        f"terminal {moved.id}. You will be notified when it finishes; use "
+                        f"read_logs with terminal_id {moved.id} to check its output, or "
+                        "stop_command to stop it.\n"
+                        f"Output so far:\n{pending.output or '(none)'}"
+                    )
+                output = pending.output
 
-            output = self._coerce_output(stdout) + self._coerce_output(stderr)
-            if process.returncode == 0:
-                return True, output if output else "Command executed successfully (no output)"
-            return False, output if output else (
-                f"Command exited with code {process.returncode} (no output)"
+            return process.returncode == 0, (
+                f"{self.EXIT_CODE_HEADER} {process.returncode}\n"
+                f"Wall time: {time.monotonic() - started:.1f}s\n"
+                f"Output:\n{output or '(none)'}"
             )
         except Exception as e:
             return False, f"Command execution failed: {str(e)}"

@@ -376,6 +376,6 @@ class ToolArgumentErrorTests(ProviderConfigMixin, unittest.TestCase):
         # Models sometimes drop a required argument; a bare "'terminal_id'" made
         # them retry the same broken call, so the error must name what is missing.
         agent = Agent(self.workspace)
-        result = json.loads(agent._execute_tool("execute_command", {"command": "echo hi"}))
+        result = json.loads(agent._execute_tool("execute_command", {"terminal_id": 1}))
         self.assertFalse(result["success"])
-        self.assertIn("Missing required argument 'terminal_id' for tool execute_command", result["error"])
+        self.assertIn("Missing required argument 'command' for tool execute_command", result["error"])

@@ -47,7 +47,7 @@ def test_terminals_start_in_the_given_cwd(tmp_path):
     blocking = manager.create_terminal(background=False)
     ok, out = manager.execute_command(blocking, PWD, timeout=10)
     assert ok, out
-    assert Path(out.strip()).resolve() == tmp_path.resolve()
+    assert Path(out.strip().splitlines()[-1]).resolve() == tmp_path.resolve()
 
     events = []
     manager.set_completion_callback(events.append)
@@ -117,3 +117,111 @@ def test_stop_command_kills_the_running_command():
         assert finished(events)[0]["stopped"] is True
     finally:
         manager.close_terminal(tid)
+
+
+PY = f'"{sys.executable}"'
+
+
+def test_blocking_result_states_exit_code_wall_time_and_output():
+    manager = TerminalManager()
+    tid = manager.create_terminal(background=False)
+    ok, out = manager.execute_command(tid, f'{PY} -c "print(1); print(2)"', timeout=10)
+    assert ok, out
+    lines = out.splitlines()
+    assert lines[0] == "Exit code: 0"
+    assert lines[1].startswith("Wall time: ") and lines[1].endswith("s")
+    assert lines[2:] == ["Output:", "1", "2"]
+
+    # A failure with output still states its exit code; stderr is included.
+    ok, out = manager.execute_command(
+        tid, f'{PY} -c "import sys; print(\'oops\', file=sys.stderr); sys.exit(3)"', timeout=10
+    )
+    assert not ok
+    assert out.startswith("Exit code: 3\n") and out.endswith("Output:\noops\n")
+
+
+def test_commands_get_plain_output_environment():
+    manager = TerminalManager()
+    probe = f'{PY} -c "import os; print([os.environ.get(k) for k in (\'NO_COLOR\', \'TERM\', \'PAGER\', \'GIT_PAGER\')])"'
+    expected = "['1', 'dumb', 'cat', 'cat']"
+    ok, out = manager.execute_command(None, probe, timeout=10)
+    assert ok and expected in out, out
+
+    events = []
+    manager.set_completion_callback(events.append)
+    background = manager.create_terminal(background=True)
+    try:
+        manager.execute_command(background, probe)
+        assert wait_for(lambda: finished(events))
+        assert expected in finished(events)[0]["output"]
+    finally:
+        manager.close_terminal(background)
+
+
+def test_default_terminal_is_created_lazily_and_recreated_after_close():
+    manager = TerminalManager()
+    ok, out = manager.execute_command(None, "echo hi")
+    assert ok and "hi" in out
+    first = manager._default_terminal_id
+    assert manager.get_terminal_info(first)["background"] is False
+    manager.execute_command(None, "echo again")
+    assert manager._default_terminal_id == first
+    manager.close_terminal(first)
+    ok, _ = manager.execute_command(None, "echo after close")
+    assert ok and manager._default_terminal_id != first
+    # Arguments from older histories still apply to the default terminal.
+    assert "only supported for background" in manager.execute_command(None, "echo x", until="x")[1]
+
+
+def test_slow_blocking_command_moves_to_background_and_reports_its_finish():
+    manager = TerminalManager()
+    events = []
+    manager.set_completion_callback(events.append)
+    blocking = manager.create_terminal(background=False)
+    ok, out = manager.execute_command(
+        blocking, f'{PY} -u -c "import time; print(\'started\'); time.sleep(2); print(\'done\')"', timeout=1
+    )
+    assert ok, out
+    assert out.startswith("Still running after 1s; moved to background as terminal ")
+    assert "Output so far:\nstarted" in out
+    moved = int(out.split("terminal ")[1].split(".")[0])
+    assert moved != blocking
+    assert manager.get_terminal_info(moved)["background"] is True
+    assert manager.running_background_commands() == 1
+    # The moved terminal has no shell for new commands; the blocking one is unchanged.
+    assert "accepts no new commands" in manager.execute_command(moved, "echo x")[1]
+    assert manager.execute_command(blocking, "echo still-blocking")[0]
+
+    assert wait_for(lambda: finished(events))
+    event = finished(events)[0]
+    assert (event["terminal_id"], event["success"], event["exit_code"]) == (moved, True, 0)
+    assert event["output"].split() == ["started", "done"]
+    assert event["duration_seconds"] >= 2
+    assert manager.read_logs(moved)[1].splitlines()[1:] == ["started", "done"]
+    assert manager.running_background_commands() == 0
+    manager.close_terminal(moved)
+    assert len(events) == 1
+
+
+def test_moved_command_can_be_stopped_or_closed():
+    manager = TerminalManager()
+    events = []
+    manager.set_completion_callback(events.append)
+    sleep = f'{PY} -c "import time; time.sleep(30)"'
+
+    out = manager.execute_command(None, sleep, timeout=0.5)[1]
+    moved = int(out.split("terminal ")[1].split(".")[0])
+    ok, message = manager.stop_command(moved)
+    assert ok, message
+    assert wait_for(lambda: finished(events))
+    assert finished(events)[0]["stopped"] is True
+
+    out = manager.execute_command(None, sleep, timeout=0.5)[1]
+    moved = int(out.split("terminal ")[1].split(".")[0])
+    process = manager.terminals[moved].process
+    manager.close_terminal(moved)
+    assert wait_for(lambda: len(finished(events)) == 2)
+    assert "closed" in finished(events)[1]["error"]
+    assert wait_for(lambda: process.poll() is not None)
+    time.sleep(0.3)  # the reader must not report the closed command a second time
+    assert len(finished(events)) == 2

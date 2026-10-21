@@ -2,6 +2,7 @@
 stops during compaction, provider-reported context, compaction prompt and
 tool error messages. No network: adapters are scripted."""
 import json
+import sys
 import threading
 import unittest
 
@@ -272,10 +273,11 @@ class ToolErrorTests(ProviderConfigMixin, unittest.TestCase):
         reply = agent.run("run the tests")
         self.assertEqual(len(agent.adapter.requests), 5)
         self.assertTrue(reply.startswith("[Stopped: execute_command failed 5 times in a row"), reply)
-        self.assertIn("terminal_id", reply)
-        results = [json.loads(m["content"]) for m in agent.conversation_history if m.get("role") == "tool"]
-        self.assertEqual(["warning" in r for r in results], [False, False, True, False, False])
-        self.assertIn("2 more identical failures", results[2]["warning"])
+        self.assertIn("'command'", reply)
+        # execute_command results are plain text; the warning is a "Warning:" paragraph.
+        results = [m["content"] for m in agent.conversation_history if m.get("role") == "tool"]
+        self.assertEqual(["Warning:" in r for r in results], [False, False, True, False, False])
+        self.assertIn("2 more identical failures", results[2])
         self.assertEqual(len(notices), 1)
         # The stop is the run's reply, so a resume does not continue the loop.
         self.assertEqual(agent.conversation_history[-1], {"role": "assistant", "content": reply})
@@ -289,9 +291,9 @@ class ToolErrorTests(ProviderConfigMixin, unittest.TestCase):
             lambda m: [("text", "Gave up.")],
         )
         self.assertEqual(agent.run("go"), "Gave up.")
-        results = [json.loads(m["content"]) for m in agent.conversation_history if m.get("role") == "tool"]
+        results = [m["content"] for m in agent.conversation_history if m.get("role") == "tool"]
         # Calls 0-1 and 3-5 are separate streaks; only the 3rd of the second one warns.
-        self.assertEqual(["warning" in r for r in results], [False, False, False, False, False, True])
+        self.assertEqual(["Warning:" in r for r in results], [False, False, False, False, False, True])
 
     def test_stop_mid_batch_answers_every_call(self):
         bad = {"is_background": False}
@@ -327,3 +329,22 @@ class HostStopAndResetTests(ProviderConfigMixin, unittest.TestCase):
         self.assertFalse(agent.browser_manager.is_open)
         agent.reset()
         self.assertEqual(closed, [True])
+
+
+class ExecuteCommandResultTests(ProviderConfigMixin, unittest.TestCase):
+    def test_result_is_plain_text_and_terminal_id_is_optional(self):
+        agent = Agent(self.workspace)
+        agent.adapter = ScriptAdapter(
+            lambda m: [tool_call("c1", "execute_command", {"command": f'"{sys.executable}" -c "print(1); print(2)"'})],
+            lambda m: [tool_call("c2", "execute_command", {"terminal_id": 99, "command": "echo x"})],
+            lambda m: [("text", "done")],
+        )
+        self.assertEqual(agent.run("go"), "done")
+        ran, missing = [m["content"] for m in agent.conversation_history if m.get("role") == "tool"]
+        # Real newlines, not a JSON blob; the default blocking terminal ran it.
+        self.assertTrue(ran.startswith("Exit code: 0\nWall time: "), ran)
+        self.assertTrue(ran.endswith("Output:\n1\n2\n"), ran)
+        self.assertEqual(missing, "Error: Terminal 99 not found")
+        # Other tools keep their JSON results.
+        self.assertEqual(json.loads(agent._execute_tool("list_skills", {}))["success"], True)
+        self.assertEqual(Agent._tool_summary("execute_command", {"command": "dir"}), "run: dir")

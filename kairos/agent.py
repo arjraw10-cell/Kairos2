@@ -311,7 +311,7 @@ class Agent:
             + ("When you finish your task, your final message (that has no tool calls) is returned as your result to the agent that started you.\n\n" if sub else
                "When you finish a task, the final message (that has no tool calls) will be showm to user as your message to them.\n\n") +
             "## Terminal Tools\n"
-            "Use a blocking terminal for short commands whose result you need immediately. Its execute_command call waits up to `timeout` seconds (default and maximum 20). Use a background terminal for servers, watchers, builds, or other long-running commands; timeout is ignored for background terminals. Background commands return immediately and the persistent shell stays alive. The full output remains available through read_logs.\n\n"
+            "For a command whose result you need now, call execute_command without terminal_id: it runs in a default blocking terminal and returns the exit code and output, waiting up to `timeout` seconds (default and maximum 20). A command still running then is not killed: it moves to a new background terminal that notifies you when it finishes. For servers, watchers and other long-running commands, open a background terminal with new_terminal; its commands return immediately, its shell keeps state (cd, set) between commands, and read_logs has the full output.\n\n"
             "## Background Work\n"
             + ("Background terminal commands report back with a `[Background notification]` message when a command finishes (or its `until` pattern matches), delivered before your next step while you are still working. Your final message ends your task; notifications that arrive after it reach you only if you are messaged again, so get the background results you need (read_logs has the output) before finishing.\n\n" if sub else
                "Background terminal commands and sub-agents report back with a `[Background notification]` message: when a command finishes (or its `until` pattern matches) and when a sub-agent finishes or fails. If your turn has already ended, you are woken with the notification. Never poll, sleep or wait for background work: start it, tell the user what is running, and end your turn or keep working on something else.\n\n") +
@@ -482,7 +482,9 @@ class Agent:
                 "function": {
                     "name": "execute_command",
                     "description": (
-                        "Execute a shell command in a terminal. In a background terminal the call returns "
+                        "Execute a shell command. Without terminal_id it runs in a default blocking terminal "
+                        "and returns the exit code and output; if still running after `timeout`, it moves to "
+                        "a background terminal instead of being killed. In a background terminal the call returns "
                         "immediately and you will be woken with a notification when the command finishes, "
                         "or when a line of its output matches `until`; end your turn or keep working instead "
                         "of polling."
@@ -490,7 +492,7 @@ class Agent:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "terminal_id": {"type": "integer", "description": "Terminal ID from new_terminal"},
+                            "terminal_id": {"type": "integer", "description": "Terminal ID from new_terminal. Omit to use the default blocking terminal."},
                             "command": {"type": "string", "description": "Shell command to execute"},
                             "timeout": {"type": "number", "description": "Blocking terminals: seconds to wait, default and maximum 20. Ignored for background terminals."},
                             "until": {"type": "string", "description": "Background terminals only: a regular expression. The first output line that matches notifies you once (with that line and recent output) while the command keeps running, e.g. 'Listening on' for a dev server."},
@@ -501,7 +503,7 @@ class Agent:
                         # characters, in every call. The terminal ID already says whether it
                         # is a background terminal, so is_background is not asked for either
                         # (an is_background argument from older histories is still checked).
-                        "required": ["terminal_id", "command"],
+                        "required": ["command"],
                     },
                 },
             },
@@ -1007,7 +1009,7 @@ class Agent:
             "web_search": lambda a: self.web_search_tool(a["query"], a.get("max_results", 5)).to_dict(),
             "git": lambda a: self.git_tool(a["command"], path=a.get("path"), count=a.get("count", 10), message=a.get("message", "")).to_dict(),
             "new_terminal": lambda a: self.new_terminal_tool(a["background"]).to_dict(),
-            "execute_command": lambda a: self.execute_command_tool(a["terminal_id"], a["command"], a.get("timeout"), a.get("is_background"), a.get("until")).to_dict(),
+            "execute_command": lambda a: self.execute_command_tool(a.get("terminal_id"), a["command"], a.get("timeout"), a.get("is_background"), a.get("until")).to_dict(),
             "read_logs": lambda a: self.read_logs_tool(a["terminal_id"], a.get("start_line"), a.get("end_line"), a.get("tail")).to_dict(),
             "stop_command": lambda a: self.stop_command_tool(a["terminal_id"]).to_dict(),
             "close_terminal": lambda a: self.close_terminal_tool(a["terminal_id"]).to_dict(),
@@ -1097,6 +1099,20 @@ class Agent:
             return _summarize_tool_call(name, args if isinstance(args, dict) else {})
         except Exception:
             return str(name)
+
+    @staticmethod
+    def _tool_message_content(name: str, result: Dict[str, Any]) -> str:
+        """Content of a tool message: the result as JSON, except plain text
+        for execute_command, whose shell output would lose its newlines to
+        JSON escaping."""
+        if name != "execute_command":
+            return json.dumps(result, ensure_ascii=False)
+        parts = [result["output"]] if result.get("output") else []
+        if result.get("error"):
+            parts.append(f"Error: {result['error']}")
+        if result.get("warning"):
+            parts.append(f"Warning: {result['warning']}")
+        return "\n\n".join(parts)
 
     @staticmethod
     def _get_text_content(content) -> str:
@@ -1878,7 +1894,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
             image_data_url = result_dict.pop("image_url", None)
             if image_data_url:
                 tool_image_data_urls.append(image_data_url)
-            text_content = json.dumps(result_dict, ensure_ascii=False)
+            text_content = self._tool_message_content(func_name, result_dict)
             # Checkpoint each result before looking for another interrupt. If
             # stop arrives while a tool is running, completed tools remain in
             # history and only the unfinished suffix is repaired on resume.
@@ -2071,7 +2087,9 @@ def _summarize_tool_call(name: str, args: Dict[str, Any]) -> str:
         if cmd == "commit": return f"git commit: {str(args.get('message') or '')[:40]}"
         return f"git {cmd}"
     if name == "new_terminal": return f"opened {'background' if args.get('background') else 'blocking'} terminal"
-    if name == "execute_command": return f"terminal {args.get('terminal_id', '?')}: {args.get('command', '?')}"
+    if name == "execute_command":
+        if args.get("terminal_id") is None: return f"run: {args.get('command', '?')}"
+        return f"terminal {args['terminal_id']}: {args.get('command', '?')}"
     if name == "read_logs": return f"read terminal {args.get('terminal_id', '?')} logs"
     if name == "close_terminal": return f"closed terminal {args.get('terminal_id', '?')}"
     if name == "get_terminal_info": return f"info on terminal {args.get('terminal_id', '?')}"
