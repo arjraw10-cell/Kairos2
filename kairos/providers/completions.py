@@ -15,10 +15,9 @@ REASONING_KEY = "_reasoning_details"
 
 def openai_client(spec: ModelSpec, key: str, cache: dict) -> OpenAI:
     if key not in cache:
-        # With several keys, a rate-limited key should rotate immediately
-        # rather than wait out the SDK's own retries; Agent still retries.
-        retries = 0 if len(spec.api_keys) > 1 else 2
-        cache[key] = OpenAI(api_key=key, base_url=spec.base_url or None, max_retries=retries)
+        # No SDK retries: Agent retries with backoff and retry-after, and a
+        # rate-limited key should rotate at once. Both would multiply attempts.
+        cache[key] = OpenAI(api_key=key, base_url=spec.base_url or None, max_retries=0)
     return cache[key]
 
 
