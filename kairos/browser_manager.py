@@ -18,8 +18,10 @@ Design:
     methods cannot resolve ``aria-ref`` selectors; when its humanize engine
     cannot map a handle (iframes), the humanized page mouse/keyboard is used
     at the element's box instead.
+  - Input is refused, with the blocker named, when the target is inert or
+    covered (usually by an open dialog), instead of reporting success.
   - The browser launches lazily on the first browser tool call and relaunches
-    if a human closes the window.
+    if a human closes the window; a crashed tab is replaced on the next call.
   - Named profiles persist logins and pin a fingerprint seed per profile. They
     are shared with Claude Code's cloakbrowser MCP (cloak-mcp): same root, same
     seed file.
@@ -42,6 +44,70 @@ ACTION_TIMEOUT_MS = 10_000
 _REF = re.compile(r"^(f\d+)?e\d+$")
 _HUMANIZE_MISS = "cloakbrowser humanize: cannot identify"
 _BUFFER_LIMIT = 500
+
+# Can the element receive input? null = yes, or no clear evidence against it
+# (no box). Custom checkboxes put a styled span over a hidden <input>, so a hit
+# on the element's own <label> counts as a hit on the element.
+_HIT_TEST = """el => {
+    const dialogs = 'dialog, [role=dialog], [role=alertdialog]';
+    const describe = n => {
+        const role = n.getAttribute('role');
+        const text = (n.getAttribute('aria-label') || n.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 60);
+        return `<${n.tagName.toLowerCase()}${n.id ? '#' + n.id : ''}${role ? ' role=' + role : ''}>` + (text ? ` "${text}"` : '');
+    };
+    const inDialog = !!el.closest(dialogs);
+    const hidden = el.closest('[inert]') || (el.parentElement && el.parentElement.closest('[aria-hidden="true"]'));
+    if (hidden) return {inert: true, inDialog, blocker: describe(hidden)};
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return null;
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return {offscreen: true};
+    const root = el.getRootNode(), top = (root.elementFromPoint ? root : document).elementFromPoint(x, y);
+    if (!top || top === el || el.contains(top)) return null;
+    const label = top.closest('label');
+    if ((label && label.control === el) || [...(el.labels || [])].some(l => l.contains(top))) return null;
+    return {inDialog, blocker: describe(top.closest(dialogs) || top)};
+}"""
+
+# The app has rendered: no visible loading indicator, and the main landmark (or
+# body) holds a visible interactive element. Pages with nothing interactive
+# count as rendered 2.5 s after navigation once loaded, so they do not wait 8 s.
+_RENDERED = """() => {
+    const shown = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 &&
+        e.checkVisibility({opacityProperty: true, visibilityProperty: true}) && !e.closest('[aria-hidden="true"]'); };
+    if ([...document.querySelectorAll('[role=progressbar]:not([aria-valuenow]), progress:not([value])')].some(shown)) return false;
+    const root = document.querySelector('main, [role=main]') || document.body;
+    const interactive = 'a[href], button, input:not([type=hidden]), select, textarea, [role=button], [role=link], ' +
+        '[role=textbox], [role=checkbox], [role=tab], [role=menuitem], [contenteditable=""], [contenteditable=true]';
+    return (!!root && [...root.querySelectorAll(interactive)].some(shown)) ||
+        (document.readyState === 'complete' && performance.now() > 2500);
+}"""
+
+_DIALOG_LINE = re.compile(r'^(\s*)- (?:dialog|alertdialog)(?: "((?:[^"\\]|\\.)*)")?.*?\[ref=(\w+)\]')
+_NAMED_LINE = re.compile(r'^\s*- (button|heading) "((?:[^"\\]|\\.)*)".*?\[ref=(\w+)\]')
+_CLOSE_NAME = re.compile(r"\b(close|dismiss|cancel)\b|^[×✕✖xX]$", re.I)
+
+
+def open_dialog(snapshot: str) -> Optional[Tuple[str, str, Optional[str]]]:
+    """The last (topmost) dialog in an AI snapshot: (name, ref, close button ref or None).
+    An unnamed dialog takes the name of its first heading."""
+    found = None
+    lines = snapshot.split("\n")
+    for i, line in enumerate(lines):
+        m = _DIALOG_LINE.match(line)
+        if not m:
+            continue
+        name, close, indent = m.group(2) or "", None, len(m.group(1))
+        for sub in lines[i + 1:]:
+            if len(sub) - len(sub.lstrip()) <= indent:
+                break
+            n = _NAMED_LINE.match(sub)
+            if n and n.group(1) == "heading" and not name:
+                name = n.group(2)
+            elif n and n.group(1) == "button" and not close and _CLOSE_NAME.search(n.group(2)):
+                close = n.group(3)
+        found = (name, m.group(3), close)
+    return found
 
 # Profile directories open in this process. Chromium cannot open one profile
 # directory twice, so a second gateway conversation gets a clear error.
@@ -68,6 +134,14 @@ def _profile_in_use(profile_dir: Path) -> bool:
 
 class StaleRefError(Exception):
     pass
+
+
+class CoveredError(Exception):
+    """The target cannot receive input: it is inert, or another element is on top of it."""
+
+    def __init__(self, ref: str, info: Dict[str, Any]):
+        super().__init__(ref)
+        self.ref, self.info = ref, info
 
 
 class _Worker:
@@ -151,6 +225,7 @@ class BrowserManager:
         self._modal_waiters: List[asyncio.Future] = []
         self._network: Dict[Any, List[Dict]] = {}
         self._last_snapshot: Optional[Tuple[Any, str, set]] = None
+        self._modal: Optional[Tuple[str, str, Optional[str], bool]] = None  # open dialog in the last snapshot
         self._profile_dir: Optional[Path] = None
         self._proxy: Optional[str] = None
         self._closing: set = set()  # closes of launches that finished after a cancel
@@ -355,12 +430,18 @@ class BrowserManager:
             if self._current is page:
                 self._current = self._pages[-1] if self._pages else None
 
+        def on_crash(_page):
+            # A crashed tab is not closed and fails every call; drop it so the next call opens a fresh one.
+            on_close(_page)
+            self._close_later(page)
+
         page.on("request", on_request)
         page.on("response", on_response)
         page.on("requestfinished", on_finished)
         page.on("requestfailed", on_failed)
         page.on("dialog", on_dialog)
         page.on("close", on_close)
+        page.on("crash", on_crash)
 
     def _notify_modal(self):
         for fut in self._modal_waiters:
@@ -380,6 +461,7 @@ class BrowserManager:
         self._dialog = None
         self._network = {}
         self._last_snapshot = None
+        self._modal = None
 
     async def _page(self):
         ctx = await self._ensure()
@@ -442,6 +524,14 @@ class BrowserManager:
 
     async def _snapshot_text(self, page, mode: str) -> str:
         snap = await page.aria_snapshot(mode="ai", timeout=10_000)
+        dialog = open_dialog(snap)
+        if dialog:
+            try:
+                modal = await page.evaluate("() => [...document.querySelectorAll('[aria-modal=\"true\"], dialog:modal')]"
+                                            ".some(e => e.checkVisibility())")
+            except Exception:
+                modal = False
+            self._modal = (*dialog, bool(modal))
         lines = snap.split("\n")
         keys = {line.strip() for line in lines}  # ignore re-indentation from inserted wrappers
         prev = self._last_snapshot
@@ -462,6 +552,7 @@ class BrowserManager:
 
     async def _state(self, mode: str = "full") -> str:
         page = self._current
+        self._modal = None
         if page is None or page.is_closed():
             return "No open page."
         lines = []
@@ -488,6 +579,12 @@ class BrowserManager:
                 lines.append(await self._snapshot_text(page, mode))
             except Exception as e:
                 lines.append(f"(snapshot unavailable: {str(e).splitlines()[0]})")
+        if self._modal:
+            # Explains why the page behind looks nameless or ignores input.
+            name, ref, close, inert = self._modal
+            lines.insert(0, "Dialog open: " + (f'"{name}" ' if name else "") + f"[ref={ref}]"
+                         + (f" (Close: [ref={close}])" if close else "") + "."
+                         + (" The page behind it is inert." if inert else ""))
         return "\n".join(lines)
 
     def snapshot(self) -> str:
@@ -502,10 +599,20 @@ class BrowserManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _explain(e: Exception, ref: Optional[str]) -> str:
+    def _explain(e: Exception, ref: Optional[str], modal: Optional[Tuple] = None) -> str:
         if isinstance(e, StaleRefError):
             return (f"Ref {ref} no longer exists: the page changed since the last snapshot. "
                     "Use a ref from the fresh snapshot below.")
+        if isinstance(e, CoveredError):
+            if modal and not e.info.get("inDialog"):
+                name, dialog_ref, close = modal[:3]
+                what = f'an open dialog "{name}"' if name else f"an open dialog [ref={dialog_ref}]"
+                return (f"Target {e.ref} is covered by {what}; close it first"
+                        + (f" (Close button: {close})." if close else "."))
+            if e.info.get("inert"):
+                return (f"Target {e.ref} is inert (inside {e.info['blocker']}, which is inert or aria-hidden) "
+                        "and cannot receive input.")
+            return f"Target {e.ref} is covered by {e.info['blocker']}; close or move it first."
         first = (str(e).splitlines() or [type(e).__name__])[0]
         if "Timeout" in first:
             return f"{first} The element may be hidden, covered, or not rendered yet; check the snapshot below."
@@ -519,12 +626,15 @@ class BrowserManager:
                                "Call browser_handle_dialog first.")
         modal = asyncio.get_running_loop().create_future()
         self._modal_waiters.append(modal)
+        url = page.url
         work = asyncio.ensure_future(fn(page))
         try:
             done, _ = await asyncio.wait({work, modal}, return_when=asyncio.FIRST_COMPLETED)
             if work in done:
                 summary = work.result()
                 await self._settle(self._current or page)
+                if (self._current or page).url != url:  # the action navigated: let the app render
+                    await self._await_render(self._current or page)
             else:
                 # The action keeps running behind the dialog; it finishes once the dialog is handled.
                 work.add_done_callback(lambda t: t.cancelled() or t.exception())
@@ -534,7 +644,8 @@ class BrowserManager:
             work.cancel()
             raise
         except Exception as e:
-            raise RuntimeError(f"{self._explain(e, ref)}\n\n{await self._state('full')}") from None
+            state = await self._state("full")  # first: it finds the open dialog the explanation names
+            raise RuntimeError(f"{self._explain(e, ref, self._modal)}\n\n{state}") from None
         finally:
             if modal in self._modal_waiters:
                 self._modal_waiters.remove(modal)
@@ -547,6 +658,63 @@ class BrowserManager:
             await page.wait_for_load_state("domcontentloaded", timeout=5_000)
         except Exception:
             pass
+
+    async def _await_render(self, page, timeout: float = 8.0):
+        """After DOMContentLoaded, wait (never fail) until the app has rendered (see _RENDERED).
+        No networkidle: consoles like Google Cloud never go idle."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline and self._dialog is None:  # page scripts are frozen while alert() is open
+            try:
+                if await asyncio.wait_for(page.evaluate(_RENDERED), 2):
+                    return
+            except Exception:
+                pass  # navigating, or the document is being replaced
+            await asyncio.sleep(0.2)
+
+    @staticmethod
+    async def _await_value(h, text: str):
+        """Wait up to ~1 s for the field to show the typed text, so the diff is not a false 'unchanged'."""
+        for _ in range(10):
+            try:
+                if await h.evaluate("(el, t) => { const v = el.isContentEditable ? el.textContent : el.value;"
+                                    " return typeof v !== 'string' || v.includes(t); }", text):
+                    return
+            except Exception:
+                return
+            await asyncio.sleep(0.1)
+
+    async def _guard(self, h, ref: str, poll: float = 1.2):
+        """Refuse input to an element that cannot receive it (inert, or covered, usually by a
+        dialog): the events would land elsewhere and the action would look successful. A cover is
+        polled for `poll` seconds first, so animations and transient overlays are not refused."""
+        loop = asyncio.get_running_loop()
+        deadline, scrolled = loop.time() + poll, False
+        while True:
+            info = await h.evaluate(_HIT_TEST)
+            if info is None:
+                return
+            if not scrolled and not info.get("inert"):
+                # Out of view or clipped: bring it into view (humanized wheel) and test again.
+                scrolled = True
+                try:
+                    await self._humanized(lambda: h.scroll_into_view_if_needed(timeout=2_000),
+                                          lambda: h.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest'})"))
+                except Exception:
+                    pass
+                deadline = loop.time() + poll
+                continue
+            if info.get("offscreen"):
+                return  # cannot test it; the action itself reports what happens
+            if loop.time() >= deadline:
+                raise CoveredError(ref, info)
+            await asyncio.sleep(0.15)
+
+    async def _input_handle(self, page, ref: str):
+        """The ref's element, checked to be able to receive input."""
+        h = await self._handle(page, ref)
+        await self._guard(h, ref)
+        return h
 
     @staticmethod
     async def _handle(page, ref: str):
@@ -584,7 +752,7 @@ class BrowserManager:
             return await fallback()
 
     async def _click(self, page, ref: str, button: str = "left", double: bool = False):
-        h = await self._handle(page, ref)
+        h = await self._input_handle(page, ref)
 
         async def native():
             if double:
@@ -599,7 +767,7 @@ class BrowserManager:
         await self._humanized(native, by_mouse)
 
     async def _type(self, page, ref: str, text: str):
-        h = await self._handle(page, ref)
+        h = await self._input_handle(page, ref)
 
         async def by_keyboard():
             x, y = await self._center(h)
@@ -609,6 +777,7 @@ class BrowserManager:
             await page.keyboard.type(text)
 
         await self._humanized(lambda: h.fill(text, timeout=ACTION_TIMEOUT_MS), by_keyboard)
+        await self._await_value(h, text)
 
     # ------------------------------------------------------------------
     #  Actions
@@ -625,6 +794,7 @@ class BrowserManager:
                 await page.reload(wait_until="domcontentloaded", timeout=60_000)
             else:
                 await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            await self._await_render(page)
             return f"Navigated ({url})."
 
         return self._run(lambda: self._act(go, mode="full"))
@@ -659,9 +829,9 @@ class BrowserManager:
                 if kind == "textbox":
                     await self._type(page, ref, value)
                 elif kind == "combobox":
-                    await (await self._handle(page, ref)).select_option(value, timeout=ACTION_TIMEOUT_MS)
+                    await (await self._input_handle(page, ref)).select_option(value, timeout=ACTION_TIMEOUT_MS)
                 elif kind in ("checkbox", "radio"):
-                    await (await self._handle(page, ref)).set_checked(value.lower() == "true", timeout=ACTION_TIMEOUT_MS)
+                    await (await self._input_handle(page, ref)).set_checked(value.lower() == "true", timeout=ACTION_TIMEOUT_MS)
                 else:
                     raise ValueError(f"Unknown field type {kind!r}")
             return f"Filled {len(fields)} field(s)."
@@ -671,14 +841,14 @@ class BrowserManager:
 
     def select(self, ref: str, values: List[str]) -> str:
         async def do(page):
-            picked = await (await self._handle(page, ref)).select_option(values, timeout=ACTION_TIMEOUT_MS)
+            picked = await (await self._input_handle(page, ref)).select_option(values, timeout=ACTION_TIMEOUT_MS)
             return f"Selected {', '.join(picked)}."
 
         return self._run(lambda: self._act(do, ref))
 
     def hover(self, ref: str) -> str:
         async def do(page):
-            h = await self._handle(page, ref)
+            h = await self._input_handle(page, ref)
 
             async def by_mouse():
                 x, y = await self._center(h)
@@ -694,8 +864,8 @@ class BrowserManager:
              x2: Optional[float] = None, y2: Optional[float] = None) -> str:
         async def do(page):
             if from_ref and to_ref:
-                start = await self._center(await self._handle(page, from_ref))
-                end = await self._center(await self._handle(page, to_ref))
+                start = await self._center(await self._input_handle(page, from_ref))
+                end = await self._center(await self._input_handle(page, to_ref))
             elif None not in (x1, y1, x2, y2):
                 start, end = (x1, y1), (x2, y2)
             else:
@@ -781,6 +951,7 @@ class BrowserManager:
                 self._current = page
                 if url:
                     await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                    await self._await_render(page)
             elif action == "select":
                 if index is None or not 0 <= index < len(self._pages):
                     raise ValueError(f"No tab at index {index}; {len(self._pages)} open.")

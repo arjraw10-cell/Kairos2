@@ -316,13 +316,14 @@ class Agent:
         "## Browser Tools\n"
         "The browser is a headed, humanized CloakBrowser. It launches automatically on the first browser tool call.\n"
         "It passes bot detection (Cloudflare, reCAPTCHA, fingerprinting checks): its Chromium is patched at the source and every click, keystroke and scroll is humanized. Use it on sites that block scripts or plain HTTP fetches instead of giving up.\n"
-        "1. `browser_navigate` opens a URL (or back / forward / reload) and returns an accessibility snapshot.\n"
+        "1. `browser_navigate` opens a URL (or back / forward / reload), waits until the app has rendered (loading bars gone, content present) and returns an accessibility snapshot.\n"
         "2. Elements in the snapshot carry refs like [ref=e12]; refs inside iframes or after the page navigates look like f1e12. Pass them as `ref` to click/type/select/hover/drag. Always use refs from the latest snapshot.\n"
         "3. Every action returns the resulting page state: on the same page only the changed snapshot lines, after navigation the full snapshot. Call `browser_snapshot` only to see the whole page again.\n"
         "4. If an action opens an alert/confirm/prompt, the result says so; answer it with `browser_handle_dialog` before anything else.\n"
         "5. `browser_search_page` finds text when a snapshot is truncated; `browser_evaluate` reads anything else.\n"
         "6. `browser_screenshot` is for visual checks only; prefer snapshots for reading and acting.\n"
-        "7. Use `browser_profile use <name>` only when a task needs a login (profiles keep cookies and a fixed fingerprint, and are shared with the user's Claude Code browser, so a profile open there cannot be opened here); return with `browser_profile ephemeral`.\n\n"
+        "7. Use `browser_profile use <name>` only when a task needs a login (profiles keep cookies and a fixed fingerprint, and are shared with the user's Claude Code browser, so a profile open there cannot be opened here); return with `browser_profile ephemeral`.\n"
+        "8. A result starting with `Dialog open: ...` means a page dialog is open and the page behind it may ignore input. Clicking or typing into a target that is covered or inert is refused, naming the blocker (usually that dialog and its Close ref): close it first.\n\n"
     )
 
     DESKTOP_PROMPT = (

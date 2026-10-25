@@ -219,7 +219,7 @@ The browser is a headed, humanized CloakBrowser that launches automatically on t
 
 | Tool | Description |
 |------|-------------|
-| `browser_navigate(url)` | Open a URL, or `back` / `forward` / `reload`. Returns the full snapshot. |
+| `browser_navigate(url)` | Open a URL, or `back` / `forward` / `reload`. Waits for the app to render, then returns the full snapshot. |
 | `browser_snapshot()` | Full accessibility snapshot of the current page |
 | `browser_click(ref?, button?, double?, x?, y?)` | Click an element by ref, or viewport coordinates (canvas, captchas) |
 | `browser_type(ref, text, submit?)` | Replace a field's content by typing like a human; `submit` presses Enter |
@@ -246,7 +246,11 @@ Browser features:
 - **Diff snapshots**: actions on the same page return only the snapshot lines that changed (refs are stable across snapshots), so a click on a large page returns a few hundred characters instead of the whole page.
 - **Dialogs**: actions race against `dialog` events. An alert/confirm/prompt is reported to the agent and answered with `browser_handle_dialog`, instead of hanging the call or being silently dismissed.
 - **Stale refs**: a ref that no longer exists fails immediately with a fresh snapshot.
-- **Lazy launch and recovery**: the browser starts on the first call, a failed or cancelled launch (Esc, timeout) releases its profile and can be retried, and closing the window by hand makes the next call relaunch.
+- **No silent success on covered targets**: before a click, type, select, hover, drag or `fill_form` field acts on a ref, Kairos checks that the element can receive input: it must not be inside an `[inert]` or `aria-hidden` subtree, and after scrolling it into view (humanized) the topmost element at its center must be the element, a descendant, or its own `<label>` (so custom checkboxes with a styled span over a hidden input still work). A cover is re-checked for about 1.2 s, so animations do not cause refusals. Otherwise the action is refused with the blocker named, preferring the open dialog (`Target e353 is covered by an open dialog "Verification status"; close it first (Close button: e588).`), plus a fresh snapshot. There is never a non-humanized fallback.
+- **Open page dialogs**: when the snapshot contains a visible `dialog` or `alertdialog`, the result starts with `Dialog open: "Verification status" [ref=e572] (Close: [ref=e588]). The page behind it is inert.` (the last sentence only for a modal: `aria-modal="true"` or a `<dialog>` opened with `showModal()`). This is separate from the alert/confirm/prompt handling above.
+- **Page settle**: `browser_navigate` and `browser_tabs(new, url)` wait after DOMContentLoaded, for up to 8 s and never failing, until no indeterminate loading indicator (`[role=progressbar]` or `<progress>` without a value) is visible and the `main` landmark (or `body`) holds a visible interactive element; a loaded page with nothing interactive counts as rendered 2.5 s after navigation. An action that changes the URL gets the same wait. No `networkidle`, which consoles like Google Cloud never reach.
+- **Typed values**: after `browser_type` (and textboxes in `browser_fill_form`) Kairos waits up to 1 s for the field to show the typed text, so fields that apply their value late do not produce a false "unchanged" diff.
+- **Lazy launch and recovery**: the browser starts on the first call, a failed or cancelled launch (Esc, timeout) releases its profile and can be retried, closing the window by hand makes the next call relaunch, and a crashed tab is dropped so the next call opens a fresh one.
 - **Persistent profiles**: `browser_profile use <name>` keeps cookies and logins under `~/.cloak-browser-mcp/profiles/<name>` (or `CLOAKBROWSER_PROFILES_DIR`), the profiles of Claude Code's cloakbrowser MCP, and pins a fingerprint seed in that MCP's `.cloak-mcp.json`, so a logged-in identity always presents the same device in both tools. A profile can be open in only one browser at a time; a second conversation, or a profile already open in the MCP, gets a clear error.
 - **New tabs**: when an action opens a tab, Kairos switches to it and says so.
 - **Console and network**: network requests are captured from tab creation with status, timing and headers. CloakBrowser suppresses the live console stream (enabling the CDP Runtime domain is a bot signal), so `browser_console` briefly enables it on demand, which makes Chrome replay the current page's console messages and uncaught exceptions.
@@ -339,7 +343,7 @@ python -m pytest tests                    # also runs the pytest-style gateway t
 python tests/run_gateway_tests.py         # dependency-light gateway checks
 ```
 
-The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 240 unittest tests, 18 skipped). No test calls a live model.
+The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 251 unittest tests, 24 skipped). No test calls a live model.
 
 ## License
 

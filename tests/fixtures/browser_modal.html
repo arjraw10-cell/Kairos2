@@ -1,0 +1,27 @@
+<!doctype html>
+<html><head><title>Modal test</title>
+<style>
+  #panel { position: fixed; top: 0; right: 0; width: 320px; height: 100%; background: #eee; display: none; }
+  .custom { position: relative; display: inline-block; padding-left: 24px; }
+  .custom input { position: absolute; left: 0; top: 0; width: 16px; height: 16px; margin: 0; }
+  .custom .box { position: absolute; left: 0; top: 0; width: 16px; height: 16px; background: #4a4; z-index: 1; }
+</style></head>
+<body>
+  <main id="bg">
+    <h1>Branding</h1>
+    <label for="home">Application home page</label><input id="home">
+    <button onclick="document.title='added'">Add domain</button>
+    <button onclick="openPanel()">Information and summary</button>
+    <button onclick="document.getElementById('native').showModal()">Open native modal</button>
+    <label class="custom"><input type="checkbox" id="sub"><span class="box"></span>Subscribe</label>
+  </main>
+  <div id="panel" role="dialog" aria-modal="true" aria-labelledby="ptitle">
+    <h2 id="ptitle">Verification status</h2>
+    <button onclick="closePanel()">Close</button>
+  </div>
+  <dialog id="native" aria-label="Native modal"><p>Native</p><button onclick="this.closest('dialog').close()">Dismiss</button></dialog>
+<script>
+  function openPanel() { document.getElementById('bg').inert = true; document.getElementById('panel').style.display = 'block'; }
+  function closePanel() { document.getElementById('bg').inert = false; document.getElementById('panel').style.display = 'none'; }
+</script>
+</body></html>

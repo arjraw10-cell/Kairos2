@@ -13,6 +13,8 @@ from pathlib import Path
 FIXTURES = Path(__file__).parent / "fixtures"
 PAGE = (FIXTURES / "browser_page.html").as_uri()
 IFRAME = (FIXTURES / "browser_iframe.html").as_uri()
+MODAL = (FIXTURES / "browser_modal.html").as_uri()
+SPA = (FIXTURES / "browser_spa.html").as_uri()
 
 try:
     import cloakbrowser  # noqa: F401
@@ -199,6 +201,76 @@ class BrowserManagerTests(unittest.TestCase):
             finally:
                 other.close()
 
+    def test_19_input_behind_an_inert_modal_is_refused_with_the_dialog_named(self):
+        snap = self.bm.navigate(MODAL)
+        self.assertNotIn("Dialog open", snap)
+        home, add = ref(snap, r'textbox "Application home page"'), ref(snap, r'button "Add domain"')
+        out = self.bm.click(ref=ref(snap, r'button "Information and summary"'))
+        close = ref(out, r'button "Close"')
+        self.assertIn(f'\n\nDialog open: "Verification status" [ref=', out)
+        self.assertIn(f"(Close: [ref={close}]). The page behind it is inert.", out)
+        self.assertIn("Dialog open:", self.bm.snapshot().splitlines()[0])
+        for act in (lambda: self.bm.click(ref=add), lambda: self.bm.type(home, "https://example.com")):
+            start = time.time()
+            with self.assertRaises(RuntimeError) as cm:
+                act()
+            self.assertLess(time.time() - start, 6)
+            msg = str(cm.exception)
+            self.assertIn(f'is covered by an open dialog "Verification status"; close it first (Close button: {close}).', msg)
+            self.assertIn("Snapshot:", msg)
+        # Nothing went through.
+        self.assertIn("Result:\nModal test", self.bm.evaluate("() => document.title"))
+        self.assertIn("Result:\n\n", self.bm.evaluate("() => document.getElementById('home').value"))
+        self.assertNotIn("Dialog open", self.bm.click(ref=close))
+        self.assertIn("Page title: added", self.bm.click(ref=add))
+
+    def test_20_native_modal_dialog_covers_the_page(self):
+        snap = self.bm.navigate(MODAL)
+        add = ref(snap, r'button "Add domain"')
+        out = self.bm.click(ref=ref(snap, r'button "Open native modal"'))
+        dismiss = ref(out, r'button "Dismiss"')
+        self.assertIn(f'Dialog open: "Native modal"', out)
+        with self.assertRaises(RuntimeError) as cm:
+            self.bm.click(ref=add)
+        self.assertIn(f'covered by an open dialog "Native modal"; close it first (Close button: {dismiss}).', str(cm.exception))
+        self.assertNotIn("Dialog open", self.bm.click(ref=dismiss))
+
+    def test_21_custom_checkbox_under_its_label_is_clickable(self):
+        # The styled span covers the real <input>; the hit lands on the input's own label.
+        snap = self.bm.navigate(MODAL)
+        self.bm.click(ref=ref(snap, r'checkbox "Subscribe"'))
+        self.assertIn("true", self.bm.evaluate("() => document.getElementById('sub').checked"))
+
+    def test_22_navigate_waits_for_the_app_to_render(self):
+        start = time.time()
+        out = self.bm.navigate(SPA)  # a loading bar for 2 s, then the content
+        self.assertGreater(time.time() - start, 1.5)
+        self.assertIn('button "Create project"', out)
+        self.assertNotIn("progressbar", out)
+
+    def test_23_type_into_a_field_that_applies_its_value_late(self):
+        snap = self.bm.navigate(SPA)
+        out = self.bm.type(ref(snap, r'textbox "Project name"'), "demo")
+        self.assertNotIn("Snapshot: unchanged", out)
+        self.assertRegex(out, r'textbox "Project name"[^\n]*: demo')
+
+    def test_24_a_crashed_tab_is_replaced_on_the_next_call(self):
+        import asyncio
+
+        self.fresh_page()
+
+        async def crash():
+            page = self.bm._current
+            session = await page.context.new_cdp_session(page)
+            try:
+                await asyncio.wait_for(session.send("Page.crash"), 3)  # never answers: the tab is gone
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        self.bm._run(crash)
+        self.assertIn("Page title: Browser test", self.fresh_page())
+
 
 class _FakeContext:
     def __init__(self):
@@ -369,6 +441,118 @@ class BrowserManagerUnitTests(unittest.TestCase):
         self.assertIn("https://example.com/", line)
         self.assertIn("checkout.js?v=2", line)
         self.assertLess(len(line), 140)
+
+    def test_open_dialog_is_found_in_the_snapshot(self):
+        from kairos.browser_manager import open_dialog
+
+        snap = "\n".join([
+            "- main [ref=e2]:",
+            '  - button "Add domain" [ref=e5]',
+            "- dialog [ref=e11]:",
+            '  - heading "Verification status" [level=2] [ref=e12]',
+            '  - button "Save" [ref=e13]',
+            '  - button "Close panel" [ref=e14]',
+            '- button "Close" [ref=e20]',  # outside the dialog
+        ])
+        self.assertEqual(open_dialog(snap), ("Verification status", "e11", "e14"))
+        self.assertEqual(open_dialog('- alertdialog "Push to production?" [ref=f1e3]:\n  - button "Confirm" [ref=f1e4]'),
+                         ("Push to production?", "f1e3", None))
+        self.assertIsNone(open_dialog('- main [ref=e2]:\n  - button "Close" [ref=e3]'))
+
+    def test_covered_target_error_names_the_dialog_or_the_blocker(self):
+        from kairos.browser_manager import BrowserManager, CoveredError
+
+        modal = ("Verification status", "e572", "e588", True)
+        covered = CoveredError("e353", {"inDialog": False, "blocker": '<div#panel role=dialog> "Verification status"'})
+        self.assertEqual(BrowserManager._explain(covered, "e353", modal),
+                         'Target e353 is covered by an open dialog "Verification status"; close it first (Close button: e588).')
+        self.assertEqual(BrowserManager._explain(covered, "e353", ("", "e572", None, False)),
+                         "Target e353 is covered by an open dialog [ref=e572]; close it first.")
+        self.assertIn('covered by <div#panel role=dialog> "Verification status"', BrowserManager._explain(covered, "e353"))
+        inert = CoveredError("e9", {"inert": True, "inDialog": False, "blocker": "<main#bg>"})
+        self.assertIn("Target e9 is inert (inside <main#bg>", BrowserManager._explain(inert, "e9"))
+        # A target inside the dialog is not covered by that dialog: name the real blocker.
+        toast = CoveredError("e14", {"inDialog": True, "blocker": '<div role=status> "Saved"'})
+        self.assertIn('covered by <div role=status> "Saved"', BrowserManager._explain(toast, "e14", modal))
+
+    def test_guard_waits_out_a_transient_cover_and_refuses_a_lasting_one(self):
+        import asyncio
+
+        from kairos.browser_manager import BrowserManager, CoveredError
+
+        class Handle:
+            def __init__(self, results):
+                self.results, self.scrolls = list(results), 0
+
+            async def evaluate(self, js, *args):
+                return self.results.pop(0) if len(self.results) > 1 else self.results[0]
+
+            async def scroll_into_view_if_needed(self, timeout=None):
+                self.scrolls += 1
+
+        bm, cover = BrowserManager(), {"inDialog": False, "blocker": "<div>"}
+        transient = Handle([cover, cover, cover, None])  # an overlay fading out
+        asyncio.run(bm._guard(transient, "e1", poll=2))
+        self.assertEqual(transient.scrolls, 1)  # brought into view (humanized) before testing again
+        start = time.time()
+        with self.assertRaises(CoveredError):
+            asyncio.run(bm._guard(Handle([cover]), "e1", poll=0.3))
+        self.assertLess(time.time() - start, 2)
+        inert = Handle([{"inert": True, "inDialog": False, "blocker": "<main>"}])
+        with self.assertRaises(CoveredError):
+            asyncio.run(bm._guard(inert, "e1", poll=0.3))
+        self.assertEqual(inert.scrolls, 0)
+        asyncio.run(bm._guard(Handle([{"offscreen": True}]), "e1", poll=0.3))  # untestable: let the action run
+
+    def test_await_render_never_fails(self):
+        import asyncio
+        import types
+
+        from kairos.browser_manager import BrowserManager
+
+        bm = BrowserManager()
+        answers = [Exception("Execution context was destroyed"), False, True]
+
+        async def evaluate(js):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        asyncio.run(bm._await_render(types.SimpleNamespace(evaluate=evaluate), timeout=5))
+        self.assertEqual(answers, [])
+        start = time.time()
+        asyncio.run(bm._await_render(types.SimpleNamespace(evaluate=lambda js: asyncio.sleep(0, result=False)), timeout=0.5))
+        self.assertLess(time.time() - start, 2)
+
+    def test_a_crashed_page_is_dropped(self):
+        import asyncio
+
+        from kairos.browser_manager import BrowserManager
+
+        class Page:
+            def __init__(self):
+                self.handlers, self.closed = {}, False
+
+            def on(self, event, fn):
+                self.handlers[event] = fn
+
+            async def close(self):
+                self.closed = True
+
+        async def run():
+            bm, first, second = BrowserManager(), Page(), Page()
+            bm._attach(first)
+            bm._attach(second)
+            bm._current = second
+            second.handlers["crash"](second)
+            await asyncio.sleep(0.05)
+            return bm, first, second
+
+        bm, first, second = asyncio.run(run())
+        self.assertIs(bm._current, first)
+        self.assertNotIn(second, bm._pages)
+        self.assertTrue(second.closed)
 
 
 class ToolSchemaTests(unittest.TestCase):

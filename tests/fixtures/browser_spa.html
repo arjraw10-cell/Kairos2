@@ -1,0 +1,24 @@
+<!doctype html>
+<html><head><title>SPA test</title></head>
+<body>
+  <main><div role="progressbar" aria-label="Loading" style="height:4px;background:#48f"></div></main>
+<script>
+  // Like a console app: a loading bar for ~2 s, then the content renders.
+  setTimeout(() => {
+    document.querySelector('main').innerHTML =
+      '<h1>Dashboard</h1><button>Create project</button>' +
+      '<label for="name">Project name</label><input id="name">';
+    // The field applies typed text late, as a framework with async state does.
+    const field = document.getElementById('name');
+    let pending = '', timer;
+    field.addEventListener('keydown', e => {
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) pending += e.key;
+      else if (e.key === 'Backspace') pending = pending.slice(0, -1);
+      else return;
+      e.preventDefault();
+      clearTimeout(timer);
+      timer = setTimeout(() => { field.value = pending; }, 700);
+    });
+  }, 2000);
+</script>
+</body></html>
