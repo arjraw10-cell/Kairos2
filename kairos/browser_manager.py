@@ -29,6 +29,8 @@ Design:
 
 import asyncio
 import base64
+import contextlib
+import dataclasses
 import json
 import os
 import random
@@ -44,6 +46,34 @@ ACTION_TIMEOUT_MS = 10_000
 _REF = re.compile(r"^(f\d+)?e\d+$")
 _HUMANIZE_MISS = "cloakbrowser humanize: cannot identify"
 _BUFFER_LIMIT = 500
+# Each key also costs fixed round trips, so the delays shrink 16x for typing about 4x faster overall.
+_FAST_TYPING_DIVISOR = 16
+_TYPING_TIMINGS = ("typing_delay", "typing_delay_spread", "typing_pause_range", "key_hold",
+                   "shift_down_delay", "shift_up_delay", "mistype_delay_notice", "mistype_delay_correct")
+
+
+def _is_long_text(text: str) -> bool:
+    """More than 5 sentences, or over 500 characters (code and lists have few sentence ends)."""
+    return len(text) > 500 or len(re.findall(r"[.!?]+(?:\s|$)", text)) > 5
+
+
+@contextlib.contextmanager
+def _fast_typing(page, text: str):
+    """Humanized typing, about 4x faster for long text so an essay doesn't take minutes.
+    CloakBrowser reads the page's config on every call, so swap in one with the
+    typing timings scaled for the duration of this call."""
+    human = getattr(page._impl_obj, "_cloak_human", None)
+    if human is None or not _is_long_text(text):
+        yield
+        return
+    cfg = human.cfg
+    scale = lambda v: (tuple(n / _FAST_TYPING_DIVISOR for n in v) if isinstance(v, (tuple, list))
+                     else v / _FAST_TYPING_DIVISOR)
+    human.cfg = dataclasses.replace(cfg, **{k: scale(getattr(cfg, k)) for k in _TYPING_TIMINGS})
+    try:
+        yield
+    finally:
+        human.cfg = cfg
 
 # Can the element receive input? null = yes, or no clear evidence against it
 # (no box). Custom checkboxes put a styled span over a hidden <input>, so a hit
@@ -776,7 +806,8 @@ class BrowserManager:
             await page.keyboard.press("Backspace")
             await page.keyboard.type(text)
 
-        await self._humanized(lambda: h.fill(text, timeout=ACTION_TIMEOUT_MS), by_keyboard)
+        with _fast_typing(page, text):
+            await self._humanized(lambda: h.fill(text, timeout=ACTION_TIMEOUT_MS), by_keyboard)
         await self._await_value(h, text)
 
     # ------------------------------------------------------------------

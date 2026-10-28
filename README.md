@@ -241,7 +241,7 @@ The browser is a headed, humanized CloakBrowser that launches automatically on t
 | `browser_close()` | Close the browser; the next browser tool relaunches it |
 
 Browser features:
-- **Stealth and humanized input**: CloakBrowser's patched Chromium, with every click, keystroke and mouse path humanized. Refs are resolved to element handles before acting, because CloakBrowser's humanized Locator methods cannot resolve `aria-ref` selectors; inside iframes, where its engine cannot map a handle, the humanized page mouse and keyboard act at the element's box.
+- **Stealth and humanized input**: CloakBrowser's patched Chromium, with every click, keystroke and mouse path humanized. Refs are resolved to element handles before acting, because CloakBrowser's humanized Locator methods cannot resolve `aria-ref` selectors; inside iframes, where its engine cannot map a handle, the humanized page mouse and keyboard act at the element's box. Long text (more than 5 sentences, or over 500 characters) is typed about 4x faster: the humanized typing delays are divided by 16 for that call (each key also costs fixed round trips), so an essay takes about 20 s per 360 characters instead of 75 s.
 - **Real accessibility snapshots**: `page.aria_snapshot(mode="ai")` gives real ARIA roles and names, iframe content inline, and refs for every element; snapshots over 15,000 characters are truncated with a pointer to `browser_search_page`.
 - **Diff snapshots**: actions on the same page return only the snapshot lines that changed (refs are stable across snapshots), so a click on a large page returns a few hundred characters instead of the whole page.
 - **Dialogs**: actions race against `dialog` events. An alert/confirm/prompt is reported to the agent and answered with `browser_handle_dialog`, instead of hanging the call or being silently dismissed.
@@ -343,7 +343,7 @@ python -m pytest tests                    # also runs the pytest-style gateway t
 python tests/run_gateway_tests.py         # dependency-light gateway checks
 ```
 
-The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 251 unittest tests, 24 skipped). No test calls a live model.
+The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 253 unittest tests, 25 skipped). No test calls a live model.
 
 ## License
 

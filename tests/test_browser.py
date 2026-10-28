@@ -271,6 +271,15 @@ class BrowserManagerTests(unittest.TestCase):
         self.bm._run(crash)
         self.assertIn("Page title: Browser test", self.fresh_page())
 
+    def test_25_long_text_types_fast_and_restores_the_typing_speed(self):
+        text = "One. Two. Three. Four. Five. Six. Seven."
+        snap = self.fresh_page()
+        human = self.bm._current._impl_obj._cloak_human
+        before = human.cfg
+        out = self.bm.type(ref(snap, r'textbox "Search"'), text)
+        self.assertIn(text, out)
+        self.assertIs(human.cfg, before)
+
 
 class _FakeContext:
     def __init__(self):
@@ -524,6 +533,30 @@ class BrowserManagerUnitTests(unittest.TestCase):
         start = time.time()
         asyncio.run(bm._await_render(types.SimpleNamespace(evaluate=lambda js: asyncio.sleep(0, result=False)), timeout=0.5))
         self.assertLess(time.time() - start, 2)
+
+    def test_long_text_is_typed_faster_and_the_speed_restored(self):
+        from types import SimpleNamespace
+
+        from cloakbrowser.human.config import HumanConfig
+
+        from kairos.browser_manager import _FAST_TYPING_DIVISOR as D, _fast_typing, _is_long_text
+
+        self.assertTrue(_is_long_text("A. B. C. D. E. F."))
+        self.assertTrue(_is_long_text("x" * 501))
+        self.assertFalse(_is_long_text("One. Two. Three. Four. Five."))
+        self.assertFalse(_is_long_text("see https://example.com/a.b.c.d.e.f.g"))
+
+        cfg = HumanConfig()
+        human = SimpleNamespace(cfg=cfg)
+        page = SimpleNamespace(_impl_obj=SimpleNamespace(_cloak_human=human))
+        with _fast_typing(page, "short"):
+            self.assertIs(human.cfg, cfg)
+        with self.assertRaises(RuntimeError), _fast_typing(page, "x" * 600):
+            self.assertEqual(human.cfg.typing_delay, cfg.typing_delay / D)
+            self.assertEqual(human.cfg.key_hold, tuple(n / D for n in cfg.key_hold))
+            self.assertEqual(human.cfg.mistype_chance, cfg.mistype_chance)
+            raise RuntimeError
+        self.assertIs(human.cfg, cfg)
 
     def test_a_crashed_page_is_dropped(self):
         import asyncio
