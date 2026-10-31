@@ -352,6 +352,12 @@ class BrowserManager:
             "args": build_args(stealth_args=True, extra_args=extra, headless=self._headless),
             "viewport": {"width": 1280, "height": 720},
         }
+        if os.name == "nt":
+            # CloakBrowser and Playwright both pass --no-sandbox (needed in Linux containers), which turns
+            # off Chromium's process sandbox and shows an "unsupported command-line flag" bar. On Windows
+            # the sandbox works with CloakBrowser's binary and leaves the fingerprint unchanged.
+            kwargs["args"] = [a for a in kwargs["args"] if a != "--no-sandbox"]
+            kwargs["chromium_sandbox"] = True
         if self._proxy:
             kwargs["proxy"] = {"server": self._proxy}
 

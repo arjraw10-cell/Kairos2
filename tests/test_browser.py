@@ -280,6 +280,21 @@ class BrowserManagerTests(unittest.TestCase):
         self.assertIn(text, out)
         self.assertIs(human.cfg, before)
 
+    @unittest.skipUnless(os.name == "nt", "the sandbox is kept on only on Windows")
+    def test_26_renderers_run_sandboxed(self):
+        async def status():
+            page = await self.bm._page()
+            await page.goto("chrome://sandbox")
+            await page.wait_for_function("document.body.innerText.includes('Renderer')", timeout=5_000)
+            return await page.evaluate("document.body.innerText")
+
+        text = self.bm._run(status)
+        renderers = [line for line in text.splitlines() if "	Renderer	" in line]
+        self.assertTrue(renderers, text[:500])
+        for line in renderers:
+            self.assertNotIn("Not Sandboxed", line)
+            self.assertIn("Lockdown", line)
+
 
 class _FakeContext:
     def __init__(self):

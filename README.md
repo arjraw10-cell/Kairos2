@@ -43,6 +43,8 @@ Browser automation needs Playwright 1.63+ (for AI accessibility snapshots) and C
 python -m cloakbrowser install
 ```
 
+On Windows the browser keeps Chromium's process sandbox on: CloakBrowser and Playwright both pass `--no-sandbox` (needed in Linux containers), which leaves renderers unsandboxed and shows an "unsupported command-line flag" bar in profile windows, so Kairos drops it. The fingerprint and bot-detection results are unchanged.
+
 Kairos always launches the browser headed and humanized; a browser tool fails with an installation message if CloakBrowser or its humanization layer is unavailable.
 
 ## Configuration
@@ -343,7 +345,7 @@ python -m pytest tests                    # also runs the pytest-style gateway t
 python tests/run_gateway_tests.py         # dependency-light gateway checks
 ```
 
-The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 253 unittest tests, 25 skipped). No test calls a live model.
+The suites cover the provider adapters and key rotation, the agent loop (tool-chain repair, stops, compaction), the file tools, background sub-agents, terminals and the wake scheduler, the CLI in both modes (against a local gateway with a fake agent), web search, workspace folders, compaction and token accounting, chat storage, the gateway (including its cross-site and DNS-rebinding protection), desktop integration, and a real headed browser against local fixtures (`KAIROS_SKIP_BROWSER_TESTS=1` skips it; 254 unittest tests, 26 skipped). No test calls a live model.
 
 ## License
 
