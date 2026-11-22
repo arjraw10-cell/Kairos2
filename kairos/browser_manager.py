@@ -64,6 +64,7 @@ _OUTLINE_ROLE = re.compile(r"^\s*- (heading|table|grid|treegrid|list|listbox|com
 _COUNTED_ROLE = re.compile(r"- (table|grid|treegrid|list|listbox|combobox)\b")
 _ROW_ROLE = re.compile(r"^\s*- (row|listitem|option|treeitem)\b")
 _FIND_CONTEXT = 3
+_FIND_ROW_LINES = 40  # rows longer than this fall back to _FIND_CONTEXT lines around the match
 
 
 def _indent(line: str) -> int:
@@ -155,6 +156,17 @@ def _fast_typing(page, text: str):
         yield
     finally:
         human.cfg = cfg
+
+# CloakBrowser's humanized scroll sends ~30 px wheel events with fixed delays, so reaching an element
+# ~10,000 px away takes ~30 s, past the action timeout. For a target more than two viewports away,
+# jump (like dragging the scrollbar) to about half a viewport short of it and let the wheel do the rest.
+_JUMP_NEAR = """el => {
+    const r = el.getBoundingClientRect(), vh = innerHeight;
+    const mid = r.top + r.height / 2 - vh / 2;
+    if (Math.abs(mid) <= 2 * vh) return;
+    el.scrollIntoView({block: 'center', inline: 'nearest'});
+    window.scrollBy(0, mid > 0 ? -vh / 2 : vh / 2);
+}"""
 
 # Can the element receive input? null = yes, or no clear evidence against it
 # (no box). Custom checkboxes put a styled span over a hidden <input>, so a hit
@@ -835,6 +847,8 @@ class BrowserManager:
                 # Out of view or clipped: bring it into view (humanized wheel) and test again.
                 scrolled = True
                 try:
+                    if info.get("offscreen"):
+                        await h.evaluate(_JUMP_NEAR)
                     await self._humanized(lambda: h.scroll_into_view_if_needed(timeout=2_000),
                                           lambda: h.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest'})"))
                 except Exception:
@@ -1162,13 +1176,34 @@ class BrowserManager:
             return out[::-1]
 
         matched = [i for i, line in enumerate(lines) if rx.search(line)]
+        note = ""
+        if not matched and not regex and "|" in pattern:
+            # Models often write alternations without regex=true: search for each part instead.
+            parts = [p.strip() for p in pattern.split("|") if p.strip()]
+            rx = re.compile("|".join(map(re.escape, parts)), flags)
+            matched = [i for i, line in enumerate(lines) if rx.search(line)]
+            note = (f'No literal match for "{pattern}"; showing lines matching any of '
+                    + ", ".join(f'"{p}"' for p in parts) + " (regex=true searches with a regular expression).\n")
         if not matched:
             return (f'Page URL: {url}\nNo matches for "{pattern}". Collapsed content (closed <details>, accordions, '
                     "menus) is not in the snapshot: expand it and search again.")
         shown = matched[:max_results]
+
+        def context(m: int) -> Tuple[int, int]:
+            """The whole table row / list item holding the match (with its own buttons), else a few lines around it."""
+            for r in [m, *reversed(ancestors(m))]:
+                if _ROW_ROLE.match(lines[r]):
+                    end = r
+                    while end + 1 < len(lines) and indents[end + 1] > indents[r]:
+                        end += 1
+                    if end - r < _FIND_ROW_LINES:
+                        return r, end
+                    break
+            return max(0, m - _FIND_CONTEXT), min(len(lines) - 1, m + _FIND_CONTEXT)
+
         windows: List[List[int]] = []
         for m in shown:
-            start, end = max(0, m - _FIND_CONTEXT), min(len(lines) - 1, m + _FIND_CONTEXT)
+            start, end = context(m)
             if windows and start <= windows[-1][1] + 1:
                 windows[-1][1] = max(windows[-1][1], end)
             else:
@@ -1193,7 +1228,7 @@ class BrowserManager:
                 out.append(render(index))
             snippets.append("\n".join(out))
         word = "match" if len(matched) == 1 else "matches"
-        header = (f'Found {len(matched)} {word} for "{pattern}" (showing the first {len(shown)}; raise max_results '
+        header = note + (f'Found {len(matched)} {word} for "{pattern}" (showing the first {len(shown)}; raise max_results '
                   "for more):" if len(shown) < len(matched) else f'Found {len(matched)} {word} for "{pattern}":')
         body = _truncate("\n\n----\n\n".join(snippets))
         return f"Page URL: {url}\n{header}\n\n{body}"

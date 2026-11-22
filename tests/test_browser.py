@@ -297,7 +297,7 @@ class BrowserManagerTests(unittest.TestCase):
 
     def test_27_large_page_card_search_and_section(self):
         rows = "".join(f"<tr><td>SKU-{10000 + i}</td><td>Widget {i}</td><td>{'backordered' if i % 4 else 'in stock'}"
-                       "</td><td><button>Restock</button></td></tr>" for i in range(600))
+                       "</td><td><button onclick=\"this.textContent='Done'\">Restock</button></td></tr>" for i in range(600))
         big = Path(self.root.name) / "large.html"
         big.write_text(f"<h1>Inventory</h1><select><option>A</option><option>B</option></select>"
                        f"<table><tr><th>SKU</th><th>Name</th><th>Status</th><th></th></tr>{rows}</table>",
@@ -314,15 +314,22 @@ class BrowserManagerTests(unittest.TestCase):
         self.assertIn("Found 1 match", found)
         self.assertIn("Widget 433", found)
         self.assertIn("- table", found)  # ancestor path
-        # A row near the top: humanized scrolling to row 433 (~10,000 px) takes ~30 s, past the click timeout.
-        near = self.bm.search_page("SKU-10003")
-        self.assertIn("Clicked", self.bm.click(ref(near, r'button "Restock"')))
+        self.assertNotIn("Widget 432", found)  # the whole matching row, not the end of the one above
+        self.assertEqual(len(re.findall(r'button "Restock"', found)), 1)
+        t0 = time.monotonic()
+        self.assertIn("Clicked", self.bm.click(ref(found, r'button "Restock"')))  # ~10,000 px down
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertIn("SKU-10433", self.bm.search_page("Done"))  # that row's button, not a neighbour's
+        either = self.bm.search_page("zzz-nothing|Widget 599")
+        self.assertIn("No literal match", either)
+        self.assertIn("Widget 599", either)
         many = self.bm.search_page(r"/back\w+/i", regex=True, max_results=3)
         self.assertIn("showing the first 3", many)
         self.assertIn("No matches", self.bm.search_page("zzz-not-there"))
         with self.assertRaises(ValueError):
             self.bm.search_page("(", regex=True)
 
+        found = self.bm.search_page("SKU-10433")  # the click renamed the row, so its ref changed
         row = re.search(r'- row \[ref=(\w+)\]:\n\s*- cell "SKU-10433"', found).group(1)
         section = self.bm.snapshot(target=row)
         self.assertIn(f"element {row}", section)
