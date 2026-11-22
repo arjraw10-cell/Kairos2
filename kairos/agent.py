@@ -318,9 +318,9 @@ class Agent:
         "It passes bot detection (Cloudflare, reCAPTCHA, fingerprinting checks): its Chromium is patched at the source and every click, keystroke and scroll is humanized. Use it on sites that block scripts or plain HTTP fetches instead of giving up.\n"
         "1. `browser_navigate` opens a URL (or back / forward / reload), waits until the app has rendered (loading bars gone, content present) and returns an accessibility snapshot.\n"
         "2. Elements in the snapshot carry refs like [ref=e12]; refs inside iframes or after the page navigates look like f1e12. Pass them as `ref` to click/type/select/hover/drag. Always use refs from the latest snapshot.\n"
-        "3. Every action returns the resulting page state: on the same page only the changed snapshot lines, after navigation the full snapshot. Call `browser_snapshot` only to see the whole page again.\n"
+        "3. Every action returns the resulting page state: on the same page only the changed snapshot lines, after navigation the full snapshot (for a large page: its top and an outline). Call `browser_snapshot` only to see the whole page again, or with `target` to read one section.\n"
         "4. If an action opens an alert/confirm/prompt, the result says so; answer it with `browser_handle_dialog` before anything else.\n"
-        "5. `browser_search_page` finds text when a snapshot is truncated; `browser_evaluate` reads anything else.\n"
+        "5. `browser_search_page` searches the whole page and returns each match with its ref and surrounding lines; use it on large pages. `browser_evaluate` reads anything else.\n"
         "6. `browser_screenshot` is for visual checks only; prefer snapshots for reading and acting.\n"
         "7. Use `browser_profile use <name>` only when a task needs a login (profiles keep cookies and a fixed fingerprint, and are shared with the user's Claude Code browser, so a profile open there cannot be opened here); return with `browser_profile ephemeral`.\n"
         "8. A result starting with `Dialog open: ...` means a page dialog is open and the page behind it may ignore input. Clicking or typing into a target that is covered or inert is refused, naming the blocker (usually that dialog and its Close ref): close it first.\n\n"
@@ -691,15 +691,18 @@ class Agent:
             # ---- Browser Tools ----
             {"type": "function", "function": {
                 "name": "browser_navigate",
-                "description": "Open a URL in the current tab (launches the browser if needed), or pass back / forward / reload. Returns the page snapshot with [ref=eN] handles.",
+                "description": "Open a URL in the current tab (launches the browser if needed), or pass back / forward / reload. Returns the page snapshot with [ref=eN] handles (for a large page: its top and an outline; search the rest with browser_search_page).",
                 "parameters": {"type": "object", "properties": {
                     "url": {"type": "string", "description": "Absolute URL, or back | forward | reload"},
                 }, "required": ["url"]},
             }},
             {"type": "function", "function": {
                 "name": "browser_snapshot",
-                "description": "Full accessibility snapshot of the current page with [ref=eN] handles. Actions already return page state; use this to see the whole page again.",
-                "parameters": {"type": "object", "properties": {}, "required": []},
+                "description": "Full accessibility snapshot of the current page with [ref=eN] handles. Actions already return page state; use this to see the whole page again, or pass target to read one section.",
+                "parameters": {"type": "object", "properties": {
+                    "target": {"type": "string", "description": "Ref of one element to snapshot (e.g. a table or form)"},
+                    "depth": {"type": "integer", "description": "Limit the snapshot to this many levels"},
+                }, "required": []},
             }},
             {"type": "function", "function": {
                 "name": "browser_click",
@@ -791,7 +794,7 @@ class Agent:
             }},
             {"type": "function", "function": {
                 "name": "browser_search_page",
-                "description": "Find text in the page's visible text and return matches with context. Useful when a snapshot is truncated.",
+                "description": "Search the whole page's snapshot for text (or a regex) and return every match with its ref, nearby lines and parent elements, plus the total count.",
                 "parameters": {"type": "object", "properties": {
                     "pattern": {"type": "string"},
                     "regex": {"type": "boolean"},

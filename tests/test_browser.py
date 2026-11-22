@@ -295,6 +295,48 @@ class BrowserManagerTests(unittest.TestCase):
             self.assertNotIn("Not Sandboxed", line)
             self.assertIn("Lockdown", line)
 
+    def test_27_large_page_card_search_and_section(self):
+        rows = "".join(f"<tr><td>SKU-{10000 + i}</td><td>Widget {i}</td><td>{'backordered' if i % 4 else 'in stock'}"
+                       "</td><td><button>Restock</button></td></tr>" for i in range(600))
+        big = Path(self.root.name) / "large.html"
+        big.write_text(f"<h1>Inventory</h1><select><option>A</option><option>B</option></select>"
+                       f"<table><tr><th>SKU</th><th>Name</th><th>Status</th><th></th></tr>{rows}</table>",
+                       encoding="utf-8")
+        card = self.bm.navigate(big.as_uri())
+        self.assertIn("large page", card)
+        self.assertLess(len(card), 7_000)
+        self.assertRegex(card, r"- table .*\(601 rows\)")
+        self.assertRegex(card, r"- combobox .*\(2 options\)")
+        saved = re.search(r"saved to (\S+\.yml)", card).group(1)
+        self.assertTrue(Path(saved).is_file())
+
+        found = self.bm.search_page("SKU-10433")
+        self.assertIn("Found 1 match", found)
+        self.assertIn("Widget 433", found)
+        self.assertIn("- table", found)  # ancestor path
+        # A row near the top: humanized scrolling to row 433 (~10,000 px) takes ~30 s, past the click timeout.
+        near = self.bm.search_page("SKU-10003")
+        self.assertIn("Clicked", self.bm.click(ref(near, r'button "Restock"')))
+        many = self.bm.search_page(r"/back\w+/i", regex=True, max_results=3)
+        self.assertIn("showing the first 3", many)
+        self.assertIn("No matches", self.bm.search_page("zzz-not-there"))
+        with self.assertRaises(ValueError):
+            self.bm.search_page("(", regex=True)
+
+        row = re.search(r'- row \[ref=(\w+)\]:\n\s*- cell "SKU-10433"', found).group(1)
+        section = self.bm.snapshot(target=row)
+        self.assertIn(f"element {row}", section)
+        self.assertIn("Widget 433", section)
+        self.assertLess(len(section), 600)
+        table = ref(card, r"- table")
+        shallow = self.bm.snapshot(target=table, depth=1)
+        self.assertIn(f"element {table}, depth 1", shallow)
+        self.assertNotIn("Widget 433", shallow)
+        with self.assertRaisesRegex(RuntimeError, "no longer exists"):
+            self.bm.snapshot(target="e99999")
+        self.assertTrue(self.bm.snapshot().startswith("Page URL") and "large page" not in self.bm.snapshot())
+        self.assertNotIn("large page", self.fresh_page())  # small pages still come back whole
+
 
 class _FakeContext:
     def __init__(self):

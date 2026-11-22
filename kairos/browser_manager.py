@@ -10,7 +10,10 @@ Design:
     names, ``[ref=eN]`` handles (``f1eN`` inside iframes and after the page
     navigates), and iframe contents inline.
   - Every action returns the resulting page state. On the same URL only the
-    changed snapshot lines are returned; after navigation, the full snapshot.
+    changed snapshot lines are returned; after navigation, the full snapshot,
+    or for a large page a card (its top, an outline, the saved file's path).
+    ``search_page`` searches a fresh snapshot of the whole page, and
+    ``snapshot(target=ref)`` reads one section.
   - Actions race against ``dialog`` events, so alert/confirm/prompt are reported
     to the agent instead of blocking or being silently dismissed.
   - Always headed and always humanized (CloakBrowser human layer). Refs are
@@ -35,6 +38,7 @@ import json
 import os
 import random
 import re
+import tempfile
 import threading
 import time as _time
 from datetime import datetime
@@ -50,6 +54,83 @@ _BUFFER_LIMIT = 500
 _FAST_TYPING_DIVISOR = 16
 _TYPING_TIMINGS = ("typing_delay", "typing_delay_spread", "typing_pause_range", "key_hold",
                    "shift_down_delay", "shift_up_delay", "mistype_delay_notice", "mistype_delay_correct")
+
+# Snapshots longer than this come back as a card: the top of the page, an outline, and how to search.
+LARGE_PAGE_CHARS = 8_000
+_CARD_HEAD_CHARS = 4_000
+_OUTLINE_LINES = 40
+_OUTLINE_ROLE = re.compile(r"^\s*- (heading|table|grid|treegrid|list|listbox|combobox|form|search|navigation|main"
+                           r"|region|tablist|dialog|alertdialog)\b")
+_COUNTED_ROLE = re.compile(r"- (table|grid|treegrid|list|listbox|combobox)\b")
+_ROW_ROLE = re.compile(r"^\s*- (row|listitem|option|treeitem)\b")
+_FIND_CONTEXT = 3
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _clip(line: str, n: int = 300) -> str:
+    return line[:n] + "…" if len(line) > n else line
+
+
+_saved_snapshots = 0
+
+
+def _save_snapshot(snap: str) -> Path:
+    """Write the full snapshot to a temp file (the last 10 are kept), for agents that can read files."""
+    global _saved_snapshots
+    folder = Path(tempfile.gettempdir()) / "kairos-snapshots" / str(os.getpid())
+    folder.mkdir(parents=True, exist_ok=True)
+    _saved_snapshots += 1
+    path = folder / f"page-{_saved_snapshots}.yml"
+    path.write_text(snap, encoding="utf-8")
+    (folder / f"page-{_saved_snapshots - 10}.yml").unlink(missing_ok=True)
+    return path
+
+
+def _outline(lines: List[str]) -> List[str]:
+    """Headings, landmarks, forms, dropdowns, and tables/lists with their row counts."""
+    out = []
+    for i, line in enumerate(lines):
+        if len(out) >= _OUTLINE_LINES:
+            break
+        if not _OUTLINE_ROLE.match(line):
+            continue
+        rows = 0
+        if _COUNTED_ROLE.search(line):
+            j = i + 1
+            while j < len(lines) and _indent(lines[j]) > _indent(line):
+                rows += bool(_ROW_ROLE.match(lines[j]))
+                j += 1
+        unit = "options" if re.search(r"- (combobox|listbox)\b", line) else "rows"
+        out.append(_clip(line, 160) + (f" ({rows} {unit})" if rows else ""))
+    return out
+
+
+def _large_page_card(lines: List[str], snap: str) -> str:
+    n = size = 0
+    while n < len(lines) and size + len(lines[n]) + 1 <= _CARD_HEAD_CHARS:
+        size += len(lines[n]) + 1
+        n += 1
+    head = "\n".join(lines[:n]) if n else _clip(lines[0], _CARD_HEAD_CHARS)
+    structure = _outline(lines)
+    return "\n".join([
+        f"Snapshot (large page: {len(lines)} lines, {len(snap)} chars; only the top is shown):",
+        head,
+        f"… {len(lines) - max(n, 1)} more lines.",
+        *(["", "Page outline:", *structure] if structure else []),
+        "",
+        "To read the rest, use browser_search_page (returns every match with its ref and context, plus the total "
+        f"count) or browser_snapshot with target=<ref> for one section. Full snapshot saved to {_save_snapshot(snap)}",
+    ])
+
+
+def _truncate(snap: str) -> str:
+    if len(snap) <= SNAPSHOT_MAX_CHARS:
+        return snap
+    return (snap[:SNAPSHOT_MAX_CHARS] + f"\n... [snapshot truncated: {len(snap) - SNAPSHOT_MAX_CHARS} more chars. "
+            f"browser_search_page searches the whole page; full snapshot saved to {_save_snapshot(snap)}]")
 
 
 def _is_long_text(text: str) -> bool:
@@ -550,7 +631,7 @@ class BrowserManager:
             self._proxy = proxy
             await self._page()
             label = f"profile '{name}'" if target else "an ephemeral profile"
-            return f"Relaunched in {label}.\n\n{await self._state('full')}"
+            return f"Relaunched in {label}.\n\n{await self._state('page')}"
 
         return self._run(relaunch)
 
@@ -581,10 +662,9 @@ class BrowserManager:
             if len(diff) < SNAPSHOT_MAX_CHARS // 2:
                 return (f"Snapshot changes (new or updated lines; {removed} lines gone; unchanged parts "
                         f"omitted, browser_snapshot shows the full page):\n{diff}")
-        if len(snap) > SNAPSHOT_MAX_CHARS:
-            snap = (snap[:SNAPSHOT_MAX_CHARS] + f"\n... [snapshot truncated: {len(snap) - SNAPSHOT_MAX_CHARS} "
-                    "more chars. Scroll, or use browser_search_page / browser_evaluate for specific content]")
-        return f"Snapshot:\n{snap}"
+        if mode != "full" and len(snap) > LARGE_PAGE_CHARS:
+            return _large_page_card(lines, snap)
+        return f"Snapshot:\n{_truncate(snap)}"
 
     async def _state(self, mode: str = "full") -> str:
         page = self._current
@@ -623,12 +703,35 @@ class BrowserManager:
                          + (" The page behind it is inert." if inert else ""))
         return "\n".join(lines)
 
-    def snapshot(self) -> str:
+    def snapshot(self, target: Optional[str] = None, depth: Optional[int] = None) -> str:
+        """The whole page, or with target/depth one section. A section doesn't replace the diff baseline."""
         async def do():
-            await self._page()
-            return await self._state("full")
+            page = await self._page()
+            if not (target or depth):
+                return await self._state("full")
+            self._raise_if_dialog()
+            try:
+                if target and _REF.match(target) and await page.locator(f"aria-ref={target}").count() == 0:
+                    raise StaleRefError(target)
+                loc = page.locator(f"aria-ref={target}" if _REF.match(target) else target) if target else page
+                snap = await loc.aria_snapshot(mode="ai", depth=depth, timeout=10_000)
+                if target:  # aria-ref resolves against the last snapshot taken: make it the whole page again
+                    await page.aria_snapshot(mode="ai", timeout=10_000)
+            except Exception as e:
+                if target and _REF.match(target) and not isinstance(e, StaleRefError) and "aria-ref" in str(e):
+                    e = StaleRefError(target)  # unknown frame prefix
+                why = self._explain(e, target).replace(" Use a ref from the fresh snapshot below.",
+                                                       " Get a current ref from browser_search_page or browser_snapshot.")
+                raise RuntimeError(why) from None
+            what = ", ".join(x for x in (target and f"element {target}", depth and f"depth {depth}") if x)
+            return f"Page URL: {page.url}\nSnapshot ({what}):\n{_truncate(snap)}"
 
         return self._run(do)
+
+    def _raise_if_dialog(self):
+        if self._dialog is not None:
+            raise RuntimeError(f'A {self._dialog.type} dialog is open ("{self._dialog.message[:200]}"). '
+                               "Call browser_handle_dialog first.")
 
     # ------------------------------------------------------------------
     #  Action plumbing
@@ -657,9 +760,7 @@ class BrowserManager:
     async def _act(self, fn: Callable, ref: Optional[str] = None, mode: str = "diff") -> str:
         """Run an action raced against dialogs, then report the resulting page state."""
         page = await self._page()
-        if self._dialog is not None:
-            raise RuntimeError(f'A {self._dialog.type} dialog is open ("{self._dialog.message[:200]}"). '
-                               "Call browser_handle_dialog first.")
+        self._raise_if_dialog()
         modal = asyncio.get_running_loop().create_future()
         self._modal_waiters.append(modal)
         url = page.url
@@ -680,7 +781,7 @@ class BrowserManager:
             work.cancel()
             raise
         except Exception as e:
-            state = await self._state("full")  # first: it finds the open dialog the explanation names
+            state = await self._state("page")  # first: it finds the open dialog the explanation names
             raise RuntimeError(f"{self._explain(e, ref, self._modal)}\n\n{state}") from None
         finally:
             if modal in self._modal_waiters:
@@ -834,7 +935,7 @@ class BrowserManager:
             await self._await_render(page)
             return f"Navigated ({url})."
 
-        return self._run(lambda: self._act(go, mode="full"))
+        return self._run(lambda: self._act(go, mode="page"))
 
     def click(self, ref: Optional[str] = None, button: str = "left", double: bool = False,
               x: Optional[float] = None, y: Optional[float] = None) -> str:
@@ -1003,7 +1104,7 @@ class BrowserManager:
             elif action != "list":
                 raise ValueError("action must be list, new, select or close")
             listing = "\n".join(f"{'*' if p is self._current else ' '} [{i}] {p.url}" for i, p in enumerate(self._pages))
-            return f"{listing}\n\n{await self._state('none' if action == 'list' else 'full')}"
+            return f"{listing}\n\n{await self._state('none' if action == 'list' else 'page')}"
 
         return self._run(do)
 
@@ -1027,40 +1128,75 @@ class BrowserManager:
         return png, f"Screenshot captured ({len(png) / 1024:.0f} KB) — {url}\nSaved to: {path}", data_url
 
     def search_page(self, pattern: str, regex: bool = False, case_sensitive: bool = False, max_results: int = 20) -> str:
-        js = """([pattern, isRegex, caseSensitive, max]) => {
-            const text = document.body ? document.body.innerText : '';
-            let re;
-            try {
-                re = new RegExp(isRegex ? pattern : pattern.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'),
-                                caseSensitive ? 'g' : 'gi');
-            } catch (e) { return {error: 'Invalid regex: ' + e.message}; }
-            const matches = []; let total = 0, m;
-            while ((m = re.exec(text)) !== null) {
-                total++;
-                if (matches.length < max) {
-                    const s = Math.max(0, m.index - 40), e = Math.min(text.length, m.index + m[0].length + 40);
-                    matches.push((s > 0 ? '...' : '') + text.slice(s, e).replace(/\\s+/g, ' ') + (e < text.length ? '...' : ''));
-                }
-                if (m[0].length === 0) re.lastIndex++;
-            }
-            return {matches, total};
-        }"""
+        """Search a fresh AI snapshot of the whole page, line by line. Each match is shown with a few lines
+        around it under its ancestor path, so a table cell reads as table > row > cell with refs.
+        Ported from Playwright MCP's browser_find (Apache-2.0, Microsoft) via cloak-mcp."""
+        flags = 0 if case_sensitive else re.IGNORECASE
+        if regex:
+            m = re.fullmatch(r"/(.*)/([a-z]*)", pattern, re.S)  # accept the JS /x/i form too
+            if m:
+                pattern, flags = m.group(1), flags | (re.IGNORECASE if "i" in m.group(2) else 0)
+            try:
+                rx = re.compile(pattern, flags)
+            except re.error as e:
+                raise ValueError(f"Invalid regular expression: {e}") from None
+        else:
+            rx = re.compile(re.escape(pattern), flags)
 
         async def do():
             page = await self._page()
-            return await page.evaluate(js, [pattern, regex, case_sensitive, max_results])
+            self._raise_if_dialog()
+            return page.url, (await page.aria_snapshot(mode="ai", timeout=10_000)).split("\n")
 
-        data = self._run(do)
-        if data.get("error"):
-            return f"search_page: {data['error']}"
-        total = data["total"]
-        if total == 0:
-            return f'No matches for "{pattern}" on the page.'
-        lines = [f'Found {total} match{"es" if total != 1 else ""} for "{pattern}":']
-        lines += [f"[{i + 1}] {m}" for i, m in enumerate(data["matches"])]
-        if total > len(data["matches"]):
-            lines.append(f"... showing {len(data['matches'])} of {total}.")
-        return "\n".join(lines)
+        url, lines = self._run(do)
+        indents = [_indent(line) for line in lines]
+
+        def ancestors(index: int) -> List[int]:
+            out, indent = [], indents[index]
+            for i in range(index - 1, -1, -1):
+                if indent <= 0:
+                    break
+                if lines[i].strip() and indents[i] < indent:
+                    out.append(i)
+                    indent = indents[i]
+            return out[::-1]
+
+        matched = [i for i, line in enumerate(lines) if rx.search(line)]
+        if not matched:
+            return (f'Page URL: {url}\nNo matches for "{pattern}". Collapsed content (closed <details>, accordions, '
+                    "menus) is not in the snapshot: expand it and search again.")
+        shown = matched[:max_results]
+        windows: List[List[int]] = []
+        for m in shown:
+            start, end = max(0, m - _FIND_CONTEXT), min(len(lines) - 1, m + _FIND_CONTEXT)
+            if windows and start <= windows[-1][1] + 1:
+                windows[-1][1] = max(windows[-1][1], end)
+            else:
+                windows.append([start, end])
+        on_path = {i for m in shown for i in (m, *ancestors(m))}
+        is_match = set(shown)
+
+        def render(i: int) -> str:
+            line = lines[i]
+            if len(line) <= 300 or i not in is_match:
+                return _clip(line)
+            pos = max(0, rx.search(line).start() - 120)
+            return f"{line[:indents[i]]}…{line[pos:pos + 300]}…"
+
+        snippets = []
+        for start, end in windows:
+            idx = ancestors(start) + list(range(start, end + 1))
+            out = []
+            for k, index in enumerate(idx):
+                if k and index > idx[k - 1] + 1 and index not in on_path and idx[k - 1] not in on_path:
+                    out.append(" " * indents[index] + "...")
+                out.append(render(index))
+            snippets.append("\n".join(out))
+        word = "match" if len(matched) == 1 else "matches"
+        header = (f'Found {len(matched)} {word} for "{pattern}" (showing the first {len(shown)}; raise max_results '
+                  "for more):" if len(shown) < len(matched) else f'Found {len(matched)} {word} for "{pattern}":')
+        body = _truncate("\n\n----\n\n".join(snippets))
+        return f"Page URL: {url}\n{header}\n\n{body}"
 
     # ------------------------------------------------------------------
     #  Console and network
