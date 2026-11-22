@@ -17,3 +17,5 @@ kairoscli.bat
 temp.py
 # Model provider config holds API keys; see provider.example.json.
 provider.json
+# Build metadata from pip install -e
+*.egg-info/

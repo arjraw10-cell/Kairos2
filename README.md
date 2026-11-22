@@ -27,6 +27,14 @@ A minimal personal coding agent in Python.
 - **Retries, Caching and Clean Errors**: Transient API failures (rate limits, overload, connection errors, 408/409/429/5xx) are retried up to 5 times with backoff, honouring the server's `retry-after`; a final failure shows a short `API Error` summary without a traceback. Anthropic requests mark the system prompt, tools and newest turn for prompt caching; OpenRouter requests carry a per-conversation `session_id` so the conversation stays on one host and its prompt cache
 - **Clean CLI**: `rich` and `prompt_toolkit`; one-line banner, typed input and replies wrap at word boundaries, model and effort at the right of the prompt, sub-agents in the bottom toolbar, and Markdown tables with rounded boxes and alternating rows
 
+## Browser benchmark
+
+Kairos's native browser tools were benchmarked against cloak-mcp, Playwright MCP and @devinwangd/cloak-browser-mcp on
+30 code-checked browser tasks (60 runs each on `claude-haiku-5-5`): **100% success** (94–100% CI), no hangs, 0.18 tool
+errors per run, 35.6k tokens per successful task, 3,001 tool-schema tokens. On other models (Kairos only): gpt-6.1-sol
+98%, glm-5.3-flash 95%, gpt-6-luna 92%. The weak spot is large pages (94k tokens per success vs 42k for Playwright
+MCP). Full results, tasks and raw logs: [cloak-mcp/bench](https://github.com/arjraw10-cell/cloak-mcp/tree/main/bench).
+
 ## Installation
 
 ```bash
