@@ -30,10 +30,19 @@ A minimal personal coding agent in Python.
 ## Browser benchmark
 
 Kairos's native browser tools were benchmarked against cloak-mcp, Playwright MCP and @devinwangd/cloak-browser-mcp on
-30 code-checked browser tasks (60 runs each on `claude-haiku-5-5`): **100% success** (94–100% CI), no hangs, 0.18 tool
-errors per run, 35.6k tokens per successful task, 3,001 tool-schema tokens. On other models (Kairos only): gpt-6.1-sol
-98%, glm-5.3-flash 95%, gpt-6-luna 92%. The weak spot is large pages (94k tokens per success vs 42k for Playwright
-MCP). Full results, tasks and raw logs: [cloak-mcp/bench](https://github.com/arjraw10-cell/cloak-mcp/tree/main/bench).
+30 code-checked browser tasks (60 runs per config on `claude-haiku-5-5`, no hangs in any run).
+
+| Kairos browser tools | Success (Haiku 5.5) | Tokens per success | Large-page tokens per task |
+|---|---|---|---|
+| Before (two runs) | 100% / 97% | 35.6k / 39.4k | 94k / 116k |
+| Now: large-page card, ref-aware `browser_search_page`, section snapshots | 93% (84–97% CI) | 27.8k | 45k (Playwright MCP: 46k) |
+
+Large pages now return their top and an outline instead of the whole page, and the agent searches for the rest. The
+4 failures in the latest run aren't from that change: two answers added the birthplace to a date of birth, one was
+a mistyped field, and one run's process exited during a console call that hung behind an `alert()`. That hang is
+now fixed. On other models (Kairos only, latest run): glm-5.3-flash 98%, gpt-6.1-sol 97%, gpt-6-luna 93%. The
+changes were designed after seeing failures on this suite, so they're shown to fix those cases, not yet to
+generalize. Full results, tasks and raw logs: [cloak-mcp/bench](https://github.com/arjraw10-cell/cloak-mcp/tree/main/bench).
 
 ## Installation
 
