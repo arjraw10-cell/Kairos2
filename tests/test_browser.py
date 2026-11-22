@@ -344,6 +344,26 @@ class BrowserManagerTests(unittest.TestCase):
         self.assertTrue(self.bm.snapshot().startswith("Page URL") and "large page" not in self.bm.snapshot())
         self.assertNotIn("large page", self.fresh_page())  # small pages still come back whole
 
+    def test_28_console_with_an_alert_open_fails_fast(self):
+        page = Path(self.root.name) / "alert_on_load.html"
+        page.write_text("<script>console.log('hello'); setTimeout(() => alert('Code ZK-73'), 300)</script>",
+                        encoding="utf-8")
+        self.bm.navigate(page.as_uri())
+        time.sleep(1)
+        t0 = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "dialog is open"):
+            self.bm.console()  # Runtime.enable never returns while an alert is open
+        self.assertLess(time.monotonic() - t0, 2)
+
+        async def unchecked():  # even when the dialog went unnoticed, the call gives up quickly
+            return await self.bm._console_replay(await self.bm._page())
+        t0 = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "not responding"):
+            self.bm._run(unchecked)
+        self.assertLess(time.monotonic() - t0, 9)
+        self.bm.handle_dialog(True)
+        self.assertIn("hello", self.bm.console())
+
 
 class _FakeContext:
     def __init__(self):

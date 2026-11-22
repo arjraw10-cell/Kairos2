@@ -1263,16 +1263,23 @@ class BrowserManager:
         session.on("Runtime.consoleAPICalled", on_console)
         session.on("Runtime.exceptionThrown", on_exception)
         try:
-            await session.send("Runtime.enable")
+            # Runtime.enable never returns while an alert/confirm/prompt is open: don't let it hang the call.
+            await asyncio.wait_for(session.send("Runtime.enable"), timeout=5)
             await asyncio.sleep(0.2)  # replayed events arrive right after enable
-            await session.send("Runtime.disable")
+            await asyncio.wait_for(session.send("Runtime.disable"), timeout=5)
+        except asyncio.TimeoutError:
+            raise RuntimeError("The page is not responding (a dialog may be open); "
+                               "call browser_handle_dialog or try again.") from None
         finally:
-            await session.detach()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(session.detach(), timeout=2)
         return msgs[-_BUFFER_LIMIT:]
 
     def console(self, index: Optional[int] = None, errors_only: bool = False, max_results: int = 50) -> str:
         async def do():
-            return await self._console_replay(await self._page())
+            page = await self._page()
+            self._raise_if_dialog()
+            return await self._console_replay(page)
 
         msgs = self._run(do)
         if index is not None:
