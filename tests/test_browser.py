@@ -364,6 +364,21 @@ class BrowserManagerTests(unittest.TestCase):
         self.bm.handle_dialog(True)
         self.assertIn("hello", self.bm.console())
 
+    def test_29_typos_in_a_late_applying_field_are_corrected(self):
+        # CloakBrowser leaves a deliberate typo in when the field hasn't changed ~200 ms after the wrong key
+        # (it assumes the page rejected it); a field that applies its value 700 ms late always looks unchanged.
+        import dataclasses
+
+        snap = self.bm.navigate(SPA)
+        human = self.bm._run(self.bm._page)._impl_obj._cloak_human
+        cfg = human.cfg
+        human.cfg = dataclasses.replace(cfg, mistype_chance=1.0)  # a typo before every letter
+        try:
+            out = self.bm.type(ref(snap, r'textbox "Project name"'), "orion")
+        finally:
+            human.cfg = cfg
+        self.assertRegex(out, r'textbox "Project name"[^\n]*: orion\n')
+
 
 class _FakeContext:
     def __init__(self):
@@ -534,6 +549,18 @@ class BrowserManagerUnitTests(unittest.TestCase):
         self.assertIn("https://example.com/", line)
         self.assertIn("checkout.js?v=2", line)
         self.assertLess(len(line), 140)
+
+    def test_left_typos_spots_stray_letters_but_not_masks(self):
+        from kairos.browser_manager import _left_typos
+
+        self.assertTrue(_left_typos("Orkion", "Orion"))
+        self.assertTrue(_left_typos("iofrkipohn", "orion"))
+        self.assertFalse(_left_typos("Orion", "Orion"))
+        self.assertFalse(_left_typos("Or", "Orion"))  # not applied yet
+        self.assertFalse(_left_typos("(555) 123-4567", "5551234567"))  # phone mask
+        self.assertFalse(_left_typos("4242 4242", "42424242"))  # card spacing
+        self.assertFalse(_left_typos("ORION", "orion"))  # upper-casing field
+        self.assertFalse(_left_typos(None, "orion"))
 
     def test_open_dialog_is_found_in_the_snapshot(self):
         from kairos.browser_manager import open_dialog

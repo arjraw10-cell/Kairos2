@@ -157,6 +157,36 @@ def _fast_typing(page, text: str):
     finally:
         human.cfg = cfg
 
+def _left_typos(value: Optional[str], text: str) -> bool:
+    """The field holds the text plus stray letters/digits: deliberate typos CloakBrowser didn't undo. Its typo
+    check reads the field ~200 ms after the wrong key and, if unchanged, assumes the page rejected the key;
+    a field that applies typed text late always looks unchanged then. Masks add spaces or symbols instead."""
+    if not isinstance(value, str) or len(value) <= len(text):
+        return False
+    i = 0
+    for c in value:
+        if i < len(text) and c == text[i]:
+            i += 1
+        elif not c.isalnum():
+            return False
+    return i == len(text)
+
+
+@contextlib.contextmanager
+def _no_typos(page):
+    """Humanized typing with CloakBrowser's deliberate typos turned off, for the duration of this call."""
+    human = getattr(page._impl_obj, "_cloak_human", None)
+    if human is None:
+        yield
+        return
+    cfg = human.cfg
+    human.cfg = dataclasses.replace(cfg, mistype_chance=0.0)
+    try:
+        yield
+    finally:
+        human.cfg = cfg
+
+
 # CloakBrowser's humanized scroll sends ~30 px wheel events with fixed delays, so reaching an element
 # ~10,000 px away takes ~30 s, past the action timeout. For a target more than two viewports away,
 # jump (like dragging the scrollbar) to about half a viewport short of it and let the wheel do the rest.
@@ -822,16 +852,23 @@ class BrowserManager:
             await asyncio.sleep(0.2)
 
     @staticmethod
-    async def _await_value(h, text: str):
-        """Wait up to ~1 s for the field to show the typed text, so the diff is not a false 'unchanged'."""
-        for _ in range(10):
-            try:
-                if await h.evaluate("(el, t) => { const v = el.isContentEditable ? el.textContent : el.value;"
-                                    " return typeof v !== 'string' || v.includes(t); }", text):
-                    return
-            except Exception:
-                return
+    async def _value(h) -> Optional[str]:
+        try:
+            return await h.evaluate("el => el.isContentEditable ? el.textContent : el.value")
+        except Exception:
+            return None
+
+    async def _settled_value(self, h, text: str, before: Optional[str]) -> Optional[str]:
+        """Wait up to 1.5 s for the field to show the typed text (some apply it late), so the diff is not a
+        false 'unchanged'. A value with stray typos only counts once it differs from `before` (the value
+        before typing): a late field still shows the old one for a while."""
+        value = None
+        for _ in range(15):
+            value = await self._value(h)
+            if not isinstance(value, str) or text in value or (value != before and _left_typos(value, text)):
+                return value
             await asyncio.sleep(0.1)
+        return value
 
     async def _guard(self, h, ref: str, poll: float = 1.2):
         """Refuse input to an element that cannot receive it (inert, or covered, usually by a
@@ -927,9 +964,15 @@ class BrowserManager:
             await page.keyboard.press("Backspace")
             await page.keyboard.type(text)
 
+        fill = lambda: h.fill(text, timeout=ACTION_TIMEOUT_MS)
+        before = await self._value(h)
         with _fast_typing(page, text):
-            await self._humanized(lambda: h.fill(text, timeout=ACTION_TIMEOUT_MS), by_keyboard)
-        await self._await_value(h, text)
+            await self._humanized(fill, by_keyboard)
+        value = await self._settled_value(h, text, before)
+        if _left_typos(value, text):
+            with _fast_typing(page, text), _no_typos(page):  # retype once, like a person fixing it
+                await self._humanized(fill, by_keyboard)
+            await self._settled_value(h, text, value)
 
     # ------------------------------------------------------------------
     #  Actions
