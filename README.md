@@ -35,14 +35,16 @@ Kairos's native browser tools were benchmarked against cloak-mcp, Playwright MCP
 | Kairos browser tools | Success (Haiku 5.5) | Tokens per success | Large-page tokens per task |
 |---|---|---|---|
 | Before (two runs) | 100% / 97% | 35.6k / 39.4k | 94k / 116k |
-| Now: large-page card, ref-aware `browser_search_page`, section snapshots | 93% (84–97% CI) | 27.8k | 45k (Playwright MCP: 46k) |
+| Large-page card, ref-aware `browser_search_page`, section snapshots | 93% | 27.8k | 45k |
+| **Now:** plus the console and typo fixes below | **98%** (91–100% CI) | **27.4k** | **45k** (Playwright MCP: 46k) |
 
-Large pages now return their top and an outline instead of the whole page, and the agent searches for the rest. The
-4 failures in the latest run aren't from that change: two answers added the birthplace to a date of birth, one was
-a mistyped field, and one run's process exited during a console call that hung behind an `alert()`. That hang is
-now fixed. On other models (Kairos only, latest run): glm-5.3-flash 98%, gpt-6.1-sol 97%, gpt-6-luna 93%. The
-changes were designed after seeing failures on this suite, so they're shown to fix those cases, not yet to
-generalize. Full results, tasks and raw logs: [cloak-mcp/bench](https://github.com/arjraw10-cell/cloak-mcp/tree/main/bench).
+Large pages now return their top and an outline instead of the whole page, and the agent searches for the rest.
+Two fixes came out of the benchmark: `browser_console` no longer hangs for 120 s while an `alert()` is open (one run's
+process died there), and when CloakBrowser's deliberate typos stay in a field that applies typed text late ("Orion"
+became "Orkion"), Kairos retypes it once. The one remaining Haiku miss added the birthplace to a date of birth. On
+other models (latest run): glm-5.3-flash 98%, gpt-6.1-sol 97%, gpt-6-luna 95%, and none of their misses came from
+the browser tools. The changes were designed after seeing failures on this suite, so they're shown to fix those
+cases, not yet to generalize. Full results, tasks and raw logs: [cloak-mcp/bench](https://github.com/arjraw10-cell/cloak-mcp/tree/main/bench).
 
 ## Installation
 
