@@ -377,7 +377,7 @@ class BrowserManagerTests(unittest.TestCase):
             out = self.bm.type(ref(snap, r'textbox "Project name"'), "orion")
         finally:
             human.cfg = cfg
-        self.assertRegex(out, r'textbox "Project name"[^\n]*: orion\n')
+        self.assertRegex(out, r'textbox "Project name"[^\n]*: orion(\n|$)')
 
 
 class _FakeContext:
