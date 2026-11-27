@@ -616,20 +616,22 @@ class GatewayBackend:
         the ack is still awaited, so ``_wait`` can cancel the run.
         """
         result: dict = {}
+        done = threading.Event()
 
         def send():
             try:
                 result["ack"] = self.client.request(command, self._id, payload)
             except Exception as exc:
                 result["error"] = exc
+            finally:
+                done.set()
 
-        sender = threading.Thread(target=send, daemon=True)
-        sender.start()
-        while True:
+        threading.Thread(target=send, daemon=True).start()
+        # Wait on an Event, not Thread.join: on Python <= 3.12 a Ctrl+C inside join()
+        # can leave is_alive() False while the thread still runs (fixed in 3.13).
+        while not done.is_set():
             try:
-                sender.join(0.05)
-                if not sender.is_alive():
-                    break
+                done.wait(0.05)
             except KeyboardInterrupt:
                 stop.set()
         if "error" in result:
